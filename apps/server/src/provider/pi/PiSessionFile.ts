@@ -1,0 +1,144 @@
+import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
+import * as Path from "effect/Path";
+import * as Schema from "effect/Schema";
+
+export const PiSessionCursor = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  sessionFile: Schema.String,
+  sessionId: Schema.String,
+});
+export type PiSessionCursor = typeof PiSessionCursor.Type;
+
+export class PiSessionFileError extends Schema.TaggedErrorClass<PiSessionFileError>()(
+  "PiSessionFileError",
+  { operation: Schema.String, sessionFile: Schema.String, cause: Schema.Defect() },
+) {}
+
+export const piInstanceStateRoot = Effect.fn("PiSessionFile.piInstanceStateRoot")(
+  function* (input: { readonly stateDir: string; readonly instanceId: string }) {
+    const path = yield* Path.Path;
+    if (!input.instanceId || input.instanceId.trim() !== input.instanceId) {
+      return yield* new PiSessionFileError({
+        operation: "instanceId",
+        sessionFile: input.stateDir,
+        cause: input.instanceId,
+      });
+    }
+    return path.resolve(
+      input.stateDir,
+      "providers",
+      "pi",
+      encodeURIComponent(input.instanceId),
+      "sessions",
+    );
+  },
+);
+
+const canonicalContainedPath = (path: Path.Path, root: string, candidate: string) => {
+  const canonicalRoot = path.resolve(root);
+  const canonical = path.resolve(candidate);
+  return canonical !== canonicalRoot && canonical.startsWith(`${canonicalRoot}${path.sep}`)
+    ? canonical
+    : undefined;
+};
+
+export const validatePiResumeSessionFile = Effect.fn("PiSessionFile.validateResume")(
+  function* (input: {
+    readonly stateRoot: string;
+    readonly cursor: PiSessionCursor;
+    readonly cwd: string;
+  }) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const rootReal = yield* fs.realPath(path.resolve(input.stateRoot));
+    const sessionFile = canonicalContainedPath(path, rootReal, input.cursor.sessionFile);
+    if (!sessionFile || sessionFile !== input.cursor.sessionFile || !path.isAbsolute(sessionFile)) {
+      return yield* new PiSessionFileError({
+        operation: "containment",
+        sessionFile: input.cursor.sessionFile,
+        cause: rootReal,
+      });
+    }
+    const fileReal = yield* fs.realPath(sessionFile);
+    if (fileReal !== sessionFile || canonicalContainedPath(path, rootReal, fileReal) !== fileReal) {
+      return yield* new PiSessionFileError({ operation: "symlink", sessionFile, cause: fileReal });
+    }
+    const info = yield* fs.stat(sessionFile);
+    if (info.type !== "File")
+      return yield* new PiSessionFileError({
+        operation: "regularFile",
+        sessionFile,
+        cause: info.type,
+      });
+    yield* fs.access(sessionFile, { readable: true });
+    const firstLine = (yield* fs.readFileString(sessionFile)).split(/\r?\n/, 1)[0] ?? "";
+    const header = yield* Schema.decodeUnknownEffect(Schema.fromJsonString(Schema.Unknown))(
+      firstLine,
+    ).pipe(
+      Effect.mapError(
+        (cause) => new PiSessionFileError({ operation: "header", sessionFile, cause }),
+      ),
+    );
+    if (
+      typeof header !== "object" ||
+      header === null ||
+      !("type" in header) ||
+      header.type !== "session" ||
+      !("id" in header) ||
+      header.id !== input.cursor.sessionId ||
+      !("cwd" in header) ||
+      typeof header.cwd !== "string" ||
+      path.resolve(header.cwd) !== path.resolve(input.cwd)
+    ) {
+      return yield* new PiSessionFileError({ operation: "header", sessionFile, cause: header });
+    }
+    return { ...input.cursor, sessionFile };
+  },
+);
+
+export const allocateFreshPiSessionFile = Effect.fn("PiSessionFile.allocateFresh")(
+  function* (input: { readonly stateRoot: string; readonly sessionId: string }) {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const root = path.resolve(input.stateRoot);
+    yield* fs.makeDirectory(root, { recursive: true, mode: 0o700 });
+    yield* fs.chmod(root, 0o700);
+    const rootReal = yield* fs.realPath(root);
+    if (!input.sessionId || input.sessionId.trim() !== input.sessionId) {
+      return yield* new PiSessionFileError({
+        operation: "allocate",
+        sessionFile: rootReal,
+        cause: input.sessionId,
+      });
+    }
+    const sessionFile = path.join(rootReal, `${encodeURIComponent(input.sessionId)}.jsonl`);
+    if (!canonicalContainedPath(path, rootReal, sessionFile)) {
+      return yield* new PiSessionFileError({
+        operation: "allocate",
+        sessionFile,
+        cause: input.sessionId,
+      });
+    }
+    yield* fs.writeFileString(sessionFile, "", { flag: "wx", mode: 0o600 });
+    yield* fs.chmod(sessionFile, 0o600);
+    return { schemaVersion: 1, sessionFile, sessionId: input.sessionId } satisfies PiSessionCursor;
+  },
+);
+
+export const cleanupFreshPiSessionFile = Effect.fn("PiSessionFile.cleanupFresh")(function* (
+  cursor: PiSessionCursor,
+) {
+  const fs = yield* FileSystem.FileSystem;
+  yield* fs.remove(cursor.sessionFile, { force: true });
+});
+
+export const cleanupResumedPiSessionFile = (_cursor: PiSessionCursor): Effect.Effect<void> =>
+  Effect.void;
+
+export function piStateMatchesCursor(
+  state: { readonly sessionFile?: unknown; readonly sessionId?: unknown },
+  cursor: PiSessionCursor,
+): boolean {
+  return state.sessionFile === cursor.sessionFile && state.sessionId === cursor.sessionId;
+}
