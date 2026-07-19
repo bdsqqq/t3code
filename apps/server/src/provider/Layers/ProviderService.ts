@@ -227,6 +227,34 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       Effect.tap(() => Effect.sync(() => McpProviderSession.clearMcpProviderSession(threadId))),
     );
 
+  const compensateFailedSessionBinding = (input: {
+    readonly adapter: ProviderAdapterShape<ProviderAdapterError>;
+    readonly threadId: ThreadId;
+    readonly sessionWasPreexisting: boolean;
+  }) =>
+    Effect.gen(function* () {
+      if (!input.sessionWasPreexisting) {
+        yield* input.adapter.stopSession(input.threadId).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("provider.session.binding-compensation-stop-failed", {
+              threadId: input.threadId,
+              provider: input.adapter.provider,
+              cause,
+            }),
+          ),
+        );
+      }
+      yield* clearMcpSession(input.threadId).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("provider.session.binding-compensation-mcp-clear-failed", {
+            threadId: input.threadId,
+            provider: input.adapter.provider,
+            cause,
+          }),
+        ),
+      );
+    });
+
   const publishRuntimeEvent = (event: ProviderRuntimeEvent): Effect.Effect<void> =>
     Effect.succeed(event).pipe(
       Effect.tap((canonicalEvent) =>
@@ -420,6 +448,14 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
       yield* upsertSessionBinding(
         { ...resumed, providerInstanceId: bindingInstanceId },
         input.binding.threadId,
+      ).pipe(
+        Effect.tapError(() =>
+          compensateFailedSessionBinding({
+            adapter,
+            threadId: input.binding.threadId,
+            sessionWasPreexisting: false,
+          }),
+        ),
       );
       yield* analytics.record("provider.session.recovered", {
         provider: resumed.provider,
@@ -590,6 +626,7 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
           "provider.cwd.effective": effectiveCwd ?? "",
         });
         const adapter = yield* registry.getByInstance(resolvedInstanceId);
+        const sessionWasPreexisting = yield* adapter.hasSession(threadId);
         yield* prepareMcpSession(threadId, resolvedInstanceId);
         const session = yield* adapter
           .startSession({
@@ -618,7 +655,15 @@ const makeProviderService = Effect.fn("makeProviderService")(function* (
         });
         yield* upsertSessionBinding(sessionWithInstance, threadId, {
           modelSelection: input.modelSelection,
-        });
+        }).pipe(
+          Effect.tapError(() =>
+            compensateFailedSessionBinding({
+              adapter,
+              threadId,
+              sessionWasPreexisting,
+            }),
+          ),
+        );
         yield* analytics.record("provider.session.started", {
           provider: sessionWithInstance.provider,
           runtimeMode: input.runtimeMode,
