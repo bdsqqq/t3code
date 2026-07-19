@@ -22,6 +22,7 @@ import {
 import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -38,6 +39,7 @@ import * as SqlClient from "effect/unstable/sql/SqlClient";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
+  ProviderSessionDirectoryPersistenceError,
   ProviderUnsupportedError,
   ProviderValidationError,
   type ProviderAdapterError,
@@ -314,6 +316,129 @@ function makeProviderServiceLayer() {
     layer,
   };
 }
+
+function makeBindingFailureHarness(
+  initialBindings: ReadonlyArray<ProviderSessionDirectory.ProviderRuntimeBinding> = [],
+) {
+  const codex = makeFakeCodexAdapter();
+  const bindings = new Map(initialBindings.map((binding) => [binding.threadId, binding]));
+  const persistenceFailure = new ProviderSessionDirectoryPersistenceError({
+    operation: "upsert",
+    detail: "injected binding failure",
+  });
+  const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+    upsert: () => Effect.fail(persistenceFailure),
+    getProvider: (threadId) =>
+      Option.match(bindings.get(threadId) ? Option.some(bindings.get(threadId)!) : Option.none(), {
+        onNone: () => Effect.die("missing test binding"),
+        onSome: (binding) => Effect.succeed(binding.provider),
+      }),
+    getBinding: (threadId) => {
+      const binding = bindings.get(threadId);
+      return Effect.succeed(binding === undefined ? Option.none() : Option.some(binding));
+    },
+    listThreadIds: () => Effect.succeed(Array.from(bindings.keys())),
+    listBindings: () =>
+      Effect.succeed(
+        Array.from(bindings.values(), (binding) => ({
+          ...binding,
+          lastSeenAt: "2026-01-01T00:00:00.000Z",
+        })),
+      ),
+  });
+  const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+  const layer = makeProviderServiceLive().pipe(
+    Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+    Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+    Layer.provide(defaultServerSettingsLayer),
+    Layer.provide(AnalyticsService.layerTest),
+    Layer.provide(
+      Layer.succeed(
+        ProviderEventLoggers.ProviderEventLoggers,
+        ProviderEventLoggers.NoOpProviderEventLoggers,
+      ),
+    ),
+  );
+  return { codex, layer, persistenceFailure };
+}
+
+it.effect("ProviderServiceLive compensates a newly started session when binding fails", () =>
+  Effect.gen(function* () {
+    const harness = makeBindingFailureHarness();
+    const threadId = asThreadId("thread-binding-failure-new");
+    const exit = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      return yield* Effect.exit(
+        provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+    }).pipe(Effect.provide(harness.layer));
+
+    assert.equal(Exit.isFailure(exit), true);
+    if (Exit.isFailure(exit)) {
+      assert.equal(
+        Option.getOrUndefined(Cause.findErrorOption(exit.cause)),
+        harness.persistenceFailure,
+      );
+    }
+    assert.deepEqual(harness.codex.stopSession.mock.calls, [[threadId]]);
+  }),
+);
+
+it.effect("ProviderServiceLive does not compensate a preexisting adapter session", () =>
+  Effect.gen(function* () {
+    const harness = makeBindingFailureHarness();
+    const threadId = asThreadId("thread-binding-failure-existing");
+    yield* harness.codex.adapter.startSession({
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      yield* Effect.exit(
+        provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+    }).pipe(Effect.provide(harness.layer));
+
+    assert.equal(harness.codex.stopSession.mock.calls.length, 0);
+    assert.equal(yield* harness.codex.adapter.hasSession(threadId), true);
+  }),
+);
+
+it.effect("ProviderServiceLive compensates a resumed session when binding fails", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-binding-failure-recovery");
+    const harness = makeBindingFailureHarness([
+      {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { opaque: "persisted-resume" },
+      },
+    ]);
+    const exit = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      return yield* Effect.exit(provider.rollbackConversation({ threadId, numTurns: 1 }));
+    }).pipe(Effect.provide(harness.layer));
+
+    assert.equal(Exit.isFailure(exit), true);
+    assert.equal(harness.codex.startSession.mock.calls.length, 1);
+    assert.deepEqual(harness.codex.stopSession.mock.calls, [[threadId]]);
+  }),
+);
 
 it.effect("ProviderServiceLive catches stopAll failures during shutdown", () =>
   Effect.gen(function* () {
