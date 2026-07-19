@@ -12,6 +12,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
+  EnvironmentId,
   EventId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -23,6 +24,7 @@ import { createModelSelection } from "@t3tools/shared/model";
 import { it, assert, vi } from "@effect/vitest";
 
 import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
@@ -53,6 +55,7 @@ import * as ProviderEventLoggers from "./ProviderEventLoggers.ts";
 import { ProviderSessionDirectoryLive } from "./ProviderSessionDirectory.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as ProviderSessionRuntime from "../../persistence/ProviderSessionRuntime.ts";
+import * as McpProviderSession from "../../mcp/McpProviderSession.ts";
 import {
   makeSqlitePersistenceLive,
   SqlitePersistenceMemory,
@@ -321,13 +324,15 @@ function makeBindingFailureHarness(
   initialBindings: ReadonlyArray<ProviderSessionDirectory.ProviderRuntimeBinding> = [],
 ) {
   const codex = makeFakeCodexAdapter();
+  const claude = makeFakeCodexAdapter(CLAUDE_AGENT_DRIVER);
   const bindings = new Map(initialBindings.map((binding) => [binding.threadId, binding]));
   const persistenceFailure = new ProviderSessionDirectoryPersistenceError({
     operation: "upsert",
     detail: "injected binding failure",
   });
+  const upsert = vi.fn(() => Effect.fail(persistenceFailure));
   const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
-    upsert: () => Effect.fail(persistenceFailure),
+    upsert,
     getProvider: (threadId) =>
       Option.match(bindings.get(threadId) ? Option.some(bindings.get(threadId)!) : Option.none(), {
         onNone: () => Effect.die("missing test binding"),
@@ -346,7 +351,10 @@ function makeBindingFailureHarness(
         })),
       ),
   });
-  const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+  const registry = makeAdapterRegistryMock({
+    [CODEX_DRIVER]: codex.adapter,
+    [CLAUDE_AGENT_DRIVER]: claude.adapter,
+  });
   const layer = makeProviderServiceLive().pipe(
     Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
     Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
@@ -359,7 +367,7 @@ function makeBindingFailureHarness(
       ),
     ),
   );
-  return { codex, layer, persistenceFailure };
+  return { claude, codex, layer, persistenceFailure, upsert };
 }
 
 it.effect("ProviderServiceLive compensates a newly started session when binding fails", () =>
@@ -391,8 +399,25 @@ it.effect("ProviderServiceLive compensates a newly started session when binding 
 
 it.effect("ProviderServiceLive does not compensate a preexisting adapter session", () =>
   Effect.gen(function* () {
-    const harness = makeBindingFailureHarness();
     const threadId = asThreadId("thread-binding-failure-existing");
+    const harness = makeBindingFailureHarness([
+      {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { opaque: "existing-resume" },
+      },
+    ]);
+    const previousMcpSession = {
+      environmentId: EnvironmentId.make("environment-test"),
+      threadId,
+      providerSessionId: "provider-session-existing",
+      providerInstanceId: codexInstanceId,
+      endpoint: "http://127.0.0.1/mcp",
+      authorizationHeader: "Bearer existing",
+    };
+    McpProviderSession.setMcpProviderSession(previousMcpSession);
     yield* harness.codex.adapter.startSession({
       provider: CODEX_DRIVER,
       providerInstanceId: codexInstanceId,
@@ -400,9 +425,93 @@ it.effect("ProviderServiceLive does not compensate a preexisting adapter session
       runtimeMode: "full-access",
     });
 
-    yield* Effect.gen(function* () {
+    const exit = yield* Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
-      yield* Effect.exit(
+      return yield* Effect.exit(
+        provider.startSession(
+          threadId,
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          },
+          { activeSession: "reuse" },
+        ),
+      );
+    }).pipe(Effect.provide(harness.layer));
+
+    assert.equal(Exit.isFailure(exit), true);
+    if (Exit.isFailure(exit)) {
+      assert.equal(
+        Option.getOrUndefined(Cause.findErrorOption(exit.cause)),
+        harness.persistenceFailure,
+      );
+    }
+    assert.equal(harness.codex.stopSession.mock.calls.length, 0);
+    assert.equal(yield* harness.codex.adapter.hasSession(threadId), true);
+    assert.equal(McpProviderSession.readMcpProviderSession(threadId), previousMcpSession);
+    McpProviderSession.clearMcpProviderSession(threadId);
+  }),
+);
+
+it.effect("ProviderServiceLive owns and compensates an explicit replacement", () =>
+  Effect.gen(function* () {
+    const harness = makeBindingFailureHarness();
+    const threadId = asThreadId("thread-binding-failure-replacement");
+    yield* harness.codex.adapter.startSession({
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+
+    const exit = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      return yield* Effect.exit(
+        provider.startSession(
+          threadId,
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          },
+          { activeSession: "replace" },
+        ),
+      );
+    }).pipe(Effect.provide(harness.layer));
+
+    assert.equal(Exit.isFailure(exit), true);
+    if (Exit.isFailure(exit)) {
+      assert.equal(
+        Option.getOrUndefined(Cause.findErrorOption(exit.cause)),
+        harness.persistenceFailure,
+      );
+    }
+    assert.equal(harness.codex.startSession.mock.calls.length, 2);
+    assert.deepEqual(harness.codex.stopSession.mock.calls, [[threadId], [threadId]]);
+    assert.equal(yield* harness.codex.adapter.hasSession(threadId), false);
+  }),
+);
+
+it.effect("ProviderServiceLive preserves binding failures when compensation cleanup fails", () =>
+  Effect.gen(function* () {
+    const harness = makeBindingFailureHarness();
+    const threadId = asThreadId("thread-binding-failure-cleanup-failure");
+    harness.codex.stopSession.mockImplementation(() =>
+      Effect.fail(
+        new ProviderAdapterRequestError({
+          provider: String(CODEX_DRIVER),
+          method: "stopSession",
+          detail: "injected cleanup failure",
+        }),
+      ),
+    );
+
+    const exit = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      return yield* Effect.exit(
         provider.startSession(threadId, {
           provider: CODEX_DRIVER,
           providerInstanceId: codexInstanceId,
@@ -412,8 +521,299 @@ it.effect("ProviderServiceLive does not compensate a preexisting adapter session
       );
     }).pipe(Effect.provide(harness.layer));
 
-    assert.equal(harness.codex.stopSession.mock.calls.length, 0);
-    assert.equal(yield* harness.codex.adapter.hasSession(threadId), true);
+    assert.equal(Exit.isFailure(exit), true);
+    if (Exit.isFailure(exit)) {
+      assert.equal(
+        Option.getOrUndefined(Cause.findErrorOption(exit.cause)),
+        harness.persistenceFailure,
+      );
+    }
+    assert.deepEqual(harness.codex.stopSession.mock.calls, [[threadId]]);
+  }),
+);
+
+it.effect("ProviderServiceLive serializes competing starts through persistence and cleanup", () =>
+  Effect.gen(function* () {
+    const firstUpsertStarted = yield* Deferred.make<void>();
+    const releaseFirstUpsert = yield* Deferred.make<void>();
+    const codex = makeFakeCodexAdapter();
+    const persistenceFailure = new ProviderSessionDirectoryPersistenceError({
+      operation: "upsert",
+      detail: "injected first binding failure",
+    });
+    let upsertCount = 0;
+    const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+      upsert: () => {
+        upsertCount += 1;
+        return upsertCount === 1
+          ? Deferred.succeed(firstUpsertStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseFirstUpsert)),
+              Effect.andThen(Effect.fail(persistenceFailure)),
+            )
+          : Effect.void;
+      },
+      getProvider: () => Effect.die("unused test directory method"),
+      getBinding: () => Effect.succeed(Option.none()),
+      listThreadIds: () => Effect.succeed([]),
+      listBindings: () => Effect.succeed([]),
+    });
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+    const layer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const threadId = asThreadId("thread-binding-failure-concurrent");
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const start = () =>
+        provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        });
+      const first = yield* Effect.forkChild(start());
+      yield* Deferred.await(firstUpsertStarted);
+      const second = yield* Effect.forkChild(start());
+      yield* Effect.yieldNow;
+      assert.equal(codex.startSession.mock.calls.length, 1);
+
+      yield* Deferred.succeed(releaseFirstUpsert, undefined);
+      const firstExit = yield* Fiber.await(first);
+      assert.equal(Exit.isFailure(firstExit), true);
+      if (Exit.isFailure(firstExit)) {
+        assert.equal(
+          Option.getOrUndefined(Cause.findErrorOption(firstExit.cause)),
+          persistenceFailure,
+        );
+      }
+      yield* Fiber.join(second);
+      assert.equal(yield* codex.adapter.hasSession(threadId), true);
+    }).pipe(Effect.provide(layer));
+
+    assert.equal(codex.startSession.mock.calls.length, 2);
+    assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
+  }),
+);
+
+it.effect("ProviderServiceLive rejects stale updates after same-instance replacement", () =>
+  Effect.gen(function* () {
+    const replacementUpsertStarted = yield* Deferred.make<void>();
+    const releaseReplacementUpsert = yield* Deferred.make<void>();
+    const staleTurnStarted = yield* Deferred.make<void>();
+    const releaseStaleTurn = yield* Deferred.make<void>();
+    const threadId = asThreadId("thread-binding-recovery-race");
+    const codex = makeFakeCodexAdapter();
+    codex.sendTurn.mockImplementation((input) =>
+      Deferred.succeed(staleTurnStarted, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseStaleTurn)),
+        Effect.as({
+          threadId: input.threadId,
+          turnId: TurnId.make("turn-stale-provider"),
+        }),
+      ),
+    );
+    let binding: ProviderSessionDirectory.ProviderRuntimeBinding = {
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+      resumeCursor: { opaque: "codex-resume" },
+    };
+    let upsertCount = 0;
+    const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+      upsert: (nextBinding) => {
+        upsertCount += 1;
+        const commit = Effect.sync(() => {
+          binding = { ...binding, ...nextBinding };
+        });
+        return upsertCount === 1
+          ? Deferred.succeed(replacementUpsertStarted, undefined).pipe(
+              Effect.andThen(Deferred.await(releaseReplacementUpsert)),
+              Effect.andThen(commit),
+            )
+          : commit;
+      },
+      getProvider: () => Effect.succeed(binding.provider),
+      getBinding: () => Effect.succeed(Option.some(binding)),
+      listThreadIds: () => Effect.succeed([threadId]),
+      listBindings: () => Effect.succeed([{ ...binding, lastSeenAt: "2026-01-01T00:00:00.000Z" }]),
+    });
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+    const layer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    yield* codex.adapter.startSession({
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const turn = yield* Effect.forkChild(
+        provider.sendTurn({
+          threadId,
+          input: "route before replacement",
+          attachments: [],
+        }),
+      );
+      yield* Deferred.await(staleTurnStarted);
+      const replacement = yield* Effect.forkChild(
+        provider.startSession(
+          threadId,
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          },
+          { activeSession: "replace" },
+        ),
+      );
+      yield* Deferred.await(replacementUpsertStarted);
+      yield* Deferred.succeed(releaseStaleTurn, undefined);
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseReplacementUpsert, undefined);
+      yield* Fiber.join(replacement);
+      yield* Fiber.join(turn);
+    }).pipe(Effect.provide(layer));
+
+    assert.equal(binding.providerInstanceId, codexInstanceId);
+    assert.equal(codex.startSession.mock.calls.length, 2);
+    assert.equal(codex.stopSession.mock.calls.length, 1);
+    assert.equal(codex.sendTurn.mock.calls.length, 1);
+    const activeTurnId =
+      binding.runtimePayload &&
+      typeof binding.runtimePayload === "object" &&
+      "activeTurnId" in binding.runtimePayload
+        ? binding.runtimePayload.activeTurnId
+        : undefined;
+    assert.notEqual(activeTurnId, "turn-stale-provider");
+  }),
+);
+
+it.effect("ProviderServiceLive rejects stale updates after failed same-instance replacement", () =>
+  Effect.gen(function* () {
+    const staleTurnStarted = yield* Deferred.make<void>();
+    const releaseStaleTurn = yield* Deferred.make<void>();
+    const threadId = asThreadId("thread-binding-failed-replacement-race");
+    const harness = makeBindingFailureHarness([
+      {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { opaque: "old-session" },
+      },
+    ]);
+    yield* harness.codex.adapter.startSession({
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+    harness.codex.sendTurn.mockImplementation((input) =>
+      Deferred.succeed(staleTurnStarted, undefined).pipe(
+        Effect.andThen(Deferred.await(releaseStaleTurn)),
+        Effect.as({
+          threadId: input.threadId,
+          turnId: TurnId.make("turn-stale-failed-replacement"),
+        }),
+      ),
+    );
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const turn = yield* Effect.forkChild(
+        provider.sendTurn({
+          threadId,
+          input: "started before failed replacement",
+          attachments: [],
+        }),
+      );
+      yield* Deferred.await(staleTurnStarted);
+      const replacementExit = yield* Effect.exit(
+        provider.startSession(
+          threadId,
+          {
+            provider: CODEX_DRIVER,
+            providerInstanceId: codexInstanceId,
+            threadId,
+            runtimeMode: "full-access",
+          },
+          { activeSession: "replace" },
+        ),
+      );
+      assert.equal(Exit.isFailure(replacementExit), true);
+      yield* Deferred.succeed(releaseStaleTurn, undefined);
+      yield* Fiber.join(turn);
+      assert.equal(harness.upsert.mock.calls.length, 1);
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("ProviderServiceLive compensates an interrupted start after adapter startup", () =>
+  Effect.gen(function* () {
+    const upsertStarted = yield* Deferred.make<void>();
+    const codex = makeFakeCodexAdapter();
+    const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
+      upsert: () => Deferred.succeed(upsertStarted, undefined).pipe(Effect.andThen(Effect.never)),
+      getProvider: () => Effect.die("unused test directory method"),
+      getBinding: () => Effect.succeed(Option.none()),
+      listThreadIds: () => Effect.succeed([]),
+      listBindings: () => Effect.succeed([]),
+    });
+    const registry = makeAdapterRegistryMock({ [CODEX_DRIVER]: codex.adapter });
+    const layer = makeProviderServiceLive().pipe(
+      Layer.provide(Layer.succeed(ProviderAdapterRegistry.ProviderAdapterRegistry, registry)),
+      Layer.provide(Layer.succeed(ProviderSessionDirectory.ProviderSessionDirectory, directory)),
+      Layer.provide(defaultServerSettingsLayer),
+      Layer.provide(AnalyticsService.layerTest),
+      Layer.provide(
+        Layer.succeed(
+          ProviderEventLoggers.ProviderEventLoggers,
+          ProviderEventLoggers.NoOpProviderEventLoggers,
+        ),
+      ),
+    );
+    const threadId = asThreadId("thread-binding-failure-interrupted");
+
+    yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const start = yield* Effect.forkChild(
+        provider.startSession(threadId, {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+      yield* Deferred.await(upsertStarted);
+      yield* Fiber.interrupt(start);
+    }).pipe(Effect.provide(layer));
+
+    assert.deepEqual(codex.stopSession.mock.calls, [[threadId]]);
+    assert.equal(yield* codex.adapter.hasSession(threadId), false);
   }),
 );
 
@@ -435,8 +835,119 @@ it.effect("ProviderServiceLive compensates a resumed session when binding fails"
     }).pipe(Effect.provide(harness.layer));
 
     assert.equal(Exit.isFailure(exit), true);
+    if (Exit.isFailure(exit)) {
+      assert.equal(
+        Option.getOrUndefined(Cause.findErrorOption(exit.cause)),
+        harness.persistenceFailure,
+      );
+    }
     assert.equal(harness.codex.startSession.mock.calls.length, 1);
     assert.deepEqual(harness.codex.stopSession.mock.calls, [[threadId]]);
+  }),
+);
+
+it.effect(
+  "ProviderServiceLive replaces stale target sessions without revoking the old provider",
+  () =>
+    Effect.gen(function* () {
+      const threadId = asThreadId("thread-binding-failure-provider-switch");
+      const harness = makeBindingFailureHarness([
+        {
+          provider: CODEX_DRIVER,
+          providerInstanceId: codexInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+          resumeCursor: { opaque: "codex-resume" },
+        },
+      ]);
+      const previousMcpSession = {
+        environmentId: EnvironmentId.make("environment-test"),
+        threadId,
+        providerSessionId: "provider-session-old-provider",
+        providerInstanceId: codexInstanceId,
+        endpoint: "http://127.0.0.1/mcp",
+        authorizationHeader: "Bearer old-provider",
+      };
+      McpProviderSession.setMcpProviderSession(previousMcpSession);
+      yield* harness.codex.adapter.startSession({
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      yield* harness.claude.adapter.startSession({
+        provider: CLAUDE_AGENT_DRIVER,
+        providerInstanceId: claudeAgentInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+
+      const exit = yield* Effect.gen(function* () {
+        const provider = yield* ProviderService.ProviderService;
+        return yield* Effect.exit(
+          provider.startSession(
+            threadId,
+            {
+              provider: CLAUDE_AGENT_DRIVER,
+              providerInstanceId: claudeAgentInstanceId,
+              threadId,
+              runtimeMode: "full-access",
+            },
+            { activeSession: "reuse" },
+          ),
+        );
+      }).pipe(Effect.provide(harness.layer));
+
+      assert.equal(Exit.isFailure(exit), true);
+      if (Exit.isFailure(exit)) {
+        assert.equal(
+          Option.getOrUndefined(Cause.findErrorOption(exit.cause)),
+          harness.persistenceFailure,
+        );
+      }
+      assert.equal(yield* harness.codex.adapter.hasSession(threadId), true);
+      assert.equal(harness.codex.stopSession.mock.calls.length, 0);
+      assert.deepEqual(harness.claude.stopSession.mock.calls, [[threadId], [threadId]]);
+      assert.equal(yield* harness.claude.adapter.hasSession(threadId), false);
+      assert.equal(McpProviderSession.readMcpProviderSession(threadId), previousMcpSession);
+      McpProviderSession.clearMcpProviderSession(threadId);
+    }),
+);
+
+it.effect("ProviderServiceLive lists only the committed session during provider replacement", () =>
+  Effect.gen(function* () {
+    const threadId = asThreadId("thread-binding-provider-switch-list");
+    const harness = makeBindingFailureHarness([
+      {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+        resumeCursor: { opaque: "codex-resume" },
+      },
+    ]);
+    yield* harness.codex.adapter.startSession({
+      provider: CODEX_DRIVER,
+      providerInstanceId: codexInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+    yield* harness.claude.adapter.startSession({
+      provider: CLAUDE_AGENT_DRIVER,
+      providerInstanceId: claudeAgentInstanceId,
+      threadId,
+      runtimeMode: "full-access",
+    });
+
+    const sessions = yield* Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      return yield* provider.listSessions();
+    }).pipe(Effect.provide(harness.layer));
+
+    assert.deepEqual(
+      sessions.map((session) => session.providerInstanceId),
+      [codexInstanceId],
+    );
   }),
 );
 
@@ -1241,6 +1752,51 @@ routing.layer("ProviderServiceLive routing", (it) => {
           .map((session) => session.provider),
         ["claudeAgent"],
       );
+    }),
+  );
+
+  it.effect("finishes stale-session cleanup when interrupted after replacement persistence", () =>
+    Effect.gen(function* () {
+      const provider = yield* ProviderService.ProviderService;
+      const threadId = asThreadId("thread-provider-replacement-interrupted");
+      const staleStopStarted = yield* Deferred.make<void>();
+      const releaseStaleStop = yield* Deferred.make<void>();
+
+      yield* provider.startSession(threadId, {
+        provider: CODEX_DRIVER,
+        providerInstanceId: codexInstanceId,
+        threadId,
+        runtimeMode: "full-access",
+      });
+      const originalStopSession = routing.codex.stopSession.getMockImplementation();
+      assert.equal(originalStopSession !== undefined, true);
+      routing.codex.stopSession.mockImplementation((stoppedThreadId) =>
+        Deferred.succeed(staleStopStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseStaleStop)),
+          Effect.andThen(originalStopSession!(stoppedThreadId)),
+        ),
+      );
+
+      const replacement = yield* Effect.forkChild(
+        provider.startSession(threadId, {
+          provider: CLAUDE_AGENT_DRIVER,
+          providerInstanceId: claudeAgentInstanceId,
+          threadId,
+          runtimeMode: "full-access",
+        }),
+      );
+      yield* Deferred.await(staleStopStarted);
+      const interruption = yield* Effect.forkChild(Fiber.interrupt(replacement));
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseStaleStop, undefined);
+      yield* Fiber.join(interruption);
+      routing.codex.stopSession.mockImplementation(originalStopSession!);
+
+      assert.equal(yield* routing.codex.adapter.hasSession(threadId), false);
+      assert.equal(yield* routing.claude.adapter.hasSession(threadId), true);
+      const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
+      const binding = Option.getOrUndefined(yield* directory.getBinding(threadId));
+      assert.equal(binding?.providerInstanceId, claudeAgentInstanceId);
     }),
   );
 
