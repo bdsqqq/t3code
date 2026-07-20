@@ -756,11 +756,20 @@ it.effect("ProviderServiceLive rejects stale updates after same-instance replace
       resumeCursor: { opaque: "codex-resume" },
     };
     let upsertCount = 0;
+    let staleTurnWrite: ProviderSessionDirectory.ProviderRuntimeBinding | undefined;
     const directory = ProviderSessionDirectory.ProviderSessionDirectory.of({
       upsert: (nextBinding) => {
         upsertCount += 1;
         const commit = Effect.sync(() => {
           binding = { ...binding, ...nextBinding };
+          if (
+            nextBinding.runtimePayload &&
+            typeof nextBinding.runtimePayload === "object" &&
+            "activeTurnId" in nextBinding.runtimePayload &&
+            nextBinding.runtimePayload.activeTurnId === "turn-stale-provider"
+          ) {
+            staleTurnWrite = nextBinding;
+          }
         });
         return upsertCount === 1
           ? Deferred.succeed(replacementUpsertStarted, undefined).pipe(
@@ -828,17 +837,11 @@ it.effect("ProviderServiceLive rejects stale updates after same-instance replace
     assert.equal(codex.startSession.mock.calls.length, 2);
     assert.equal(codex.stopSession.mock.calls.length, 1);
     assert.equal(codex.sendTurn.mock.calls.length, 1);
-    const activeTurnId =
-      binding.runtimePayload &&
-      typeof binding.runtimePayload === "object" &&
-      "activeTurnId" in binding.runtimePayload
-        ? binding.runtimePayload.activeTurnId
-        : undefined;
-    assert.notEqual(activeTurnId, "turn-stale-provider");
+    assert.equal(staleTurnWrite, undefined);
   }),
 );
 
-it.effect("ProviderServiceLive rejects stale updates after failed same-instance replacement", () =>
+it.effect("ProviderServiceLive does not persist a stale turn after failed replacement", () =>
   Effect.gen(function* () {
     const staleTurnStarted = yield* Deferred.make<void>();
     const releaseStaleTurn = yield* Deferred.make<void>();
@@ -852,6 +855,17 @@ it.effect("ProviderServiceLive rejects stale updates after failed same-instance 
         resumeCursor: { opaque: "old-session" },
       },
     ]);
+    let replacementWriteSeen = false;
+    let delayedWrite: ProviderSessionDirectory.ProviderRuntimeBinding | undefined;
+    harness.upsert.mockImplementation((binding) => {
+      if (!replacementWriteSeen) {
+        replacementWriteSeen = true;
+        return Effect.fail(harness.persistenceFailure);
+      }
+      return Effect.sync(() => {
+        delayedWrite = binding;
+      });
+    });
     yield* harness.codex.adapter.startSession({
       provider: CODEX_DRIVER,
       providerInstanceId: codexInstanceId,
@@ -893,7 +907,7 @@ it.effect("ProviderServiceLive rejects stale updates after failed same-instance 
       assert.equal(Exit.isFailure(replacementExit), true);
       yield* Deferred.succeed(releaseStaleTurn, undefined);
       yield* Fiber.join(turn);
-      assert.equal(harness.upsert.mock.calls.length, 1);
+      assert.equal(delayedWrite, undefined);
     }).pipe(Effect.provide(harness.layer));
   }),
 );
@@ -1196,7 +1210,7 @@ it.effect("ProviderServiceLive compensates a started session with a mismatched p
   }).pipe(Effect.provide(mcpTestRegistryLayer)),
 );
 
-it.effect("ProviderServiceLive compensates a recovered session with a mismatched provider", () =>
+it.effect("ProviderServiceLive restores MCP state when recovery mismatch cleanup fails", () =>
   Effect.gen(function* () {
     const registry = yield* McpSessionRegistry.McpSessionRegistry;
     const threadId = asThreadId("thread-provider-mismatch-recovery");
@@ -1482,43 +1496,6 @@ it.effect("ProviderServiceLive commits the new MCP credential after successful r
   }).pipe(Effect.provide(mcpTestRegistryLayer)),
 );
 
-it.effect("ProviderServiceLive lists only the committed session during provider replacement", () =>
-  Effect.gen(function* () {
-    const threadId = asThreadId("thread-binding-provider-switch-list");
-    const harness = makeBindingFailureHarness([
-      {
-        provider: CODEX_DRIVER,
-        providerInstanceId: codexInstanceId,
-        threadId,
-        runtimeMode: "full-access",
-        resumeCursor: { opaque: "codex-resume" },
-      },
-    ]);
-    yield* harness.codex.adapter.startSession({
-      provider: CODEX_DRIVER,
-      providerInstanceId: codexInstanceId,
-      threadId,
-      runtimeMode: "full-access",
-    });
-    yield* harness.claude.adapter.startSession({
-      provider: CLAUDE_AGENT_DRIVER,
-      providerInstanceId: claudeAgentInstanceId,
-      threadId,
-      runtimeMode: "full-access",
-    });
-
-    const sessions = yield* Effect.gen(function* () {
-      const provider = yield* ProviderService.ProviderService;
-      return yield* provider.listSessions();
-    }).pipe(Effect.provide(harness.layer));
-
-    assert.deepEqual(
-      sessions.map((session) => session.providerInstanceId),
-      [codexInstanceId],
-    );
-  }),
-);
-
 it.effect("ProviderServiceLive fails listSessions when committed bindings cannot be read", () =>
   Effect.gen(function* () {
     const readFailure = new ProviderSessionDirectoryPersistenceError({
@@ -1526,13 +1503,6 @@ it.effect("ProviderServiceLive fails listSessions when committed bindings cannot
       detail: "injected binding read failure",
     });
     const harness = makeBindingFailureHarness([], readFailure);
-    const threadId = asThreadId("thread-binding-list-read-failure");
-    yield* harness.codex.adapter.startSession({
-      provider: CODEX_DRIVER,
-      providerInstanceId: codexInstanceId,
-      threadId,
-      runtimeMode: "full-access",
-    });
 
     const exit = yield* Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
@@ -2280,7 +2250,7 @@ routing.layer("ProviderServiceLive routing", (it) => {
     }),
   );
 
-  it.effect("hides active sessions that are not owned by their persisted binding", () =>
+  it.effect("lists only active sessions owned by their persisted binding", () =>
     Effect.gen(function* () {
       const provider = yield* ProviderService.ProviderService;
       const directory = yield* ProviderSessionDirectory.ProviderSessionDirectory;
@@ -2293,6 +2263,14 @@ routing.layer("ProviderServiceLive routing", (it) => {
         cwd: "/tmp/project-binding-mismatch",
         runtimeMode: "full-access",
       });
+
+      assert.deepEqual(
+        (yield* provider.listSessions())
+          .filter((session) => session.threadId === threadId)
+          .map((session) => session.providerInstanceId),
+        [codexInstanceId],
+      );
+
       yield* directory.upsert({
         threadId,
         provider: ProviderDriverKind.make("claudeAgent"),
