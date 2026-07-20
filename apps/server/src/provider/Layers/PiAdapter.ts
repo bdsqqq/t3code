@@ -1,0 +1,752 @@
+import {
+  EventId,
+  ProviderDriverKind,
+  type ProviderInstanceId,
+  type ProviderRuntimeEvent,
+  type ProviderSession,
+  RuntimeItemId,
+  type ThreadId,
+  TurnId,
+} from "@t3tools/contracts";
+import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
+import * as Crypto from "effect/Crypto";
+import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
+import * as Path from "effect/Path";
+import * as Queue from "effect/Queue";
+import * as Result from "effect/Result";
+import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
+import * as Scope from "effect/Scope";
+import * as Stream from "effect/Stream";
+import * as SynchronizedRef from "effect/SynchronizedRef";
+import { ChildProcessSpawner } from "effect/unstable/process";
+
+import {
+  ProviderAdapterRequestError,
+  ProviderAdapterSessionNotFoundError,
+  ProviderAdapterValidationError,
+  type ProviderAdapterError,
+} from "../Errors.ts";
+import { decodePiModelSlug } from "../pi/PiModel.ts";
+import {
+  makePiRpcClient,
+  PiRpcCommandError,
+  type PiRpcClient,
+  type PiRpcError,
+  type PiRpcSpawnOptions,
+} from "../pi/PiRpcClient.ts";
+import { PiThinkingLevel, type PiRpcEvent } from "../pi/PiRpcSchema.ts";
+import {
+  allocateFreshPiSessionFile,
+  cleanupFreshPiSessionFile,
+  piInstanceStateRoot,
+  PiSessionCursor,
+  piStateMatchesCursor,
+  validatePiResumeSessionFile,
+} from "../pi/PiSessionFile.ts";
+import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
+
+const PROVIDER = ProviderDriverKind.make("pi");
+const isPiRpcCommandError = Schema.is(PiRpcCommandError);
+const DETERMINISTIC_ARGS = [
+  "--offline",
+  "--no-context-files",
+  "--no-extensions",
+  "--no-skills",
+  "--no-prompt-templates",
+] as const;
+
+export type PiRpcClientFactory = (
+  options: PiRpcSpawnOptions,
+) => Effect.Effect<PiRpcClient, PiRpcError, ChildProcessSpawner.ChildProcessSpawner | Scope.Scope>;
+
+export interface PiAdapterOptions {
+  readonly binaryPath: string;
+  readonly args?: ReadonlyArray<string>;
+  readonly providerInstanceId: ProviderInstanceId;
+  readonly stateDir: string;
+  readonly environment?: Readonly<Record<string, string | undefined>>;
+  readonly makeRpcClient?: PiRpcClientFactory;
+  readonly onSessionPublished?: () => Effect.Effect<void>;
+}
+
+interface ActiveTurn {
+  readonly id: TurnId;
+  readonly assistantItemId: RuntimeItemId;
+  readonly reasoningItemId: RuntimeItemId;
+  readonly toolItemIds: Map<string, RuntimeItemId>;
+  assistantText: string;
+  assistantStarted: boolean;
+  reasoningStarted: boolean;
+  interruptRequested: boolean;
+  terminal: boolean;
+}
+
+interface SessionContext {
+  session: ProviderSession;
+  readonly cursor: PiSessionCursor;
+  readonly lease: SessionFileLease;
+  readonly client: PiRpcClient;
+  readonly scope: Scope.Closeable;
+  eventFiber: Fiber.Fiber<void>;
+  activeTurn: ActiveTurn | undefined;
+  closing: boolean;
+  stopped: boolean;
+}
+
+interface SessionFileLease {
+  startupOwned: boolean;
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const string = (value: unknown): string | undefined =>
+  typeof value === "string" && value.length > 0 ? value : undefined;
+const detail = (value: unknown): string | undefined => {
+  if (typeof value === "string") return value.trim() || undefined;
+  if (value === undefined || value === null) return undefined;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+};
+
+export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAdapterOptions) {
+  const crypto = yield* Crypto.Crypto;
+  const fs = yield* FileSystem.FileSystem;
+  const path = yield* Path.Path;
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const provideFiles = <A, E>(effect: Effect.Effect<A, E, FileSystem.FileSystem | Path.Path>) =>
+    effect.pipe(
+      Effect.provideService(FileSystem.FileSystem, fs),
+      Effect.provideService(Path.Path, path),
+    );
+  const root = yield* piInstanceStateRoot({
+    stateDir: options.stateDir,
+    instanceId: options.providerInstanceId,
+  }).pipe(Effect.mapError((cause) => validation("startSession", "Invalid Pi state root.", cause)));
+  const sessions = new Map<ThreadId, SessionContext>();
+  const sessionFileLeases = new Map<string, SessionFileLease>();
+  const threadLocks = yield* SynchronizedRef.make(new Map<ThreadId, Semaphore.Semaphore>());
+  const getThreadLock = (threadId: ThreadId) =>
+    SynchronizedRef.modifyEffect(threadLocks, (locks) => {
+      const existing = locks.get(threadId);
+      if (existing) return Effect.succeed([existing, locks] as const);
+      return Semaphore.make(1).pipe(
+        Effect.map((lock) => [lock, new Map(locks).set(threadId, lock)] as const),
+      );
+    });
+  const withThreadLock = <A, E, R>(threadId: ThreadId, effect: Effect.Effect<A, E, R>) =>
+    Effect.flatMap(getThreadLock(threadId), (lock) => lock.withPermit(effect));
+  const events = yield* Queue.unbounded<ProviderRuntimeEvent>();
+  const now = Effect.map(DateTime.now, DateTime.formatIso);
+  const uuid = crypto.randomUUIDv4.pipe(
+    Effect.mapError((cause) => request("crypto/randomUUIDv4", cause)),
+  );
+  const stamp = Effect.all({ eventId: Effect.map(uuid, EventId.make), createdAt: now });
+
+  function validation(operation: string, issue: string, cause?: unknown) {
+    return new ProviderAdapterValidationError({ provider: PROVIDER, operation, issue, cause });
+  }
+  function request(method: string, cause: unknown) {
+    return new ProviderAdapterRequestError({
+      provider: PROVIDER,
+      method,
+      detail: isRecord(cause) && typeof cause.detail === "string" ? cause.detail : String(cause),
+      cause,
+    });
+  }
+  const offer = (event: ProviderRuntimeEvent) => Queue.offer(events, event).pipe(Effect.asVoid);
+  const base = Effect.fn("PiAdapter.eventBase")(function* (ctx: SessionContext, turn?: ActiveTurn) {
+    return {
+      ...(yield* stamp),
+      provider: PROVIDER,
+      providerInstanceId: options.providerInstanceId,
+      threadId: ctx.session.threadId,
+      ...(turn ? { turnId: turn.id } : {}),
+    } as const;
+  });
+  const raw = (event: PiRpcEvent) => ({
+    source: "pi.rpc.notification" as const,
+    method: isRecord(event) ? string(event.type) : undefined,
+    payload: event,
+  });
+
+  const publishTerminal = Effect.fn("PiAdapter.publishTerminal")(function* (
+    ctx: SessionContext,
+    expected: ActiveTurn,
+    terminalEvents: ReadonlyArray<ProviderRuntimeEvent>,
+    status: "ready" | "error",
+    errorMessage?: string,
+  ) {
+    return yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (ctx.activeTurn !== expected || expected.terminal) return false;
+        expected.terminal = true;
+        ctx.activeTurn = undefined;
+        yield* Effect.forEach(terminalEvents, offer, { discard: true });
+        const { activeTurnId: _, ...session } = ctx.session;
+        ctx.session = {
+          ...session,
+          status,
+          ...(status === "ready" ? { resumeCursor: ctx.cursor } : {}),
+          ...(errorMessage ? { lastError: errorMessage } : {}),
+          updatedAt: yield* now,
+        };
+        return true;
+      }),
+    );
+  });
+
+  const close = Effect.fn("PiAdapter.close")(function* (ctx: SessionContext) {
+    yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (ctx.stopped || ctx.closing) return;
+        ctx.closing = true;
+        const turn = ctx.activeTurn;
+        if (turn && !turn.terminal) {
+          const completedEvent = {
+            type: "turn.completed",
+            ...(yield* base(ctx, turn)),
+            payload: { state: "interrupted", stopReason: "abort" },
+          } as const;
+          yield* publishTerminal(ctx, turn, [completedEvent], "ready");
+        }
+        const { activeTurnId: _, ...session } = ctx.session;
+        ctx.session = { ...session, status: "closed", updatedAt: yield* now };
+        yield* ctx.client.close().pipe(Effect.ignore);
+        yield* Scope.close(ctx.scope, Exit.void).pipe(Effect.ignore);
+        if (sessions.get(ctx.session.threadId) === ctx) {
+          sessions.delete(ctx.session.threadId);
+        }
+        if (!ctx.lease.startupOwned && sessionFileLeases.get(ctx.cursor.sessionFile) === ctx.lease)
+          sessionFileLeases.delete(ctx.cursor.sessionFile);
+        ctx.stopped = true;
+      }),
+    );
+  });
+
+  const failActive = Effect.fn("PiAdapter.failActive")(function* (
+    ctx: SessionContext,
+    message: string,
+    event?: PiRpcEvent,
+    fatal = true,
+  ) {
+    const turn = ctx.activeTurn;
+    if (!turn || turn.terminal) return;
+    const errorEvent = {
+      type: "runtime.error",
+      ...(yield* base(ctx, turn)),
+      payload: { message, class: "transport_error", ...(event ? { detail: event } : {}) },
+      ...(event ? { raw: raw(event) } : {}),
+    } as const;
+    const completedEvent = {
+      type: "turn.completed",
+      ...(yield* base(ctx, turn)),
+      payload: { state: "failed", errorMessage: message },
+    } as const;
+    yield* publishTerminal(
+      ctx,
+      turn,
+      [errorEvent, completedEvent],
+      fatal ? "error" : "ready",
+      fatal ? message : undefined,
+    );
+  });
+
+  const itemForTool = Effect.fn("PiAdapter.itemForTool")(function* (
+    turn: ActiveTurn,
+    event: Record<string, unknown>,
+  ) {
+    const key =
+      string(event.toolCallId) ?? string(event.toolCallID) ?? string(event.toolName) ?? "tool";
+    const existing = turn.toolItemIds.get(key);
+    if (existing) return existing;
+    const id = RuntimeItemId.make(`pi-tool:${turn.id}:${key}`);
+    turn.toolItemIds.set(key, id);
+    return id;
+  });
+
+  const handleEvent = Effect.fn("PiAdapter.handleEvent")(function* (
+    ctx: SessionContext,
+    native: PiRpcEvent,
+  ) {
+    if ("_tag" in native && native._tag === "PiRpcProtocolFailureEvent") {
+      yield* failActive(ctx, String(native.detail), native);
+      yield* close(ctx);
+      return;
+    }
+    const event = native as Record<string, unknown>;
+    const type = string(event.type);
+    const turn = ctx.activeTurn;
+    if (!turn || turn.terminal) return;
+    if (type === "message_update") {
+      const update = isRecord(event.assistantMessageEvent)
+        ? event.assistantMessageEvent
+        : undefined;
+      const updateType = string(update?.type);
+      const delta = string(update?.delta);
+      if ((updateType === "text_delta" || updateType === "thinking_delta") && delta) {
+        const isAssistant = updateType === "text_delta";
+        const itemId = isAssistant ? turn.assistantItemId : turn.reasoningItemId;
+        const started = isAssistant ? turn.assistantStarted : turn.reasoningStarted;
+        if (!started) {
+          if (isAssistant) turn.assistantStarted = true;
+          else turn.reasoningStarted = true;
+          yield* offer({
+            type: "item.started",
+            ...(yield* base(ctx, turn)),
+            itemId,
+            payload: {
+              itemType: isAssistant ? "assistant_message" : "reasoning",
+              status: "inProgress",
+              title: isAssistant ? "Assistant message" : "Reasoning",
+            },
+            raw: raw(native),
+          });
+        }
+        if (isAssistant) turn.assistantText += delta;
+        yield* offer({
+          type: "content.delta",
+          ...(yield* base(ctx, turn)),
+          itemId,
+          payload: {
+            streamKind: isAssistant ? "assistant_text" : "reasoning_text",
+            delta,
+          },
+          raw: raw(native),
+        });
+      } else if (updateType === "error") {
+        yield* failActive(
+          ctx,
+          string(update?.reason) ?? string(update?.error) ?? "Pi assistant failed.",
+          native,
+        );
+      }
+      return;
+    }
+    if (type?.startsWith("tool_execution_")) {
+      const lifecycle =
+        type === "tool_execution_start"
+          ? "item.started"
+          : type === "tool_execution_update"
+            ? "item.updated"
+            : "item.completed";
+      const itemId = yield* itemForTool(turn, event);
+      const isError = event.isError === true;
+      yield* offer({
+        type: lifecycle,
+        ...(yield* base(ctx, turn)),
+        itemId,
+        payload: {
+          itemType: "dynamic_tool_call",
+          status:
+            lifecycle === "item.completed" ? (isError ? "failed" : "completed") : "inProgress",
+          title: string(event.toolName) ?? "Tool call",
+          ...(detail(event.result ?? event.partialResult ?? event.args)
+            ? { detail: detail(event.result ?? event.partialResult ?? event.args) }
+            : {}),
+          data: native,
+        },
+        raw: raw(native),
+      } as ProviderRuntimeEvent);
+      return;
+    }
+    if (type === "agent_settled") {
+      const state = yield* ctx.client.getState().pipe(
+        Effect.mapError((cause) => request("get_state", cause)),
+        Effect.exit,
+      );
+      if (ctx.activeTurn !== turn || turn.terminal || ctx.closing || ctx.stopped) return;
+      if (Exit.isFailure(state) || !piStateMatchesCursor(state.value, ctx.cursor)) {
+        yield* failActive(ctx, "Pi session identity drifted during settlement.", native);
+        yield* close(ctx);
+        return;
+      }
+      const terminalEvents: ProviderRuntimeEvent[] = [];
+      if (turn.assistantText.trim().length > 0) {
+        terminalEvents.push({
+          type: "item.completed",
+          ...(yield* base(ctx, turn)),
+          itemId: turn.assistantItemId,
+          payload: {
+            itemType: "assistant_message",
+            status: "completed",
+            title: "Assistant message",
+          },
+          raw: raw(native),
+        });
+      }
+      if (turn.reasoningStarted) {
+        terminalEvents.push({
+          type: "item.completed",
+          ...(yield* base(ctx, turn)),
+          itemId: turn.reasoningItemId,
+          payload: {
+            itemType: "reasoning",
+            status: "completed",
+            title: "Reasoning",
+          },
+          raw: raw(native),
+        });
+      }
+      terminalEvents.push({
+        type: "turn.completed",
+        ...(yield* base(ctx, turn)),
+        payload: {
+          state: turn.interruptRequested ? "interrupted" : "completed",
+          stopReason: turn.interruptRequested ? "abort" : null,
+        },
+        raw: raw(native),
+      });
+      yield* publishTerminal(ctx, turn, terminalEvents, "ready");
+    }
+    // agent_end and turn_end are native cycle boundaries, not T3 settlement.
+  });
+
+  const requireSession = (threadId: ThreadId) => {
+    const ctx = sessions.get(threadId);
+    return ctx && !ctx.stopped
+      ? Effect.succeed(ctx)
+      : Effect.fail(new ProviderAdapterSessionNotFoundError({ provider: PROVIDER, threadId }));
+  };
+
+  const startSession: ProviderAdapterShape<ProviderAdapterError>["startSession"] = (input) =>
+    withThreadLock(
+      input.threadId,
+      Effect.scoped(
+        Effect.gen(function* () {
+          if (input.runtimeMode !== "full-access")
+            return yield* validation("startSession", "Pi supports only full-access runtime mode.");
+          if (input.provider && input.provider !== PROVIDER)
+            return yield* validation("startSession", `Expected provider '${PROVIDER}'.`);
+          if (input.providerInstanceId && input.providerInstanceId !== options.providerInstanceId)
+            return yield* validation(
+              "startSession",
+              "Provider instance does not match this Pi adapter.",
+            );
+          if (sessions.has(input.threadId))
+            return yield* validation(
+              "startSession",
+              `Thread '${input.threadId}' is already active.`,
+            );
+          const cwd = yield* provideFiles(
+            fs.realPath(path.resolve(input.cwd ?? process.cwd())),
+          ).pipe(
+            Effect.mapError((cause) =>
+              validation("startSession", "Invalid Pi working directory.", cause),
+            ),
+          );
+          const fresh = input.resumeCursor === undefined;
+          let cursor: PiSessionCursor | undefined;
+          let freshFile: { readonly sessionFile: string } | undefined;
+          const scope = yield* Scope.make();
+          let transferred = false;
+          let leasedFile: string | undefined;
+          let startupLease: SessionFileLease | undefined;
+          let candidateCtx: SessionContext | undefined;
+          yield* Effect.addFinalizer(() =>
+            transferred
+              ? Effect.void
+              : Effect.uninterruptible(
+                  Effect.gen(function* () {
+                    yield* Scope.close(scope, Exit.void).pipe(Effect.ignore);
+                    if (candidateCtx && sessions.get(input.threadId) === candidateCtx)
+                      sessions.delete(input.threadId);
+                    const ownsStartupLease =
+                      leasedFile !== undefined &&
+                      startupLease !== undefined &&
+                      sessionFileLeases.get(leasedFile) === startupLease;
+                    const releaseStartupLease = Effect.sync(() => {
+                      if (ownsStartupLease && sessionFileLeases.get(leasedFile!) === startupLease)
+                        sessionFileLeases.delete(leasedFile!);
+                    });
+                    yield* freshFile && (leasedFile === undefined || ownsStartupLease)
+                      ? provideFiles(cleanupFreshPiSessionFile(freshFile)).pipe(
+                          Effect.ignore,
+                          Effect.ensuring(releaseStartupLease),
+                        )
+                      : releaseStartupLease;
+                  }),
+                ),
+          );
+          if (fresh) {
+            freshFile = yield* provideFiles(
+              allocateFreshPiSessionFile({ stateRoot: root, fileId: yield* uuid }),
+            ).pipe(Effect.mapError((cause) => request("session/allocate", cause)));
+          } else {
+            cursor = yield* Schema.decodeUnknownEffect(PiSessionCursor)(input.resumeCursor).pipe(
+              Effect.mapError((cause) =>
+                validation("startSession", "Invalid Pi resume cursor.", cause),
+              ),
+            );
+            cursor = yield* provideFiles(
+              validatePiResumeSessionFile({ stateRoot: root, cursor, cwd }),
+            ).pipe(
+              Effect.mapError((cause) =>
+                validation("startSession", "Invalid Pi resume session file.", cause),
+              ),
+            );
+          }
+          const candidateFile = cursor?.sessionFile ?? freshFile!.sessionFile;
+          const leaseOwner = sessionFileLeases.get(candidateFile);
+          if (leaseOwner !== undefined)
+            return yield* validation("startSession", "Pi session file already has a live writer.");
+          startupLease = { startupOwned: true };
+          sessionFileLeases.set(candidateFile, startupLease);
+          leasedFile = candidateFile;
+          const factory: PiRpcClientFactory = options.makeRpcClient ?? makePiRpcClient;
+          const spawn = factory({
+            command: options.binaryPath,
+            args: [
+              ...(options.args ?? []),
+              "--session",
+              cursor?.sessionFile ?? freshFile!.sessionFile,
+              ...DETERMINISTIC_ARGS,
+            ],
+            cwd,
+            ...(options.environment ? { env: options.environment } : {}),
+          }).pipe(
+            Effect.provideService(Scope.Scope, scope),
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+          );
+          const started = yield* spawn.pipe(
+            Effect.flatMap((client) =>
+              client.getState().pipe(Effect.map((state) => ({ client, state }))),
+            ),
+            Effect.mapError((cause) => request("session/start", cause)),
+            Effect.result,
+          );
+          if (
+            fresh &&
+            Result.isSuccess(started) &&
+            started.success.state.sessionFile === freshFile!.sessionFile &&
+            typeof started.success.state.sessionId === "string" &&
+            started.success.state.sessionId.length > 0 &&
+            started.success.state.sessionId.trim() === started.success.state.sessionId
+          ) {
+            cursor = {
+              schemaVersion: 1,
+              sessionFile: freshFile!.sessionFile,
+              sessionId: started.success.state.sessionId,
+            };
+          }
+          if (
+            Result.isFailure(started) ||
+            cursor === undefined ||
+            !piStateMatchesCursor(started.success.state, cursor)
+          ) {
+            if (Result.isSuccess(started)) yield* started.success.client.close();
+            yield* Scope.close(scope, Exit.void).pipe(Effect.ignore);
+            if (Result.isFailure(started)) return yield* started.failure;
+            return yield* validation("startSession", "Pi reported a different session path or id.");
+          }
+          // Fresh Pi must have replaced the private placeholder with its exact header.
+          cursor = yield* provideFiles(
+            validatePiResumeSessionFile({ stateRoot: root, cursor, cwd }),
+          ).pipe(
+            Effect.mapError((cause) =>
+              validation("startSession", "Pi session header validation failed.", cause),
+            ),
+            Effect.onError(() =>
+              started.success.client
+                .close()
+                .pipe(
+                  Effect.andThen(Scope.close(scope, Exit.void)),
+                  Effect.andThen(
+                    freshFile ? provideFiles(cleanupFreshPiSessionFile(freshFile)) : Effect.void,
+                  ),
+                  Effect.ignore,
+                ),
+            ),
+          );
+          const createdAt = yield* now;
+          const session: ProviderSession = {
+            provider: PROVIDER,
+            providerInstanceId: options.providerInstanceId,
+            threadId: input.threadId,
+            status: "ready",
+            runtimeMode: "full-access",
+            cwd,
+            ...(input.modelSelection ? { model: input.modelSelection.model } : {}),
+            resumeCursor: cursor,
+            createdAt,
+            updatedAt: createdAt,
+          };
+          const ctx: SessionContext = {
+            session,
+            cursor,
+            lease: startupLease,
+            client: started.success.client,
+            scope,
+            eventFiber: undefined as never,
+            activeTurn: undefined,
+            closing: false,
+            stopped: false,
+          };
+          candidateCtx = ctx;
+          sessions.set(input.threadId, ctx);
+          if (options.onSessionPublished) yield* options.onSessionPublished();
+          ctx.eventFiber = yield* started.success.client.events.pipe(
+            Stream.runForEach((event) => handleEvent(ctx, event)),
+            Effect.ensuring(
+              Effect.suspend(() =>
+                ctx.closing || ctx.stopped
+                  ? Effect.void
+                  : failActive(ctx, "Pi RPC event stream ended unexpectedly.").pipe(
+                      Effect.andThen(close(ctx)),
+                      Effect.orDie,
+                    ),
+              ),
+            ),
+            Effect.orDie,
+            Effect.forkIn(scope),
+          );
+          yield* Effect.yieldNow;
+          if (ctx.closing || ctx.stopped)
+            return yield* validation("startSession", "Pi RPC event stream ended during startup.");
+          startupLease.startupOwned = false;
+          transferred = true;
+          return session;
+        }),
+      ),
+    );
+
+  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) =>
+    withThreadLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const ctx = yield* requireSession(input.threadId);
+        if (ctx.activeTurn || ctx.session.status !== "ready")
+          return yield* validation("sendTurn", "Pi session must be idle before prompting.");
+        if (!input.input) return yield* validation("sendTurn", "Pi requires non-empty text input.");
+        if (input.attachments && input.attachments.length > 0)
+          return yield* validation("sendTurn", "Pi attachments are not supported yet.");
+        const selection = input.modelSelection;
+        if (selection && selection.instanceId !== options.providerInstanceId)
+          return yield* validation(
+            "sendTurn",
+            "Model selection belongs to another provider instance.",
+          );
+        const parsed = selection ? decodePiModelSlug(selection.model) : undefined;
+        if (!parsed)
+          return yield* validation("sendTurn", "A valid Pi model selection is required.");
+        const available = yield* ctx.client
+          .getAvailableModels()
+          .pipe(Effect.mapError((cause) => request("get_available_models", cause)));
+        if (
+          !available.models.some((m) => m.provider === parsed.provider && m.id === parsed.modelId)
+        )
+          return yield* validation("sendTurn", "Selected Pi model is not currently available.");
+        yield* ctx.client
+          .setModel(parsed.provider, parsed.modelId)
+          .pipe(Effect.mapError((cause) => request("set_model", cause)));
+        const thinking = getModelSelectionStringOptionValue(selection, "thinkingLevel");
+        if (thinking !== undefined) {
+          const level = yield* Schema.decodeUnknownEffect(PiThinkingLevel)(thinking).pipe(
+            Effect.mapError((cause) => validation("sendTurn", "Invalid Pi thinking level.", cause)),
+          );
+          yield* ctx.client
+            .setThinkingLevel(level)
+            .pipe(Effect.mapError((cause) => request("set_thinking_level", cause)));
+        }
+        if (
+          ctx.closing ||
+          ctx.stopped ||
+          sessions.get(input.threadId) !== ctx ||
+          ctx.session.status !== "ready"
+        )
+          return yield* new ProviderAdapterSessionNotFoundError({
+            provider: PROVIDER,
+            threadId: input.threadId,
+          });
+        const turnId = TurnId.make(yield* uuid);
+        const turn: ActiveTurn = {
+          id: turnId,
+          assistantItemId: RuntimeItemId.make(`pi-assistant:${turnId}`),
+          reasoningItemId: RuntimeItemId.make(`pi-reasoning:${turnId}`),
+          toolItemIds: new Map(),
+          assistantText: "",
+          assistantStarted: false,
+          reasoningStarted: false,
+          interruptRequested: false,
+          terminal: false,
+        };
+        ctx.activeTurn = turn;
+        ctx.session = {
+          ...ctx.session,
+          status: "running",
+          activeTurnId: turnId,
+          updatedAt: yield* now,
+        };
+        yield* offer({
+          type: "turn.started",
+          ...(yield* base(ctx, turn)),
+          payload: { model: selection!.model, ...(thinking ? { effort: thinking } : {}) },
+        });
+        const prompted = yield* ctx.client.prompt(input.input).pipe(Effect.result);
+        if (Result.isFailure(prompted)) {
+          const reusable = isPiRpcCommandError(prompted.failure);
+          yield* failActive(ctx, "Pi prompt failed.", undefined, !reusable);
+          if (!reusable) yield* close(ctx);
+          return yield* request("prompt", prompted.failure);
+        }
+        return { threadId: input.threadId, turnId, resumeCursor: ctx.cursor };
+      }).pipe(
+        Effect.onInterrupt(() =>
+          Effect.suspend(() => {
+            const ctx = sessions.get(input.threadId);
+            return ctx ? close(ctx) : Effect.void;
+          }),
+        ),
+      ),
+    );
+
+  const interruptTurn: ProviderAdapterShape<ProviderAdapterError>["interruptTurn"] = (
+    threadId,
+    turnId,
+  ) =>
+    withThreadLock(
+      threadId,
+      Effect.gen(function* () {
+        const ctx = yield* requireSession(threadId);
+        const turn = ctx.activeTurn;
+        if (!turn || (turnId && turn.id !== turnId))
+          return yield* validation("interruptTurn", "No matching active Pi turn.");
+        turn.interruptRequested = true;
+        yield* ctx.client.abort().pipe(Effect.mapError((cause) => request("abort", cause)));
+      }),
+    );
+  const unsupported = (operation: string, threadId: ThreadId) =>
+    requireSession(threadId).pipe(
+      Effect.andThen(validation(operation, `Pi does not support ${operation}.`)),
+    );
+  const stopSession = (threadId: ThreadId) =>
+    withThreadLock(threadId, sessions.has(threadId) ? close(sessions.get(threadId)!) : Effect.void);
+  const stopAll = () =>
+    Effect.forEach([...sessions.keys()], stopSession, { discard: true, concurrency: "unbounded" });
+  yield* Effect.addFinalizer(() => stopAll().pipe(Effect.ignore));
+
+  return {
+    provider: PROVIDER,
+    capabilities: { sessionModelSwitch: "in-session" },
+    startSession,
+    sendTurn,
+    interruptTurn,
+    respondToRequest: (threadId) => unsupported("respondToRequest", threadId),
+    respondToUserInput: (threadId) => unsupported("respondToUserInput", threadId),
+    readThread: (threadId) => unsupported("readThread", threadId),
+    rollbackThread: (threadId) => unsupported("rollbackThread", threadId),
+    stopSession,
+    listSessions: () =>
+      Effect.sync(() => [...sessions.values()].map((ctx) => ({ ...ctx.session }))),
+    hasSession: (threadId) => Effect.sync(() => sessions.has(threadId)),
+    stopAll,
+    streamEvents: Stream.fromQueue(events),
+  } satisfies ProviderAdapterShape<ProviderAdapterError>;
+});
