@@ -1,8 +1,12 @@
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
+import * as Fiber from "effect/Fiber";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 
 import {
   allocateFreshPiSessionFile,
@@ -22,23 +26,92 @@ describe("PiSessionFile", () => {
           const path = yield* Path.Path;
           const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-session-" });
           const root = yield* piInstanceStateRoot({ stateDir, instanceId: "pi_local" });
-          const cursor = yield* allocateFreshPiSessionFile({
+          const fresh = yield* allocateFreshPiSessionFile({
             stateRoot: root,
-            sessionId: "session/1",
+            fileId: "session/1",
           });
-          expect(cursor.sessionFile).toBe(path.join(yield* fs.realPath(root), "session%2F1.jsonl"));
+          expect(fresh.sessionFile).toBe(path.join(yield* fs.realPath(root), "session%2F1.jsonl"));
           expect((yield* fs.stat(root)).mode & 0o777).toBe(0o700);
-          expect((yield* fs.stat(cursor.sessionFile)).mode & 0o777).toBe(0o600);
+          expect((yield* fs.stat(fresh.sessionFile)).mode & 0o777).toBe(0o600);
+          const cursor = { schemaVersion: 1 as const, ...fresh, sessionId: "pi-generated-id" };
           expect(piStateMatchesCursor(cursor, cursor)).toBe(true);
           expect(
             yield* Effect.result(
-              allocateFreshPiSessionFile({ stateRoot: root, sessionId: "session/1" }),
+              allocateFreshPiSessionFile({ stateRoot: root, fileId: "session/1" }),
             ),
           ).toMatchObject({ _tag: "Failure" });
           yield* cleanupResumedPiSessionFile(cursor);
-          expect(yield* fs.exists(cursor.sessionFile)).toBe(true);
-          yield* cleanupFreshPiSessionFile(cursor);
-          expect(yield* fs.exists(cursor.sessionFile)).toBe(false);
+          expect(yield* fs.exists(fresh.sessionFile)).toBe(true);
+          yield* cleanupFreshPiSessionFile(fresh);
+          expect(yield* fs.exists(fresh.sessionFile)).toBe(false);
+        }),
+      ),
+    );
+
+    it.effect("removes a newly written file when its chmod fails", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-session-chmod-" });
+          const root = yield* piInstanceStateRoot({ stateDir, instanceId: "pi_local" });
+          yield* fs.makeDirectory(root, { recursive: true });
+          const sessionFile = path.join(yield* fs.realPath(root), "chmod-failure.jsonl");
+          const chmodFailure = PlatformError.systemError({
+            _tag: "PermissionDenied",
+            module: "FileSystem",
+            method: "chmod",
+            pathOrDescriptor: sessionFile,
+          });
+          const failingFileSystem = FileSystem.FileSystem.of({
+            ...fs,
+            chmod: (target, mode) =>
+              String(target) === sessionFile ? Effect.fail(chmodFailure) : fs.chmod(target, mode),
+          });
+
+          const failure = yield* allocateFreshPiSessionFile({
+            stateRoot: root,
+            fileId: "chmod-failure",
+          }).pipe(Effect.provideService(FileSystem.FileSystem, failingFileSystem), Effect.flip);
+
+          expect(failure).toBe(chmodFailure);
+          expect(yield* fs.exists(sessionFile)).toBe(false);
+        }),
+      ),
+    );
+
+    it.effect("removes a newly written file when chmod is interrupted", () =>
+      Effect.scoped(
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-session-chmod-" });
+          const root = yield* piInstanceStateRoot({ stateDir, instanceId: "pi_local" });
+          yield* fs.makeDirectory(root, { recursive: true });
+          const sessionFile = path.join(yield* fs.realPath(root), "chmod-interrupt.jsonl");
+          const chmodEntered = yield* Deferred.make<void>();
+          const blockingFileSystem = FileSystem.FileSystem.of({
+            ...fs,
+            chmod: (target, mode) =>
+              String(target) === sessionFile
+                ? Deferred.succeed(chmodEntered, undefined).pipe(Effect.andThen(Effect.never))
+                : fs.chmod(target, mode),
+          });
+          const allocation = yield* allocateFreshPiSessionFile({
+            stateRoot: root,
+            fileId: "chmod-interrupt",
+          }).pipe(
+            Effect.provideService(FileSystem.FileSystem, blockingFileSystem),
+            Effect.forkChild,
+          );
+          yield* Deferred.await(chmodEntered);
+          yield* Fiber.interrupt(allocation);
+          const exit = yield* Fiber.await(allocation);
+
+          expect(exit._tag).toBe("Failure");
+          if (exit._tag === "Failure")
+            expect(exit.cause.reasons.every(Cause.isInterruptReason)).toBe(true);
+          expect(yield* fs.exists(sessionFile)).toBe(false);
         }),
       ),
     );
@@ -52,6 +125,7 @@ describe("PiSessionFile", () => {
           const path = yield* Path.Path;
           const stateDir = yield* fs.makeTempDirectoryScoped({ prefix: "t3-pi-resume-" });
           const cwd = path.join(stateDir, "workspace");
+          yield* fs.makeDirectory(cwd);
           const root = yield* piInstanceStateRoot({ stateDir, instanceId: "pi_local" });
           yield* fs.makeDirectory(root, { recursive: true });
           const sessionFile = path.join(root, "resume.jsonl");
@@ -68,6 +142,22 @@ describe("PiSessionFile", () => {
           expect(yield* validatePiResumeSessionFile({ stateRoot: root, cursor, cwd })).toEqual(
             cursor,
           );
+          for (const sessionId of ["", "  ", " session-1 "]) {
+            expect(
+              yield* Effect.result(
+                validatePiResumeSessionFile({
+                  stateRoot: root,
+                  cursor: { ...cursor, sessionId },
+                  cwd,
+                }),
+              ),
+            ).toMatchObject({ _tag: "Failure" });
+          }
+          const cwdLink = path.join(stateDir, "workspace-link");
+          yield* fs.symlink(cwd, cwdLink);
+          expect(
+            yield* validatePiResumeSessionFile({ stateRoot: root, cursor, cwd: cwdLink }),
+          ).toEqual(cursor);
           const outside = path.join(stateDir, "outside.jsonl");
           yield* fs.symlink(sessionFile, outside);
           expect(
