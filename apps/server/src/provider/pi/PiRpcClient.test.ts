@@ -2,12 +2,15 @@ import { describe, expect, it } from "@effect/vitest";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { ChildProcessSpawner } from "effect/unstable/process";
 
 import {
+  makePiRpcClient,
   makePiRpcTransport,
   PiRpcCommandError,
   PiRpcProtocolError,
@@ -33,6 +36,16 @@ const makeIo = Effect.fn("PiRpcClient.test.makeIo")(function* () {
     },
   } as const;
 });
+
+const respondTo = (stdout: Queue.Queue<Uint8Array, Cause.Done<void>>, request: string) => {
+  const parsed = JSON.parse(request) as { readonly id: string; readonly type: string };
+  return Queue.offer(
+    stdout,
+    bytes(
+      `${JSON.stringify({ type: "response", command: parsed.type, success: true, id: parsed.id })}\n`,
+    ),
+  );
+};
 
 describe("PiRpcClient transport", () => {
   it.effect("frames chunks and preserves unicode line separators", () =>
@@ -117,6 +130,35 @@ describe("PiRpcClient transport", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("writes sequential and concurrent requests as complete NDJSON lines", () =>
+    Effect.gen(function* () {
+      const test = yield* makeIo();
+      const client = yield* makePiRpcTransport(test.io);
+
+      const first = yield* client.prompt("first").pipe(Effect.forkScoped);
+      const firstWrite = yield* Queue.take(test.writes);
+      expect(firstWrite.endsWith("\n")).toBe(true);
+      expect(() => JSON.parse(firstWrite)).not.toThrow();
+      yield* respondTo(test.stdout, firstWrite);
+      yield* Fiber.join(first);
+
+      const concurrent = yield* Effect.all([client.prompt("second"), client.prompt("third")], {
+        concurrency: "unbounded",
+      }).pipe(Effect.forkScoped);
+      const writes = [yield* Queue.take(test.writes), yield* Queue.take(test.writes)];
+      for (const write of writes) {
+        expect(write.endsWith("\n")).toBe(true);
+        expect(write.split("\n")).toHaveLength(2);
+        expect(() => JSON.parse(write)).not.toThrow();
+        yield* respondTo(test.stdout, write);
+      }
+      yield* Fiber.join(concurrent);
+      expect(
+        writes.map((write) => (JSON.parse(write) as { message: string }).message).sort(),
+      ).toEqual(["second", "third"]);
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("times out requests and ignores their late responses", () =>
     Effect.gen(function* () {
       const test = yield* makeIo();
@@ -141,6 +183,38 @@ describe("PiRpcClient transport", () => {
         ),
       );
       expect((yield* Fiber.join(nextFiber)).sessionId).toBe("current");
+    }).pipe(Effect.scoped),
+  );
+});
+
+describe("PiRpcClient process", () => {
+  it.effect("keeps the spawned child stdin open between request streams", () =>
+    Effect.gen(function* () {
+      const stdout = yield* Queue.unbounded<Uint8Array, Cause.Done<void>>();
+      let spawnOptions: unknown;
+      const spawner = ChildProcessSpawner.make((command) => {
+        spawnOptions = command.options;
+        return Effect.succeed(
+          ChildProcessSpawner.makeHandle({
+            pid: ChildProcessSpawner.ProcessId(1),
+            exitCode: Effect.never,
+            isRunning: Effect.succeed(true),
+            kill: () => Effect.void,
+            unref: Effect.succeed(Effect.void),
+            stdin: Sink.drain,
+            stdout: Stream.fromQueue(stdout),
+            stderr: Stream.empty,
+            all: Stream.empty,
+            getInputFd: () => Sink.drain,
+            getOutputFd: () => Stream.empty,
+          }),
+        );
+      });
+
+      yield* makePiRpcClient({ command: "fake-pi" }).pipe(
+        Effect.provide(Layer.succeed(ChildProcessSpawner.ChildProcessSpawner, spawner)),
+      );
+      expect(spawnOptions).toMatchObject({ stdin: { stream: "pipe", endOnDone: false } });
     }).pipe(Effect.scoped),
   );
 });
