@@ -292,6 +292,7 @@ export const makePiRpcClient = Effect.fn("PiRpcClient.make")(function* (
       ChildProcess.make(options.command, ["--mode", "rpc", ...(options.args ?? [])], {
         ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
         ...(options.env === undefined ? {} : { env: options.env, extendEnv: true }),
+        stdin: { stream: "pipe", endOnDone: false },
       }),
     )
     .pipe(
