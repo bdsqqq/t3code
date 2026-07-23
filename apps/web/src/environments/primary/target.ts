@@ -181,6 +181,40 @@ function resolveHttpRequestBaseUrl(primaryTarget: PrimaryEnvironmentTarget): str
   return currentUrl.origin;
 }
 
+function resolveRemoteDevProxyTarget(
+  configuredTarget: PrimaryEnvironmentTarget,
+): PrimaryEnvironmentTarget {
+  if (!import.meta.env.VITE_DEV_SERVER_URL?.trim()) {
+    return configuredTarget;
+  }
+
+  const currentUrl = parseTargetUrl({
+    rawValue: window.location.href,
+    source: "window-origin",
+    urlKind: "window-location-url",
+  });
+  const configuredHttpUrl = parseTargetUrl({
+    rawValue: configuredTarget.target.httpBaseUrl,
+    source: configuredTarget.source,
+    urlKind: "http-base-url",
+  });
+  const configuredWsUrl = parseTargetUrl({
+    rawValue: configuredTarget.target.wsBaseUrl,
+    source: configuredTarget.source,
+    urlKind: "websocket-base-url",
+  });
+
+  if (
+    isLoopbackHostname(currentUrl.hostname) ||
+    !isLoopbackHostname(configuredHttpUrl.hostname) ||
+    !isLoopbackHostname(configuredWsUrl.hostname)
+  ) {
+    return configuredTarget;
+  }
+
+  return resolveWindowOriginPrimaryTarget();
+}
+
 function resolveConfiguredPrimaryTarget(): PrimaryEnvironmentTarget | null {
   const configuredHttpBaseUrl = import.meta.env.VITE_HTTP_URL?.trim() || undefined;
   const configuredWsBaseUrl = import.meta.env.VITE_WS_URL?.trim() || undefined;
@@ -200,13 +234,13 @@ function resolveConfiguredPrimaryTarget(): PrimaryEnvironmentTarget | null {
       ? swapBaseUrlProtocol(configuredHttpBaseUrl, "wss:", "http-base-url")
       : swapBaseUrlProtocol(configuredHttpBaseUrl!, "ws:", "http-base-url"));
 
-  return {
+  return resolveRemoteDevProxyTarget({
     source: "configured",
     target: {
       httpBaseUrl: normalizeBaseUrl(resolvedHttpBaseUrl, "configured", "http-base-url"),
       wsBaseUrl: normalizeBaseUrl(resolvedWsBaseUrl, "configured", "websocket-base-url"),
     },
-  };
+  });
 }
 
 function resolveWindowOriginPrimaryTarget(): PrimaryEnvironmentTarget {

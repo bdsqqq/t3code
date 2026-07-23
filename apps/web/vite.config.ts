@@ -149,6 +149,10 @@ export default defineConfig(() => {
       ...(devProxyTarget
         ? {
             proxy: {
+              "/ws": {
+                target: devProxyTarget,
+                ws: true,
+              },
               "/.well-known": {
                 target: devProxyTarget,
                 changeOrigin: true,

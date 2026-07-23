@@ -165,6 +165,23 @@ describe("environmentBootstrap", () => {
     );
   });
 
+  it("uses the current origin when a remote browser reaches loopback dev services by proxy", async () => {
+    vi.stubEnv("VITE_DEV_SERVER_URL", "http://localhost:5733");
+    vi.stubEnv("VITE_HTTP_URL", "http://localhost:13773");
+    vi.stubEnv("VITE_WS_URL", "ws://localhost:13773");
+    installTestBrowser("http://mbp-m2:8573/");
+    await installDescriptorApi();
+
+    await expect(resolveInitialPrimaryEnvironmentDescriptor()).resolves.toEqual(BASE_ENVIRONMENT);
+    expect(resolvePrimaryEnvironmentHttpUrl("/.well-known/t3/environment")).toBe(
+      "http://mbp-m2:8573/.well-known/t3/environment",
+    );
+    expect(getPrimaryKnownEnvironment()?.target).toEqual({
+      httpBaseUrl: "http://mbp-m2:8573/",
+      wsBaseUrl: "ws://mbp-m2:8573/",
+    });
+  });
+
   it("uses the vite proxy for desktop-managed loopback descriptor requests during local dev", async () => {
     vi.stubEnv("VITE_DEV_SERVER_URL", "http://127.0.0.1:5733");
     vi.stubGlobal("window", {
