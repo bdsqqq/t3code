@@ -47,6 +47,11 @@ describe("ServerSettings.providerInstances (slice-2 invariant)", () => {
       binaryPath: "pi",
       customModels: [],
     });
+    expect(decoded.providers.amp).toEqual({
+      enabled: true,
+      binaryPath: "amp",
+      customModels: [],
+    });
   });
 
   it("hydrates legacy Pi settings and exposes their encoded shape", () => {
@@ -158,6 +163,20 @@ describe("ServerSettingsPatch.providers.pi", () => {
       customModels: ["custom/model"],
     });
     expect(patch.providers?.pi?.enabled).toBeUndefined();
+  });
+});
+
+describe("ServerSettingsPatch.providers.amp", () => {
+  it("accepts a partial Amp patch and normalizes its binary path", () => {
+    const patch = decodeServerSettingsPatch({
+      providers: { amp: { binaryPath: " /custom/amp ", customModels: ["architect"] } },
+    });
+
+    expect(patch.providers?.amp).toEqual({
+      binaryPath: "/custom/amp",
+      customModels: ["architect"],
+    });
+    expect(patch.providers?.amp?.enabled).toBeUndefined();
   });
 });
 
