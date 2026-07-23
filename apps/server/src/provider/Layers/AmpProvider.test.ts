@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { AmpSettings } from "@t3tools/contracts";
@@ -14,17 +14,15 @@ import {
 
 const settings = Schema.decodeSync(AmpSettings)({ customModels: ["architect"] });
 
-it.effect("publishes Amp modes, effort options, and custom plugin modes", () =>
+it.effect("publishes Amp modes and custom plugin modes", () =>
   Effect.gen(function* () {
     const snapshot = yield* makePendingAmpProvider(settings);
-    assert.deepEqual(
+    NodeAssert.deepEqual(
       snapshot.models.map((model) => model.slug),
       ["low", "medium", "high", "ultra", "architect"],
     );
-    const effort = snapshot.models[1]?.capabilities?.optionDescriptors?.[0];
-    assert.equal(effort?.id, "effort");
-    assert.equal(effort?.currentValue, "medium");
-    assert.deepEqual(
+    NodeAssert.equal(snapshot.models[1]?.capabilities?.optionDescriptors, undefined);
+    NodeAssert.deepEqual(
       ampModelsFromSettings(settings).map((model) => model.name),
       ["Low", "Medium", "High", "Ultra", "architect"],
     );
@@ -34,7 +32,7 @@ it.effect("publishes Amp modes, effort options, and custom plugin modes", () =>
 it.effect("does not probe the CLI while Amp is disabled", () =>
   Effect.gen(function* () {
     const snapshot = yield* checkAmpProviderStatus({ ...settings, enabled: false });
-    assert.equal(snapshot.enabled, false);
-    assert.equal(snapshot.status, "disabled");
+    NodeAssert.equal(snapshot.enabled, false);
+    NodeAssert.equal(snapshot.status, "disabled");
   }).pipe(Effect.provide(NodeServices.layer)),
 );

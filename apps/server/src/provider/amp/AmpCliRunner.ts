@@ -1,8 +1,8 @@
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import * as Sink from "effect/Sink";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
 
@@ -63,6 +63,9 @@ export class AmpCliTransportError extends Schema.TaggedErrorClass<AmpCliTranspor
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
+const decodeJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
+const decodeAmpCliMessage = Schema.decodeUnknownEffect(AmpCliMessage);
+const isAmpCliTransportError = Schema.is(AmpCliTransportError);
 
 export interface AmpCliRunOptions {
   readonly binaryPath: string;
@@ -70,7 +73,6 @@ export interface AmpCliRunOptions {
   readonly env?: Readonly<Record<string, string | undefined>>;
   readonly prompt: string;
   readonly mode: string;
-  readonly effort?: string;
   readonly continueThreadId?: string;
 }
 export interface AmpCliRunner {
@@ -92,7 +94,6 @@ export function buildAmpCliArgs(options: AmpCliRunOptions): ReadonlyArray<string
     "--no-archive-after-execute",
     "--mode",
     options.mode,
-    ...(options.effort ? ["--effort", options.effort] : []),
   ];
 }
 
@@ -152,14 +153,14 @@ export const makeAmpCliRunner: AmpCliRunnerFactory = Effect.fn("AmpCliRunner.mak
             ),
             Effect.forkScoped,
           );
-          const decode = Schema.decodeUnknownEffect(AmpCliMessage);
+          let result: AmpCliMessage | undefined;
           const messages = child.stdout.pipe(
             Stream.decodeText(),
             Stream.splitLines,
             Stream.filter((line) => line.trim().length > 0),
             Stream.mapEffect((line) =>
-              Schema.decodeUnknownEffect(Schema.UnknownFromJsonString)(line).pipe(
-                Effect.flatMap(decode),
+              decodeJson(line).pipe(
+                Effect.flatMap(decodeAmpCliMessage),
                 Effect.mapError(
                   (cause) =>
                     new AmpCliTransportError({
@@ -169,6 +170,18 @@ export const makeAmpCliRunner: AmpCliRunnerFactory = Effect.fn("AmpCliRunner.mak
                 ),
               ),
             ),
+            Stream.mapEffect((message) => {
+              if (message.type !== "result")
+                return Effect.succeed(Option.some<AmpCliMessage>(message));
+              if (result)
+                return Effect.fail(
+                  new AmpCliTransportError({ detail: "Amp CLI emitted multiple results" }),
+                );
+              result = message;
+              return Effect.succeed(Option.none<AmpCliMessage>());
+            }),
+            Stream.filter(Option.isSome),
+            Stream.map((message) => message.value),
           );
           const checked = messages.pipe(
             Stream.concat(
@@ -182,7 +195,12 @@ export const makeAmpCliRunner: AmpCliRunnerFactory = Effect.fn("AmpCliRunner.mak
                       exitCode: Number(code),
                       stderr,
                     });
-                  return yield* new AmpCliTransportError({ detail: "Amp CLI stream ended" });
+                  if (!result)
+                    return yield* new AmpCliTransportError({
+                      detail: "Amp CLI exited without a result",
+                      stderr,
+                    });
+                  return result;
                 }),
               ),
             ),
@@ -191,7 +209,7 @@ export const makeAmpCliRunner: AmpCliRunnerFactory = Effect.fn("AmpCliRunner.mak
         }),
       ).pipe(
         Stream.mapError((cause) =>
-          Schema.is(AmpCliTransportError)(cause)
+          isAmpCliTransportError(cause)
             ? cause
             : new AmpCliTransportError({ detail: String(cause), cause: () => cause }),
         ),

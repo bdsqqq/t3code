@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -10,7 +10,9 @@ import {
 } from "@t3tools/contracts";
 import { createModelSelection } from "@t3tools/shared/model";
 import { describe, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
@@ -23,7 +25,7 @@ import { makeAmpAdapter } from "./AmpAdapter.ts";
 const instanceId = ProviderInstanceId.make("amp-test");
 const threadId = ThreadId.make("thread");
 const cwd = process.cwd();
-const selection = createModelSelection(instanceId, "medium", [{ id: "effort", value: "high" }]);
+const selection = createModelSelection(instanceId, "medium");
 type Adapter = ProviderAdapterShape<ProviderAdapterError>;
 
 const init = (id = "T-amp-test"): AmpCliMessage => ({
@@ -61,9 +63,12 @@ class QueueRunner implements AmpCliRunner {
 
   run = (options: AmpCliRunOptions) => {
     this.calls.push(options);
-    const queue = Effect.runSync(Queue.unbounded<AmpCliMessage>());
-    this.queues.push(queue);
-    return Stream.fromQueue(queue);
+    return Stream.unwrap(
+      Queue.unbounded<AmpCliMessage>().pipe(
+        Effect.tap((queue) => Effect.sync(() => this.queues.push(queue))),
+        Effect.map(Stream.fromQueue),
+      ),
+    );
   };
 }
 
@@ -150,19 +155,18 @@ describe("AmpAdapter", () => {
         });
         const events = Array.from(yield* Fiber.join(collecting));
 
-        assert.deepEqual(turn.resumeCursor, { schemaVersion: 1, threadId: "T-amp-test" });
-        assert.equal(runner.calls[0]?.binaryPath, "/custom/bin/amp");
-        assert.equal(runner.calls[0]?.mode, "medium");
-        assert.equal(runner.calls[0]?.effort, "high");
-        assert.equal(runner.calls[0]?.env?.AMP_API_KEY, "test");
-        assert.equal(
+        NodeAssert.deepEqual(turn.resumeCursor, { schemaVersion: 1, threadId: "T-amp-test" });
+        NodeAssert.equal(runner.calls[0]?.binaryPath, "/custom/bin/amp");
+        NodeAssert.equal(runner.calls[0]?.mode, "medium");
+        NodeAssert.equal(runner.calls[0]?.env?.AMP_API_KEY, "test");
+        NodeAssert.equal(
           events
             .filter((event) => event.type === "content.delta")
             .map((event) => (event.type === "content.delta" ? event.payload.delta : ""))
             .join(""),
           "checkingdone",
         );
-        assert.equal(
+        NodeAssert.equal(
           events.some(
             (event) =>
               event.type === "item.completed" &&
@@ -171,8 +175,8 @@ describe("AmpAdapter", () => {
           ),
           true,
         );
-        assert.equal(events.at(-1)?.type, "turn.completed");
-        assert.equal(
+        NodeAssert.equal(events.at(-1)?.type, "turn.completed");
+        NodeAssert.equal(
           events.every((event) => event.raw?.source === "amp.cli.stream-json" || !event.raw),
           true,
         );
@@ -186,7 +190,7 @@ describe("AmpAdapter", () => {
       Effect.gen(function* () {
         yield* start(adapter, { schemaVersion: 1, threadId: "T-existing" });
         yield* adapter.sendTurn({ threadId, input: "continue", modelSelection: selection });
-        assert.equal(runner.calls[0]?.continueThreadId, "T-existing");
+        NodeAssert.equal(runner.calls[0]?.continueThreadId, "T-existing");
       }),
     );
   });
@@ -203,11 +207,11 @@ describe("AmpAdapter", () => {
             modelSelection: createModelSelection(instanceId, "unknown"),
           })
           .pipe(Effect.result);
-        assert.equal(rejected._tag, "Failure");
-        assert.equal(runner.calls.length, 0);
+        NodeAssert.equal(rejected._tag, "Failure");
+        NodeAssert.equal(runner.calls.length, 0);
 
         yield* adapter.sendTurn({ threadId, input: "valid", modelSelection: selection });
-        assert.equal(runner.calls.length, 1);
+        NodeAssert.equal(runner.calls.length, 1);
       }),
     );
   });
@@ -228,7 +232,7 @@ describe("AmpAdapter", () => {
         const rejected = yield* adapter
           .sendTurn({ threadId, input: "hello", modelSelection: selection })
           .pipe(Effect.result);
-        assert.equal(rejected._tag, "Failure");
+        NodeAssert.equal(rejected._tag, "Failure");
       }),
     );
   });
@@ -249,15 +253,47 @@ describe("AmpAdapter", () => {
         const stale = yield* adapter
           .interruptTurn(threadId, TurnId.make("stale"))
           .pipe(Effect.result);
-        assert.equal(stale._tag, "Failure");
+        NodeAssert.equal(stale._tag, "Failure");
         yield* adapter.interruptTurn(threadId, turn.turnId);
 
         const events: ProviderRuntimeEvent[] = Array.from(yield* Fiber.join(collecting));
         const completed = events.find((event) => event.type === "turn.completed");
-        assert.equal(completed?.type, "turn.completed");
+        NodeAssert.equal(completed?.type, "turn.completed");
         if (completed?.type === "turn.completed")
-          assert.equal(completed.payload.state, "interrupted");
-        assert.equal(
+          NodeAssert.equal(completed.payload.state, "interrupted");
+        NodeAssert.equal(
+          events.some((event) => event.type === "runtime.error"),
+          false,
+        );
+      }),
+    );
+  });
+
+  it.effect("treats cancellation before initialization as interruption", () => {
+    const runner = new QueueRunner();
+    return withAdapter(runner, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const collecting = yield* collectTurn(adapter);
+        const sending = yield* adapter
+          .sendTurn({ threadId, input: "wait before init", modelSelection: selection })
+          .pipe(Effect.forkChild);
+        while (!runner.queues[0]) yield* Effect.yieldNow;
+        const activeTurnId = (yield* adapter.listSessions())[0]?.activeTurnId;
+        NodeAssert.ok(activeTurnId);
+
+        yield* adapter.interruptTurn(threadId, activeTurnId);
+        const sendExit = yield* Fiber.await(sending);
+        NodeAssert.equal(Exit.isFailure(sendExit), true);
+        if (Exit.isFailure(sendExit))
+          NodeAssert.equal(Cause.hasInterruptsOnly(sendExit.cause), true);
+
+        const events: ProviderRuntimeEvent[] = Array.from(yield* Fiber.join(collecting));
+        const completed = events.filter((event) => event.type === "turn.completed");
+        NodeAssert.equal(completed.length, 1);
+        if (completed[0]?.type === "turn.completed")
+          NodeAssert.equal(completed[0].payload.state, "interrupted");
+        NodeAssert.equal(
           events.some((event) => event.type === "runtime.error"),
           false,
         );

@@ -5,7 +5,6 @@ import { ChildProcess } from "effect/unstable/process";
 
 import { resolveSpawnCommand } from "@t3tools/shared/shell";
 import {
-  buildSelectOptionDescriptor,
   buildServerProvider,
   isCommandMissingCause,
   parseGenericCliVersion,
@@ -15,26 +14,17 @@ import {
 } from "../providerSnapshot.ts";
 
 const PROVIDER = ProviderDriverKind.make("amp");
-const EFFORT = buildSelectOptionDescriptor({
-  id: "effort",
-  label: "Effort",
-  options: ["none", "minimal", "low", "medium", "high", "xhigh", "max"].map((value) => ({
-    value,
-    label: value,
-    isDefault: value === "medium",
-  })),
-});
 export const ampModelsFromSettings = (settings: AmpSettings) =>
   providerModelsFromSettings(
     ["low", "medium", "high", "ultra"].map((mode) => ({
       slug: mode,
       name: mode[0]!.toUpperCase() + mode.slice(1),
       isCustom: false,
-      capabilities: { optionDescriptors: [EFFORT] },
+      capabilities: null,
     })),
     PROVIDER,
     settings.customModels,
-    { optionDescriptors: [EFFORT] },
+    {},
   );
 const presentation = {
   displayName: "Amp",

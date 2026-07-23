@@ -8,7 +8,6 @@ import {
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
-import { getModelSelectionStringOptionValue } from "@t3tools/shared/model";
 import * as Crypto from "effect/Crypto";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
@@ -31,7 +30,7 @@ import { AmpSessionCursor, type AmpSessionCursor as Cursor } from "../amp/AmpSes
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 
 const PROVIDER = ProviderDriverKind.make("amp");
-const EFFORTS = new Set(["none", "minimal", "low", "medium", "high", "xhigh", "max"]);
+const decodeAmpSessionCursor = Schema.decodeUnknownEffect(AmpSessionCursor);
 interface Turn {
   id: TurnId;
   fiber: Fiber.Fiber<void> | undefined;
@@ -106,75 +105,79 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
     message?: string,
     native?: AmpCliMessage,
   ) {
-    if (c.turn !== t || t.terminal) return;
-    t.terminal = true;
-    const itemStatus =
-      state === "completed"
-        ? ("completed" as const)
-        : state === "failed"
-          ? ("failed" as const)
-          : ("declined" as const);
-    if (t.assistant)
-      yield* offer({
-        type: "item.completed",
-        ...(yield* base(c, t)),
-        itemId: RuntimeItemId.make(`amp-assistant:${t.id}`),
-        payload: {
-          itemType: "assistant_message",
-          status: itemStatus,
-          title: "Assistant message",
-        },
-        ...(native ? { raw: raw(native) } : {}),
-      });
-    if (t.reasoning)
-      yield* offer({
-        type: "item.completed",
-        ...(yield* base(c, t)),
-        itemId: RuntimeItemId.make(`amp-reasoning:${t.id}`),
-        payload: { itemType: "reasoning", status: itemStatus, title: "Reasoning" },
-        ...(native ? { raw: raw(native) } : {}),
-      });
-    yield* Effect.forEach(
-      t.tools.values(),
-      (itemId) =>
-        Effect.gen(function* () {
+    yield* Effect.uninterruptible(
+      Effect.gen(function* () {
+        if (c.turn !== t || t.terminal) return;
+        t.terminal = true;
+        c.turn = undefined;
+        const itemStatus =
+          state === "completed"
+            ? ("completed" as const)
+            : state === "failed"
+              ? ("failed" as const)
+              : ("declined" as const);
+        if (t.assistant)
           yield* offer({
             type: "item.completed",
             ...(yield* base(c, t)),
-            itemId,
-            payload: { itemType: "dynamic_tool_call", status: itemStatus, title: "Tool call" },
+            itemId: RuntimeItemId.make(`amp-assistant:${t.id}`),
+            payload: {
+              itemType: "assistant_message",
+              status: itemStatus,
+              title: "Assistant message",
+            },
             ...(native ? { raw: raw(native) } : {}),
           });
-        }),
-      { discard: true },
+        if (t.reasoning)
+          yield* offer({
+            type: "item.completed",
+            ...(yield* base(c, t)),
+            itemId: RuntimeItemId.make(`amp-reasoning:${t.id}`),
+            payload: { itemType: "reasoning", status: itemStatus, title: "Reasoning" },
+            ...(native ? { raw: raw(native) } : {}),
+          });
+        yield* Effect.forEach(
+          t.tools.values(),
+          (itemId) =>
+            Effect.gen(function* () {
+              yield* offer({
+                type: "item.completed",
+                ...(yield* base(c, t)),
+                itemId,
+                payload: { itemType: "dynamic_tool_call", status: itemStatus, title: "Tool call" },
+                ...(native ? { raw: raw(native) } : {}),
+              });
+            }),
+          { discard: true },
+        );
+        t.tools.clear();
+        if (state === "failed")
+          yield* offer({
+            type: "runtime.error",
+            ...(yield* base(c, t)),
+            payload: { message: message ?? "Amp failed.", class: "transport_error" },
+            ...(native ? { raw: raw(native) } : {}),
+          });
+        yield* offer({
+          type: "turn.completed",
+          ...(yield* base(c, t)),
+          payload:
+            state === "completed"
+              ? { state, stopReason: null }
+              : state === "interrupted"
+                ? { state, stopReason: "abort" }
+                : { state, errorMessage: message ?? "Amp failed." },
+          ...(native ? { raw: raw(native) } : {}),
+        });
+        const { activeTurnId: _, ...session } = c.session;
+        c.session = {
+          ...session,
+          status: state === "failed" ? "error" : "ready",
+          ...(c.cursor ? { resumeCursor: c.cursor } : {}),
+          updatedAt: yield* now,
+        };
+      }),
     );
-    t.tools.clear();
-    if (state === "failed")
-      yield* offer({
-        type: "runtime.error",
-        ...(yield* base(c, t)),
-        payload: { message: message ?? "Amp failed.", class: "transport_error" },
-        ...(native ? { raw: raw(native) } : {}),
-      });
-    yield* offer({
-      type: "turn.completed",
-      ...(yield* base(c, t)),
-      payload:
-        state === "completed"
-          ? { state, stopReason: null }
-          : state === "interrupted"
-            ? { state, stopReason: "abort" }
-            : { state, errorMessage: message ?? "Amp failed." },
-      ...(native ? { raw: raw(native) } : {}),
-    });
-    c.turn = undefined;
-    const { activeTurnId: _, ...session } = c.session;
-    c.session = {
-      ...session,
-      status: state === "failed" ? "error" : "ready",
-      ...(c.cursor ? { resumeCursor: c.cursor } : {}),
-      updatedAt: yield* now,
-    };
   });
   const consume = Effect.fn("AmpAdapter.consume")(function* (
     c: Context,
@@ -189,7 +192,7 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
             return yield* validation("stream", "First Amp message was not system/init.");
           t.first = false;
           if (m.type === "system") {
-            const cursor = yield* Schema.decodeUnknownEffect(AmpSessionCursor)({
+            const cursor = yield* decodeAmpSessionCursor({
               schemaVersion: 1,
               threadId: m.session_id,
             }).pipe(Effect.mapError(String));
@@ -287,9 +290,13 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
         terminal(c, t, t.interrupted ? "interrupted" : "failed", String(cause)),
       ),
       Effect.ensuring(
-        Deferred.fail(
-          t.initialized,
-          validation("sendTurn", "Amp failed before initialization."),
+        Effect.suspend(() =>
+          t.interrupted
+            ? Deferred.interrupt(t.initialized)
+            : Deferred.fail(
+                t.initialized,
+                validation("sendTurn", "Amp failed before initialization."),
+              ),
         ).pipe(Effect.ignore),
       ),
     );
@@ -318,7 +325,7 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
             Effect.mapError((c) => validation("startSession", "Invalid Amp working directory.", c)),
           );
         const cursor = input.resumeCursor
-          ? yield* Schema.decodeUnknownEffect(AmpSessionCursor)(input.resumeCursor).pipe(
+          ? yield* decodeAmpSessionCursor(input.resumeCursor).pipe(
               Effect.mapError((c) => validation("startSession", "Invalid Amp resume cursor.", c)),
             )
           : undefined;
@@ -350,11 +357,14 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
         return session;
       }),
     );
-  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) =>
-    Effect.flatMap(requireSession(input.threadId), (c) =>
+  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) => {
+    let startedTurn: Turn | undefined;
+    return Effect.flatMap(requireSession(input.threadId), (c) =>
       c.lock
         .withPermit(
           Effect.gen(function* () {
+            if (c.closing || c.stopped || sessions.get(input.threadId) !== c)
+              return yield* validation("sendTurn", "Amp session is stopping.");
             if (c.turn || c.session.status !== "ready")
               return yield* validation("sendTurn", "Amp session is not idle.");
             if (!input.input?.trim())
@@ -369,9 +379,6 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
               );
             if (!options.allowedModes.has(s.model))
               return yield* validation("sendTurn", "Invalid Amp mode.");
-            const effort = getModelSelectionStringOptionValue(s, "effort");
-            if (effort && !EFFORTS.has(effort))
-              return yield* validation("sendTurn", "Invalid Amp effort selection.");
             const initialized = yield* Deferred.make<Cursor, ProviderAdapterValidationError>();
             const t: Turn = {
               id: TurnId.make(yield* uuid),
@@ -384,6 +391,7 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
               reasoning: false,
               tools: new Map(),
             };
+            startedTurn = t;
             c.turn = t;
             c.session = {
               ...c.session,
@@ -394,7 +402,7 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
             yield* offer({
               type: "turn.started",
               ...(yield* base(c, t)),
-              payload: { model: s.model, ...(effort ? { effort } : {}) },
+              payload: { model: s.model },
             });
             t.fiber = yield* consume(
               c,
@@ -405,7 +413,6 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
                 ...(options.environment ? { env: options.environment } : {}),
                 prompt: input.input!,
                 mode: s.model,
-                ...(effort ? { effort } : {}),
                 ...(c.cursor ? { continueThreadId: c.cursor.threadId } : {}),
               }),
             ).pipe(Effect.forkDetach);
@@ -424,14 +431,15 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
           ),
           Effect.onInterrupt(() =>
             Effect.suspend(() => {
-              const turn = c.turn;
-              return turn
+              const turn = startedTurn;
+              return turn && c.turn === turn
                 ? interruptTurn(input.threadId, turn.id).pipe(Effect.ignore)
                 : Effect.void;
             }),
           ),
         ),
     );
+  };
   const interruptTurn: ProviderAdapterShape<ProviderAdapterError>["interruptTurn"] = (id, turnId) =>
     Effect.flatMap(requireSession(id), (c) =>
       c.lock.withPermit(
@@ -450,7 +458,12 @@ export const makeAmpAdapter = Effect.fn("makeAmpAdapter")(function* (options: Am
       c.lock.withPermit(
         Effect.gen(function* () {
           c.closing = true;
-          if (c.turn?.fiber) yield* Fiber.interrupt(c.turn.fiber);
+          const turn = c.turn;
+          if (turn) {
+            turn.interrupted = true;
+            yield* terminal(c, turn, "interrupted");
+            if (turn.fiber) yield* Fiber.interrupt(turn.fiber);
+          }
           if (c.cursor && owners.get(c.cursor.threadId) === c) owners.delete(c.cursor.threadId);
           sessions.delete(id);
           c.stopped = true;

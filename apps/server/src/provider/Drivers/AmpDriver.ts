@@ -11,7 +11,11 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { makeAmpTextGeneration } from "../../textGeneration/AmpTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
 import { makeAmpAdapter } from "../Layers/AmpAdapter.ts";
-import { checkAmpProviderStatus, makePendingAmpProvider } from "../Layers/AmpProvider.ts";
+import {
+  ampModelsFromSettings,
+  checkAmpProviderStatus,
+  makePendingAmpProvider,
+} from "../Layers/AmpProvider.ts";
 import { makeManagedServerProvider } from "../makeManagedServerProvider.ts";
 import {
   defaultProviderContinuationIdentity,
@@ -28,6 +32,7 @@ import {
 } from "../providerUpdateSettings.ts";
 
 const KIND = ProviderDriverKind.make("amp");
+const defaultAmpSettings = Schema.decodeSync(AmpSettings);
 export type AmpDriverEnv =
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
@@ -38,7 +43,7 @@ export const AmpDriver: ProviderDriver<AmpSettings, AmpDriverEnv> = {
   driverKind: KIND,
   metadata: { displayName: "Amp", supportsMultipleInstances: true },
   configSchema: AmpSettings,
-  defaultConfig: () => Schema.decodeSync(AmpSettings)({}),
+  defaultConfig: () => defaultAmpSettings({}),
   create: ({ instanceId, displayName, accentColor, environment, enabled, config }) =>
     Effect.gen(function* () {
       const settingsService = yield* ServerSettingsService;
@@ -61,7 +66,7 @@ export const AmpDriver: ProviderDriver<AmpSettings, AmpDriverEnv> = {
         binaryPath: effective.binaryPath,
         providerInstanceId: instanceId,
         environment: env,
-        allowedModes: new Set(["low", "medium", "high", "ultra", ...effective.customModels]),
+        allowedModes: new Set(ampModelsFromSettings(effective).map((model) => model.slug)),
       });
       const maintenanceCapabilities = makeManualOnlyProviderMaintenanceCapabilities({
         provider: KIND,
