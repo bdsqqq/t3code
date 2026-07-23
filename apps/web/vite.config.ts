@@ -145,6 +145,7 @@ export default defineConfig(() => {
       host,
       port,
       strictPort: true,
+      allowedHosts: ["mbp-m2"],
       ...(devProxyTarget
         ? {
             proxy: {
