@@ -36,6 +36,7 @@ const CUSTOM_MODEL_PLACEHOLDER_BY_KIND: Partial<Record<ProviderDriverKind, strin
   [ProviderDriverKind.make("cursor")]: "claude-sonnet-4-6",
   [ProviderDriverKind.make("opencode")]: "openai/gpt-5",
   [ProviderDriverKind.make("pi")]: "provider/model-name",
+  [ProviderDriverKind.make("amp")]: "custom-agent-mode",
 };
 
 interface ProviderModelsSectionProps {

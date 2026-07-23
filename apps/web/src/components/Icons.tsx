@@ -696,3 +696,21 @@ export const PiAgentIcon: Icon = ({ className, ...props }) => (
     <path fill="#fff" d="M517.36 400H634.72V634.72H517.36Z" />
   </svg>
 );
+
+export const AmpIcon: Icon = ({ className, ...props }) => (
+  <svg {...props} viewBox="0 0 64 64" className={cn("fill-none", className)}>
+    <rect width="64" height="64" rx="12" fill="#171717" />
+    <text
+      x="32"
+      y="39"
+      fill="#f4eddf"
+      fontFamily="Arial, sans-serif"
+      fontSize="25"
+      fontStyle="italic"
+      fontWeight="600"
+      textAnchor="middle"
+    >
+      amp
+    </text>
+  </svg>
+);

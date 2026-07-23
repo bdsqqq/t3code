@@ -1,4 +1,5 @@
 import {
+  AmpSettings,
   ClaudeSettings,
   CodexSettings,
   CursorSettings,
@@ -9,6 +10,7 @@ import {
 } from "@t3tools/contracts";
 import type * as Schema from "effect/Schema";
 import {
+  AmpIcon,
   ClaudeAI,
   CursorIcon,
   GrokIcon,
@@ -81,6 +83,13 @@ export const PROVIDER_CLIENT_DEFINITIONS: readonly ProviderClientDefinition[] = 
     label: "Pi",
     icon: PiAgentIcon,
     settingsSchema: PiSettings,
+  },
+  {
+    value: ProviderDriverKind.make("amp"),
+    label: "Amp",
+    icon: AmpIcon,
+    badgeLabel: "Early Access",
+    settingsSchema: AmpSettings,
   },
 ];
 

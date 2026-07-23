@@ -43,6 +43,13 @@ describe("ProviderSettingsForm helpers", () => {
     expect(deriveProviderSettingsFields(pi!).map((field) => field.key)).toEqual(["binaryPath"]);
   });
 
+  it("exposes Amp with its binary path setting", () => {
+    const amp = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("amp")];
+
+    expect(amp).toMatchObject({ label: "Amp", value: "amp", badgeLabel: "Early Access" });
+    expect(deriveProviderSettingsFields(amp!).map((field) => field.key)).toEqual(["binaryPath"]);
+  });
+
   it("preserves unknown config keys while omitting empty configurable fields", () => {
     const opencode = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("opencode")];
     expect(opencode).toBeDefined();
