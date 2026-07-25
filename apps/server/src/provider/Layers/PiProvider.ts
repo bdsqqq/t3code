@@ -1,4 +1,4 @@
-import { PiSettings, ProviderDriverKind } from "@t3tools/contracts";
+import { PiSettings } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
@@ -19,7 +19,6 @@ import {
   type ServerProviderDraft,
 } from "../providerSnapshot.ts";
 
-const PROVIDER = ProviderDriverKind.make("pi");
 const PRESENTATION = {
   displayName: "Pi",
   showInteractionModeToggle: false,
@@ -38,7 +37,7 @@ type PiRpcClientFactory = (
   options: PiRpcSpawnOptions,
 ) => Effect.Effect<PiRpcClient, PiRpcError, ChildProcessSpawner.ChildProcessSpawner | Scope.Scope>;
 const models = (settings: PiSettings, discovered = mapPiDiscoveredModels([])) =>
-  providerModelsFromSettings(discovered, PROVIDER, settings.customModels, {
+  providerModelsFromSettings(discovered, settings.customModels, {
     optionDescriptors: [],
   });
 
