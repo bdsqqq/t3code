@@ -10,6 +10,13 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    server: {
+      deps: {
+        // Keep @effect/vitest on the active Vite+ runner instance instead of
+        // externalizing a second copy with separate suite-collector state.
+        inline: [/@effect[+/]vitest/, /vite-plus/, /vitest/],
+      },
+    },
     exclude: [
       "**/.repos/**",
       "**/node_modules/**",
