@@ -67,6 +67,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         binaryPath: effectiveConfig.binaryPath,
         providerInstanceId: instanceId,
         stateDir: serverConfig.stateDir,
+        attachmentsDir: serverConfig.attachmentsDir,
         environment: processEnv,
       }).pipe(
         Effect.mapError(

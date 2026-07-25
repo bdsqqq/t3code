@@ -25,6 +25,7 @@ import * as Stream from "effect/Stream";
 import * as SynchronizedRef from "effect/SynchronizedRef";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
+import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -69,6 +70,7 @@ export interface PiAdapterOptions {
   readonly args?: ReadonlyArray<string>;
   readonly providerInstanceId: ProviderInstanceId;
   readonly stateDir: string;
+  readonly attachmentsDir: string;
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly makeRpcClient?: PiRpcClientFactory;
   readonly onSessionPublished?: () => Effect.Effect<void>;
@@ -79,6 +81,7 @@ interface ActiveTurn {
   readonly assistantItemId: RuntimeItemId;
   readonly reasoningItemId: RuntimeItemId;
   readonly toolItemIds: Map<string, RuntimeItemId>;
+  readonly toolArgs: Map<string, Record<string, unknown>>;
   assistantText: string;
   assistantStarted: boolean;
   reasoningStarted: boolean;
@@ -106,14 +109,98 @@ const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === "object" && value !== null && !Array.isArray(value);
 const string = (value: unknown): string | undefined =>
   typeof value === "string" && value.length > 0 ? value : undefined;
-const detail = (value: unknown): string | undefined => {
-  if (typeof value === "string") return value.trim() || undefined;
-  if (value === undefined || value === null) return undefined;
-  try {
-    return JSON.stringify(value);
-  } catch {
-    return undefined;
-  }
+const trimmedString = (value: unknown): string | undefined =>
+  typeof value === "string" ? value.trim() || undefined : undefined;
+
+const piToolText = (value: unknown): string | undefined => {
+  const record = isRecord(value) ? value : undefined;
+  if (!record) return trimmedString(value);
+  if (!Array.isArray(record.content)) return undefined;
+  const text = record.content
+    .flatMap((part) => (isRecord(part) && typeof part.text === "string" ? [part.text] : []))
+    .join("\n")
+    .trim();
+  return text || undefined;
+};
+
+const piToolPath = (args: Record<string, unknown>): string | undefined =>
+  trimmedString(args.path) ?? trimmedString(args.file_path);
+
+const piToolPresentation = (event: Record<string, unknown>) => {
+  const toolName = string(event.toolName) ?? "tool";
+  const normalizedName = toolName.toLowerCase();
+  const args = isRecord(event.args) ? event.args : {};
+  const output = event.result ?? event.partialResult;
+  const outputRecord = isRecord(output) ? output : undefined;
+  const outputText = piToolText(output);
+  const path = piToolPath(args);
+  const toolCallId = string(event.toolCallId) ?? string(event.toolCallID);
+  const itemType =
+    normalizedName === "bash"
+      ? ("command_execution" as const)
+      : normalizedName === "write" || normalizedName === "edit"
+        ? ("file_change" as const)
+        : ("dynamic_tool_call" as const);
+  const title =
+    normalizedName === "bash"
+      ? "Ran command"
+      : normalizedName === "read"
+        ? "Read file"
+        : normalizedName === "write"
+          ? "Wrote file"
+          : normalizedName === "edit"
+            ? "Edited file"
+            : normalizedName === "grep"
+              ? "Searched files"
+              : normalizedName === "find"
+                ? "Found files"
+                : normalizedName === "ls"
+                  ? "Listed directory"
+                  : toolName;
+  const invocationDetail =
+    normalizedName === "grep"
+      ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? "."}`
+      : normalizedName === "find"
+        ? `${trimmedString(args.pattern) ?? "files"} in ${path ?? "."}`
+        : normalizedName === "ls"
+          ? (path ?? ".")
+          : path;
+  const detail = event.isError === true ? outputText?.split(/\r?\n/u)[0] : invocationDetail;
+  const command = normalizedName === "bash" ? trimmedString(args.command) : undefined;
+  const changes =
+    (normalizedName === "write" || normalizedName === "edit") && path ? [{ path }] : undefined;
+
+  return {
+    itemType,
+    title,
+    ...(detail ? { detail } : {}),
+    data: {
+      ...(toolCallId ? { toolCallId } : {}),
+      toolName,
+      kind:
+        normalizedName === "bash"
+          ? "execute"
+          : normalizedName === "read"
+            ? "read"
+            : normalizedName === "write" || normalizedName === "edit"
+              ? "edit"
+              : "other",
+      ...(command ? { command } : {}),
+      rawInput: args,
+      ...(outputRecord
+        ? {
+            rawOutput: {
+              ...(outputText ? { content: outputText } : {}),
+              ...(isRecord(outputRecord.details) ? outputRecord.details : {}),
+            },
+          }
+        : {}),
+      item: {
+        input: args,
+        ...(changes ? { changes } : {}),
+      },
+    },
+  };
 };
 
 export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAdapterOptions) {
@@ -259,12 +346,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
     );
   });
 
+  const toolEventKey = (event: Record<string, unknown>) =>
+    string(event.toolCallId) ?? string(event.toolCallID) ?? string(event.toolName) ?? "tool";
+
   const itemForTool = Effect.fn("PiAdapter.itemForTool")(function* (
     turn: ActiveTurn,
     event: Record<string, unknown>,
   ) {
-    const key =
-      string(event.toolCallId) ?? string(event.toolCallID) ?? string(event.toolName) ?? "tool";
+    const key = toolEventKey(event);
     const existing = turn.toolItemIds.get(key);
     if (existing) return existing;
     const id = RuntimeItemId.make(`pi-tool:${turn.id}:${key}`);
@@ -338,20 +427,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
             ? "item.updated"
             : "item.completed";
       const itemId = yield* itemForTool(turn, event);
+      const toolKey = toolEventKey(event);
+      const eventArgs = isRecord(event.args) ? event.args : undefined;
+      if (eventArgs) turn.toolArgs.set(toolKey, eventArgs);
+      const presentationEvent =
+        eventArgs || !turn.toolArgs.has(toolKey)
+          ? event
+          : { ...event, args: turn.toolArgs.get(toolKey) };
       const isError = event.isError === true;
       yield* offer({
         type: lifecycle,
         ...(yield* base(ctx, turn)),
         itemId,
         payload: {
-          itemType: "dynamic_tool_call",
+          ...piToolPresentation(presentationEvent),
           status:
             lifecycle === "item.completed" ? (isError ? "failed" : "completed") : "inProgress",
-          title: string(event.toolName) ?? "Tool call",
-          ...(detail(event.result ?? event.partialResult ?? event.args)
-            ? { detail: detail(event.result ?? event.partialResult ?? event.args) }
-            : {}),
-          data: native,
         },
         raw: raw(native),
       } as ProviderRuntimeEvent);
@@ -624,9 +715,28 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
         const ctx = yield* requireSession(input.threadId);
         if (ctx.activeTurn || ctx.session.status !== "ready")
           return yield* validation("sendTurn", "Pi session must be idle before prompting.");
-        if (!input.input) return yield* validation("sendTurn", "Pi requires non-empty text input.");
-        if (input.attachments && input.attachments.length > 0)
-          return yield* validation("sendTurn", "Pi attachments are not supported yet.");
+        if (!input.input && (!input.attachments || input.attachments.length === 0))
+          return yield* validation("sendTurn", "Pi requires non-empty text or attachments.");
+        const images = yield* Effect.forEach(
+          input.attachments ?? [],
+          (attachment) => {
+            const attachmentPath = resolveAttachmentPath({
+              attachmentsDir: options.attachmentsDir,
+              attachment,
+            });
+            if (!attachmentPath)
+              return Effect.fail(request("prompt", `Invalid attachment id '${attachment.id}'.`));
+            return provideFiles(fs.readFile(attachmentPath)).pipe(
+              Effect.map((bytes) => ({
+                type: "image" as const,
+                data: Buffer.from(bytes).toString("base64"),
+                mimeType: attachment.mimeType,
+              })),
+              Effect.mapError((cause) => request("prompt", cause)),
+            );
+          },
+          { concurrency: 1 },
+        );
         const selection = input.modelSelection;
         if (selection && selection.instanceId !== options.providerInstanceId)
           return yield* validation(
@@ -671,6 +781,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
           assistantItemId: RuntimeItemId.make(`pi-assistant:${turnId}`),
           reasoningItemId: RuntimeItemId.make(`pi-reasoning:${turnId}`),
           toolItemIds: new Map(),
+          toolArgs: new Map(),
           assistantText: "",
           assistantStarted: false,
           reasoningStarted: false,
@@ -689,7 +800,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
           ...(yield* base(ctx, turn)),
           payload: { model: selection!.model, ...(thinking ? { effort: thinking } : {}) },
         });
-        const prompted = yield* ctx.client.prompt(input.input).pipe(Effect.result);
+        const prompted = yield* ctx.client.prompt(input.input ?? "", images).pipe(Effect.result);
         if (Result.isFailure(prompted)) {
           const reusable = isPiRpcCommandError(prompted.failure);
           yield* failActive(ctx, "Pi prompt failed.", undefined, !reusable);

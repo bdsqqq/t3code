@@ -53,13 +53,22 @@ export interface PiRpcTransportIo {
   readonly stderr?: Stream.Stream<Uint8Array, PiRpcProtocolError>;
 }
 
+export interface PiRpcImage {
+  readonly type: "image";
+  readonly data: string;
+  readonly mimeType: string;
+}
+
 export interface PiRpcClient {
   readonly events: Stream.Stream<PiRpcEvent>;
   readonly getState: () => Effect.Effect<PiRpcState, PiRpcError>;
   readonly getAvailableModels: () => Effect.Effect<PiRpcAvailableModels, PiRpcError>;
   readonly setModel: (provider: string, modelId: string) => Effect.Effect<PiRpcModel, PiRpcError>;
   readonly setThinkingLevel: (level: PiThinkingLevel) => Effect.Effect<void, PiRpcError>;
-  readonly prompt: (message: string) => Effect.Effect<void, PiRpcError>;
+  readonly prompt: (
+    message: string,
+    images?: ReadonlyArray<PiRpcImage>,
+  ) => Effect.Effect<void, PiRpcError>;
   readonly abort: () => Effect.Effect<void, PiRpcError>;
   readonly close: () => Effect.Effect<void>;
 }
@@ -265,7 +274,12 @@ export const makePiRpcTransport = Effect.fn("PiRpcClient.makeTransport")(functio
     getAvailableModels: () => request("get_available_models", {}, decodeModels),
     setModel: (provider, modelId) => request("set_model", { provider, modelId }, decodeModel),
     setThinkingLevel: (level) => request("set_thinking_level", { level }, () => Effect.void),
-    prompt: (message) => request("prompt", { message }, () => Effect.void),
+    prompt: (message, images) =>
+      request(
+        "prompt",
+        { message, ...(images && images.length > 0 ? { images } : {}) },
+        () => Effect.void,
+      ),
     abort: () => request("abort", {}, () => Effect.void),
     close: () => close,
   };

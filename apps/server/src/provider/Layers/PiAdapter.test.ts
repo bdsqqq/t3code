@@ -23,6 +23,7 @@ import assert from "node:assert/strict";
 import {
   PiRpcCommandError,
   type PiRpcClient,
+  type PiRpcImage,
   PiRpcProtocolError,
   type PiRpcSpawnOptions,
 } from "../pi/PiRpcClient.ts";
@@ -40,7 +41,13 @@ type Adapter = ProviderAdapterShape<ProviderAdapterError>;
 class FakeClient implements PiRpcClient {
   input = Effect.runSync(Queue.unbounded<PiRpcEvent>());
   events: Stream.Stream<PiRpcEvent> = Stream.fromQueue(this.input);
-  readonly calls = { close: 0, abort: 0, prompt: 0, thinking: [] as PiThinkingLevel[] };
+  readonly calls = {
+    close: 0,
+    abort: 0,
+    prompt: 0,
+    prompts: [] as Array<{ message: string; images: ReadonlyArray<PiRpcImage> | undefined }>,
+    thinking: [] as PiThinkingLevel[],
+  };
   state: { sessionFile?: string; sessionId?: string } = {};
   failPrompt = false;
   fatalPrompt = false;
@@ -76,10 +83,11 @@ class FakeClient implements PiRpcClient {
     Effect.sync(() => {
       this.calls.thinking.push(level);
     });
-  prompt = (_message: string) => {
+  prompt = (message: string, images?: ReadonlyArray<PiRpcImage>) => {
     const self = this;
     return Effect.gen(function* () {
       self.calls.prompt += 1;
+      self.calls.prompts.push({ message, images });
       if (self.promptEntered) yield* Deferred.succeed(self.promptEntered, undefined);
       if (self.promptGate) yield* Deferred.await(self.promptGate);
       if (self.failPrompt)
@@ -113,6 +121,7 @@ interface Harness {
   readonly client: FakeClient;
   readonly spawns: PiRpcSpawnOptions[];
   readonly stateDir: string;
+  readonly attachmentsDir: string;
   readonly makeClient: PiRpcClientFactory;
 }
 
@@ -137,6 +146,8 @@ const makeHarness = (harnessOptions: { readonly failStart?: boolean } = {}): Har
   const client = new FakeClient();
   const spawns: PiRpcSpawnOptions[] = [];
   const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "t3-pi-adapter-"));
+  const attachmentsDir = path.join(stateDir, "attachments");
+  fs.mkdirSync(attachmentsDir, { recursive: true });
   const makeClient: PiRpcClientFactory = (spawnOptions) =>
     Effect.gen(function* () {
       spawns.push(spawnOptions);
@@ -158,7 +169,7 @@ const makeHarness = (harnessOptions: { readonly failStart?: boolean } = {}): Har
       client.state = { sessionFile, sessionId };
       return client;
     });
-  return { client, spawns, stateDir, makeClient };
+  return { client, spawns, stateDir, attachmentsDir, makeClient };
 };
 
 const withAdapter = <A>(
@@ -171,6 +182,7 @@ const withAdapter = <A>(
         binaryPath: "pi",
         providerInstanceId: instanceId,
         stateDir: harness.stateDir,
+        attachmentsDir: harness.attachmentsDir,
         makeRpcClient: harness.makeClient,
       });
       return yield* use(adapter);
@@ -225,6 +237,163 @@ describe("PiAdapter", () => {
           "--no-prompt-templates",
         ])
           assert.equal(args.includes(arg), true);
+      }),
+    );
+  });
+
+  it.effect("sends persisted image attachments through Pi RPC", () => {
+    const h = makeHarness();
+    const attachmentId = "thread-image";
+    fs.writeFileSync(path.join(h.attachmentsDir, `${attachmentId}.png`), Buffer.from("image"));
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          attachments: [
+            {
+              type: "image",
+              id: attachmentId,
+              name: "screenshot.png",
+              mimeType: "image/png",
+              sizeBytes: 5,
+            },
+          ],
+          modelSelection,
+        });
+        assert.deepEqual(h.client.calls.prompts, [
+          {
+            message: "",
+            images: [
+              {
+                type: "image",
+                data: Buffer.from("image").toString("base64"),
+                mimeType: "image/png",
+              },
+            ],
+          },
+        ]);
+        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+      }),
+    );
+  });
+
+  it.effect("projects Pi built-in tools into useful canonical tool call details", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const collected = yield* Stream.take(adapter.streamEvents, 7).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          input: "inspect and edit",
+          modelSelection,
+        });
+        yield* Queue.offerAll(h.client.input, [
+          {
+            type: "tool_execution_start",
+            toolCallId: "bash-1",
+            toolName: "bash",
+            args: { command: "git status --short" },
+          },
+          {
+            type: "tool_execution_update",
+            toolCallId: "bash-1",
+            toolName: "bash",
+            args: { command: "git status --short" },
+            partialResult: {
+              content: [{ type: "text", text: " M apps/server/src/provider/Layers/PiAdapter.ts" }],
+              details: { truncation: null },
+            },
+          },
+          {
+            type: "tool_execution_end",
+            toolCallId: "bash-1",
+            toolName: "bash",
+            result: {
+              content: [{ type: "text", text: " M apps/server/src/provider/Layers/PiAdapter.ts" }],
+              details: { truncation: null },
+            },
+            isError: false,
+          },
+          {
+            type: "tool_execution_start",
+            toolCallId: "edit-1",
+            toolName: "edit",
+            args: { path: "src/app.ts", oldText: "old", newText: "new" },
+          },
+          {
+            type: "tool_execution_update",
+            toolCallId: "edit-1",
+            toolName: "edit",
+            args: { path: "src/app.ts", oldText: "old", newText: "new" },
+            partialResult: { content: [{ type: "text", text: "Editing src/app.ts" }] },
+          },
+          {
+            type: "tool_execution_end",
+            toolCallId: "edit-1",
+            toolName: "edit",
+            result: {
+              content: [{ type: "text", text: "Successfully replaced text in src/app.ts" }],
+              details: { diff: "-old\n+new" },
+            },
+            isError: false,
+          },
+        ]);
+
+        const events = Array.from(yield* Fiber.join(collected));
+        const tools = events.filter(
+          (
+            event,
+          ): event is Extract<
+            ProviderRuntimeEvent,
+            { type: "item.started" | "item.updated" | "item.completed" }
+          > =>
+            event.type === "item.started" ||
+            event.type === "item.updated" ||
+            event.type === "item.completed",
+        );
+        assert.equal(tools.length, 6);
+        assert.deepEqual(tools[2]?.payload, {
+          itemType: "command_execution",
+          title: "Ran command",
+          status: "completed",
+          data: {
+            toolCallId: "bash-1",
+            toolName: "bash",
+            kind: "execute",
+            command: "git status --short",
+            rawInput: { command: "git status --short" },
+            rawOutput: {
+              content: "M apps/server/src/provider/Layers/PiAdapter.ts",
+              truncation: null,
+            },
+            item: { input: { command: "git status --short" } },
+          },
+        });
+        assert.deepEqual(tools[5]?.payload, {
+          itemType: "file_change",
+          title: "Edited file",
+          detail: "src/app.ts",
+          status: "completed",
+          data: {
+            toolCallId: "edit-1",
+            toolName: "edit",
+            kind: "edit",
+            rawInput: { path: "src/app.ts", oldText: "old", newText: "new" },
+            rawOutput: {
+              content: "Successfully replaced text in src/app.ts",
+              diff: "-old\n+new",
+            },
+            item: {
+              input: { path: "src/app.ts", oldText: "old", newText: "new" },
+              changes: [{ path: "src/app.ts" }],
+            },
+          },
+        });
       }),
     );
   });
@@ -706,6 +875,7 @@ describe("PiAdapter", () => {
             binaryPath: "pi",
             providerInstanceId: instanceId,
             stateDir: h.stateDir,
+            attachmentsDir: h.attachmentsDir,
             makeRpcClient: h.makeClient,
             onSessionPublished: () =>
               blockPublication
