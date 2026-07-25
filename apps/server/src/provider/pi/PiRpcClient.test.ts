@@ -142,6 +142,18 @@ describe("PiRpcClient transport", () => {
       yield* respondTo(test.stdout, firstWrite);
       yield* Fiber.join(first);
 
+      const withImage = yield* client
+        .prompt("inspect", [{ type: "image", data: "cG5n", mimeType: "image/png" }])
+        .pipe(Effect.forkScoped);
+      const imageWrite = yield* Queue.take(test.writes);
+      expect(imageWrite).toContain('"type":"prompt"');
+      expect(imageWrite).toContain('"message":"inspect"');
+      expect(imageWrite).toContain(
+        '"images":[{"type":"image","data":"cG5n","mimeType":"image/png"}]',
+      );
+      yield* respondTo(test.stdout, imageWrite);
+      yield* Fiber.join(withImage);
+
       const concurrent = yield* Effect.all([client.prompt("second"), client.prompt("third")], {
         concurrency: "unbounded",
       }).pipe(Effect.forkScoped);
