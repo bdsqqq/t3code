@@ -2,6 +2,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { describe, expect, it } from "vite-plus/test";
 
 import ChatMarkdown, { MermaidDiagram } from "./ChatMarkdown";
+import { renderSafeMermaidSvg } from "./mermaid-renderer";
 
 describe("MermaidDiagram", () => {
   it("renders Mermaid source as a themed SVG", () => {
@@ -46,6 +47,16 @@ describe("MermaidDiagram", () => {
     expect(html).not.toContain('fill="url(https://example.com');
   });
 
+  it("rejects CSS-escaped external SVG resource references", () => {
+    const source = String.raw`graph LR
+ A --> B
+ style A fill:u\72l(http://127.0.0.1/pixel.svg#x)`;
+    const html = renderToStaticMarkup(<MermaidDiagram code={source} />);
+
+    expect(html).toContain("<pre>");
+    expect(html).not.toContain("<svg");
+  });
+
   it("shows source while a diagram is streaming", () => {
     const html = renderToStaticMarkup(
       <MermaidDiagram code="graph LR\n A --> B" isStreaming={true} />,
@@ -63,6 +74,29 @@ describe("MermaidDiagram", () => {
 
     expect(html).toContain("<pre>");
     expect(html).not.toContain("<svg");
+  });
+
+  it("rejects Cartesian edge expansion before layout", () => {
+    const left = Array.from({ length: 15 }, (_, index) => `A${index}`).join(" & ");
+    const right = Array.from({ length: 15 }, (_, index) => `B${index}`).join(" & ");
+    const html = renderToStaticMarkup(<MermaidDiagram code={`graph LR\n${left} --> ${right}`} />);
+
+    expect(html).toContain("<pre>");
+    expect(html).not.toContain("<svg");
+  });
+
+  it("rejects oversized XY chart datasets before rendering", () => {
+    const points = Array.from({ length: 201 }, (_, index) => index).join(",");
+    const html = renderToStaticMarkup(<MermaidDiagram code={`xychart-beta\nbar [${points}]`} />);
+
+    expect(html).toContain("<pre>");
+    expect(html).not.toContain("<svg");
+  });
+
+  it("preserves cylinder geometry through SVG sanitization", () => {
+    const svg = renderSafeMermaidSvg("graph LR\n A[(Database)]");
+
+    expect(svg.match(/<ellipse/g)).toHaveLength(2);
   });
 
   it("namespaces defs independently without changing diagram data IDs", () => {
