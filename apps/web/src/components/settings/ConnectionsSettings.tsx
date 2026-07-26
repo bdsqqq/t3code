@@ -2309,8 +2309,6 @@ export function ConnectionsSettings() {
         : visibleDesktopNetworkAdvertisedEndpoints,
     [tailscaleHttpsEndpoint, visibleDesktopNetworkAdvertisedEndpoints],
   );
-  const isLocalBackendRemotelyReachable =
-    isLocalBackendNetworkAccessible || tailscaleHttpsEndpoint?.status === "available";
   const defaultDesktopNetworkAdvertisedEndpoint = useMemo(
     () =>
       selectPairingEndpoint(visibleDesktopNetworkAdvertisedEndpoints, defaultAdvertisedEndpointKey),
@@ -3019,26 +3017,24 @@ export function ConnectionsSettings() {
             )}
           </SettingsSection>
 
-          {isLocalBackendRemotelyReachable ? (
-            <SettingsSection
-              title="Authorized clients"
-              headerAction={
-                <AuthorizedClientsHeaderAction
-                  clientSessions={desktopClientSessions}
-                  isRevokingOtherClients={isRevokingOtherDesktopClients}
-                  onRevokeOtherClients={handleRevokeOtherDesktopClients}
-                />
-              }
+          <SettingsSection
+            title="Authorized clients"
+            headerAction={
+              <AuthorizedClientsHeaderAction
+                clientSessions={desktopClientSessions}
+                isRevokingOtherClients={isRevokingOtherDesktopClients}
+                onRevokeOtherClients={handleRevokeOtherDesktopClients}
+              />
+            }
+          >
+            <ScrollArea
+              scrollFade
+              className="max-h-[22.5rem]"
+              data-testid="authorized-clients-scroll-area"
             >
-              <ScrollArea
-                scrollFade
-                className="max-h-[22.5rem]"
-                data-testid="authorized-clients-scroll-area"
-              >
-                {renderAuthorizedClients("current")}
-              </ScrollArea>
-            </SettingsSection>
-          ) : null}
+              {renderAuthorizedClients("current")}
+            </ScrollArea>
+          </SettingsSection>
           <AlertDialog
             open={isDesktopServerExposureDialogOpen}
             onOpenChange={(open) => {
