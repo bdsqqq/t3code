@@ -28,6 +28,23 @@ describe("renderSafeMermaidSvg", () => {
     expect(() => renderSafeMermaidSvg(escaped, "escaped-url")).toThrow("unsafe paint");
   });
 
+  it("rejects expensive Cartesian edge expansion before layout", () => {
+    const left = Array.from({ length: 11 }, (_, index) => `A${index}`).join(" & ");
+    const right = Array.from({ length: 11 }, (_, index) => `B${index}`).join(" & ");
+
+    expect(() => renderSafeMermaidSvg(`graph LR\n${left} --> ${right}`, "too-many-edges")).toThrow(
+      "too many edges",
+    );
+  });
+
+  it("does not count ampersands inside labels as parallel nodes", () => {
+    const edges = Array.from({ length: 51 }, (_, index) => `A${index}["R & D"] --> B${index}`).join(
+      "\n",
+    );
+
+    expect(renderSafeMermaidSvg(`graph LR\n${edges}`, "quoted-ampersands")).toContain("<svg ");
+  });
+
   it("rejects oversized disconnected flowcharts before layout", () => {
     const nodes = Array.from({ length: 151 }, (_, index) => `N${index}`).join(" & ");
 
