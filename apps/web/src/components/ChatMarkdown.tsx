@@ -1,7 +1,5 @@
 import { useAtomValue } from "@effect/atom-react";
 import { DiffsHighlighter, getSharedHighlighter, SupportedLanguages } from "@pierre/diffs";
-import { renderMermaidSVG } from "beautiful-mermaid";
-import sanitizeHtml from "sanitize-html";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -76,6 +74,11 @@ import {
 } from "../markdown-links";
 import { readLocalApi } from "../localApi";
 import { cn } from "../lib/utils";
+import {
+  assertMermaidComplexity,
+  normalizeMermaidStatements,
+  renderSafeMermaidSvg,
+} from "./mermaid-renderer";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useActiveEnvironmentId } from "../state/entities";
 import { serverEnvironment } from "../state/server";
@@ -579,164 +582,6 @@ function MarkdownCodeBlockTitleContent({
   );
 }
 
-const MAX_MERMAID_SOURCE_LENGTH = 20_000;
-const MAX_MERMAID_STATEMENTS = 200;
-const MAX_MERMAID_CONNECTORS = 200;
-const MAX_MERMAID_CACHE_ENTRIES = 100;
-const MAX_MERMAID_CACHE_MEMORY_BYTES = 10 * 1024 * 1024;
-const mermaidSvgCache = new LRUCache<string>(
-  MAX_MERMAID_CACHE_ENTRIES,
-  MAX_MERMAID_CACHE_MEMORY_BYTES,
-);
-
-const MERMAID_SVG_TAGS = [
-  "svg",
-  "style",
-  "defs",
-  "marker",
-  "polygon",
-  "polyline",
-  "rect",
-  "text",
-  "tspan",
-  "g",
-  "circle",
-  "line",
-  "path",
-  "title",
-];
-const MERMAID_SVG_ATTRIBUTES = [
-  "xmlns",
-  "viewBox",
-  "width",
-  "height",
-  "style",
-  "aria-hidden",
-  "focusable",
-  "id",
-  "class",
-  "data-*",
-  "markerWidth",
-  "markerHeight",
-  "refX",
-  "refY",
-  "orient",
-  "marker-start",
-  "marker-end",
-  "points",
-  "fill",
-  "fill-opacity",
-  "stroke",
-  "stroke-width",
-  "stroke-linejoin",
-  "stroke-linecap",
-  "stroke-dasharray",
-  "opacity",
-  "x",
-  "y",
-  "x1",
-  "y1",
-  "x2",
-  "y2",
-  "cx",
-  "cy",
-  "r",
-  "rx",
-  "ry",
-  "d",
-  "dy",
-  "transform",
-  "text-anchor",
-  "font-size",
-  "font-weight",
-  "font-style",
-  "text-decoration",
-];
-
-function normalizeMermaidStatements(code: string): string {
-  let normalized = "";
-  let quoted = false;
-  let escaped = false;
-  let bracketDepth = 0;
-
-  for (let index = 0; index < code.length; index += 1) {
-    const character = code[index] ?? "";
-    if (escaped) {
-      normalized += character;
-      escaped = false;
-      continue;
-    }
-    if (character === "\\" && quoted) {
-      normalized += character;
-      escaped = true;
-      continue;
-    }
-    if (character === '"') {
-      quoted = !quoted;
-      normalized += character;
-      continue;
-    }
-    if (!quoted && character === "%" && code[index + 1] === "%") {
-      const lineEnd = code.indexOf("\n", index);
-      if (lineEnd === -1) return normalized + code.slice(index);
-      normalized += code.slice(index, lineEnd + 1);
-      index = lineEnd;
-      continue;
-    }
-    if (!quoted && "([{".includes(character)) bracketDepth += 1;
-    if (!quoted && ")]}".includes(character)) bracketDepth = Math.max(0, bracketDepth - 1);
-    normalized += character === ";" && !quoted && bracketDepth === 0 ? "\n" : character;
-  }
-
-  return normalized;
-}
-
-function assertMermaidComplexity(code: string): void {
-  if (code.length > MAX_MERMAID_SOURCE_LENGTH) {
-    throw new Error("Mermaid diagram source is too large");
-  }
-  const statements = code
-    .split("\n")
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0 && !line.startsWith("%%"));
-  if (statements.length > MAX_MERMAID_STATEMENTS) {
-    throw new Error("Mermaid diagram has too many statements");
-  }
-  const connectorCount = code.match(/--|->|<-|==/g)?.length ?? 0;
-  if (connectorCount > MAX_MERMAID_CONNECTORS) {
-    throw new Error("Mermaid diagram has too many connectors");
-  }
-}
-
-function assertLocalMermaidSvgReferences(svg: string): void {
-  for (const match of svg.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)) {
-    if (!match[2]?.trim().startsWith("#")) {
-      throw new Error("Mermaid diagram contains an external resource reference");
-    }
-  }
-}
-
-function sanitizeMermaidSvg(svg: string): string {
-  const withoutRemoteFonts = svg
-    .replace(/\s*@import url\('[^']+'\);/g, "")
-    .replace("<svg ", '<svg aria-hidden="true" focusable="false" ');
-  assertLocalMermaidSvgReferences(withoutRemoteFonts);
-  const sanitized = sanitizeHtml(withoutRemoteFonts, {
-    allowedTags: MERMAID_SVG_TAGS,
-    allowedAttributes: {
-      "*": MERMAID_SVG_ATTRIBUTES.filter((attribute) => attribute !== "style"),
-      svg: MERMAID_SVG_ATTRIBUTES,
-    },
-    allowedSchemes: [],
-    allowProtocolRelative: false,
-    parser: { lowerCaseAttributeNames: false, lowerCaseTags: false },
-  });
-  if (!sanitized.startsWith("<svg ")) {
-    throw new Error("Mermaid renderer did not return a safe SVG");
-  }
-  return sanitized;
-}
-
 function namespaceMermaidSvg(svg: string, namespace: string): string {
   const ids = [...svg.matchAll(/\sid="([^"]+)"/g)].flatMap((match) => (match[1] ? [match[1]] : []));
   return ids.reduce((result, id) => {
@@ -747,24 +592,27 @@ function namespaceMermaidSvg(svg: string, namespace: string): string {
   }, svg);
 }
 
-function renderSafeMermaidSvg(code: string): string {
-  const normalized = normalizeMermaidStatements(code);
-  assertMermaidComplexity(normalized);
-  const cached = mermaidSvgCache.get(normalized);
-  if (cached) return cached;
-  const rendered = renderMermaidSVG(normalized, {
-    bg: "color-mix(in srgb, var(--muted) 78%, var(--background))",
-    fg: "var(--foreground)",
-    line: "var(--muted-foreground)",
-    accent: "var(--foreground)",
-    border: "var(--border)",
-    font: "DM Sans Variable",
-    transparent: true,
-    interactive: false,
-  });
-  const sanitized = sanitizeMermaidSvg(rendered);
-  mermaidSvgCache.set(normalized, sanitized, sanitized.length * 2);
-  return sanitized;
+const MERMAID_WORKER_TIMEOUT_MS = 3_000;
+const mermaidSvgCache = new LRUCache<string>(100, 10 * 1024 * 1024);
+
+interface MermaidRenderState {
+  readonly code: string;
+  readonly svg: string | null;
+  readonly error: unknown;
+}
+
+interface MermaidWorkerResponse {
+  readonly svg?: string;
+  readonly error?: string;
+}
+
+function renderMermaidForStaticMarkup(code: string, isStreaming: boolean): MermaidRenderState {
+  if (isStreaming || typeof Worker !== "undefined") return { code, svg: null, error: null };
+  try {
+    return { code, svg: renderSafeMermaidSvg(code), error: null };
+  } catch (error) {
+    return { code, svg: null, error };
+  }
 }
 
 function MermaidSourceFallback({ code }: { code: string }) {
@@ -785,16 +633,78 @@ export function MermaidDiagram({
   const reactId = React.useId();
   const namespace = `mermaid-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
   const sourceDescriptionId = `${namespace}-source`;
-  const result = useMemo(() => {
-    if (isStreaming) return { svg: null, error: new Error("Diagram is still streaming") };
-    try {
-      return { svg: namespaceMermaidSvg(renderSafeMermaidSvg(code), namespace), error: null };
-    } catch (error) {
-      return { svg: null, error };
-    }
-  }, [code, isStreaming, namespace]);
+  const [result, setResult] = useState<MermaidRenderState>(() =>
+    renderMermaidForStaticMarkup(code, isStreaming),
+  );
 
-  if (result.error || !result.svg) {
+  useEffect(() => {
+    if (isStreaming) {
+      setResult({ code, svg: null, error: null });
+      return;
+    }
+
+    const cached = mermaidSvgCache.get(code);
+    if (cached) {
+      setResult({ code, svg: cached, error: null });
+      return;
+    }
+    if (typeof Worker === "undefined") {
+      setResult(renderMermaidForStaticMarkup(code, false));
+      return;
+    }
+
+    try {
+      assertMermaidComplexity(normalizeMermaidStatements(code));
+    } catch (error) {
+      setResult({ code, svg: null, error });
+      return;
+    }
+
+    setResult({ code, svg: null, error: null });
+    const worker = new Worker(new URL("./mermaid-renderer.worker.ts", import.meta.url), {
+      type: "module",
+    });
+    let active = true;
+    const timeout = setTimeout(() => {
+      if (!active) return;
+      active = false;
+      worker.terminate();
+      setResult({ code, svg: null, error: new Error("Mermaid rendering timed out") });
+    }, MERMAID_WORKER_TIMEOUT_MS);
+
+    worker.addEventListener("message", (event: MessageEvent<MermaidWorkerResponse>) => {
+      if (!active) return;
+      active = false;
+      clearTimeout(timeout);
+      worker.terminate();
+      if (event.data.svg) {
+        mermaidSvgCache.set(code, event.data.svg, event.data.svg.length * 2);
+        setResult({ code, svg: event.data.svg, error: null });
+      } else {
+        setResult({ code, svg: null, error: new Error(event.data.error ?? "Rendering failed") });
+      }
+    });
+    worker.addEventListener("error", () => {
+      if (!active) return;
+      active = false;
+      clearTimeout(timeout);
+      worker.terminate();
+      setResult({ code, svg: null, error: new Error("Mermaid rendering worker failed") });
+    });
+
+    return () => {
+      active = false;
+      clearTimeout(timeout);
+      worker.terminate();
+    };
+  }, [code, isStreaming]);
+
+  const renderedSvg = useMemo(
+    () => (result.code === code && result.svg ? namespaceMermaidSvg(result.svg, namespace) : null),
+    [code, namespace, result],
+  );
+
+  if (isStreaming || result.code !== code || result.error || !renderedSvg) {
     return <MermaidSourceFallback code={code} />;
   }
 
@@ -813,7 +723,7 @@ export function MermaidDiagram({
       >
         <div
           className="chat-markdown-mermaid-canvas"
-          dangerouslySetInnerHTML={{ __html: result.svg }}
+          dangerouslySetInnerHTML={{ __html: renderedSvg }}
         />
       </div>
     </>
