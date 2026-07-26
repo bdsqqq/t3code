@@ -104,6 +104,22 @@ describe("PiRpcClient transport", () => {
     }).pipe(Effect.scoped),
   );
 
+  it.effect("accepts fragmented Pi event lines larger than the former production limit", () =>
+    Effect.gen(function* () {
+      const test = yield* makeIo();
+      const client = yield* makePiRpcTransport(test.io);
+      const eventsFiber = yield* Stream.runCollect(client.events.pipe(Stream.take(1))).pipe(
+        Effect.forkScoped,
+      );
+      const text = "x".repeat(1024 * 1024 + 1);
+      const line = `{"type":"message","text":"${text}"}\n`;
+      const splitAt = 1024 * 1024 + 1;
+      yield* Queue.offer(test.stdout, bytes(line.slice(0, splitAt)));
+      yield* Queue.offer(test.stdout, bytes(line.slice(splitAt)));
+      expect((yield* Fiber.join(eventsFiber))[0]).toEqual({ type: "message", text });
+    }).pipe(Effect.scoped),
+  );
+
   it.effect("reports command failures without poisoning later requests", () =>
     Effect.gen(function* () {
       const test = yield* makeIo();
