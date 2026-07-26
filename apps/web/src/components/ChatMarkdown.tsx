@@ -654,6 +654,7 @@ export function MermaidDiagram({
       worker.terminate();
       setResult({ code, svg: null, error: new Error("Mermaid rendering worker failed") });
     });
+    worker.postMessage({ code });
 
     return () => {
       active = false;
