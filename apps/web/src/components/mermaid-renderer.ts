@@ -81,12 +81,14 @@ export function normalizeMermaidStatements(code: string): string {
   let quoted = false;
   let escaped = false;
   let bracketDepth = 0;
+  let atStatementStart = true;
 
   for (let index = 0; index < code.length; index += 1) {
     const character = code[index] ?? "";
     if (escaped) {
       normalized += character;
       escaped = false;
+      atStatementStart = false;
       continue;
     }
     if (character === "\\" && quoted) {
@@ -97,9 +99,10 @@ export function normalizeMermaidStatements(code: string): string {
     if (character === '"') {
       quoted = !quoted;
       normalized += character;
+      atStatementStart = false;
       continue;
     }
-    if (!quoted && character === "%" && code[index + 1] === "%") {
+    if (!quoted && atStatementStart && character === "%" && code[index + 1] === "%") {
       const lineEnd = code.indexOf("\n", index);
       if (lineEnd === -1) return normalized + code.slice(index);
       normalized += code.slice(index, lineEnd + 1);
@@ -108,7 +111,14 @@ export function normalizeMermaidStatements(code: string): string {
     }
     if (!quoted && "([{".includes(character)) bracketDepth += 1;
     if (!quoted && ")]}".includes(character)) bracketDepth = Math.max(0, bracketDepth - 1);
-    normalized += character === ";" && !quoted && bracketDepth === 0 ? "\n" : character;
+    if (character === ";" && !quoted && bracketDepth === 0) {
+      normalized += "\n";
+      atStatementStart = true;
+      continue;
+    }
+    normalized += character;
+    if (character === "\n") atStatementStart = true;
+    else if (!/\s/.test(character)) atStatementStart = false;
   }
 
   return normalized;
