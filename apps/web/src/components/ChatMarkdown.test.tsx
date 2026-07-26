@@ -1,5 +1,6 @@
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it } from "vite-plus/test";
+import { act, create, type ReactTestRenderer } from "react-test-renderer";
+import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import ChatMarkdown, { MermaidDiagram } from "./ChatMarkdown";
 import { renderSafeMermaidSvg } from "./mermaid-renderer";
@@ -36,6 +37,15 @@ describe("MermaidDiagram", () => {
     expect(html).toContain('data-id="A"');
     expect(html).not.toContain('data-id="C"');
     expect(html).not.toContain('data-id="D"');
+  });
+
+  it("preserves percent pairs inside node labels", () => {
+    const html = renderToStaticMarkup(
+      <MermaidDiagram code={"graph LR; A[100%% coverage]; B --> C"} />,
+    );
+
+    expect(html).toContain('data-label="100%% coverage"');
+    expect(html).toContain('data-id="C"');
   });
 
   it("rejects diagrams with external SVG resource references", () => {
@@ -130,5 +140,119 @@ describe("MermaidDiagram", () => {
     expect(html).toContain("<pre>");
     expect(html).toContain('class="language-mermaid"');
     expect(html).toContain("not a diagram");
+  });
+});
+
+interface MermaidWorkerResponse {
+  readonly svg?: string;
+  readonly error?: string;
+}
+
+class FakeWorker {
+  static readonly instances: FakeWorker[] = [];
+  readonly listeners = new Map<
+    string,
+    Array<(event: MessageEvent<MermaidWorkerResponse>) => void>
+  >();
+  postedMessage: unknown;
+  terminated = false;
+
+  constructor() {
+    FakeWorker.instances.push(this);
+  }
+
+  addEventListener(type: string, listener: (event: MessageEvent<MermaidWorkerResponse>) => void) {
+    const listeners = this.listeners.get(type) ?? [];
+    listeners.push(listener);
+    this.listeners.set(type, listeners);
+  }
+
+  postMessage(message: unknown) {
+    this.postedMessage = message;
+  }
+
+  terminate() {
+    this.terminated = true;
+  }
+
+  emit(type: "message" | "error", data: MermaidWorkerResponse = {}) {
+    for (const listener of this.listeners.get(type) ?? []) {
+      listener({ data } as MessageEvent<MermaidWorkerResponse>);
+    }
+  }
+}
+
+const originalWorker = globalThis.Worker;
+const reactActEnvironment = globalThis as typeof globalThis & {
+  IS_REACT_ACT_ENVIRONMENT?: boolean;
+};
+
+afterEach(() => {
+  vi.useRealTimers();
+  FakeWorker.instances.length = 0;
+  globalThis.Worker = originalWorker;
+  reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = false;
+});
+
+describe("MermaidDiagram worker lifecycle", () => {
+  it("posts source and renders a successful worker response", async () => {
+    reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+    globalThis.Worker = FakeWorker as unknown as typeof Worker;
+    const code = "graph LR\n WorkerA --> WorkerB";
+    let renderer: ReactTestRenderer | undefined;
+
+    await act(async () => {
+      renderer = create(<MermaidDiagram code={code} />);
+    });
+    const worker = FakeWorker.instances[0];
+    expect(worker?.postedMessage).toEqual({ code });
+
+    await act(async () => {
+      worker?.emit("message", { svg: renderSafeMermaidSvg(code) });
+    });
+    expect(renderer?.root.findByProps({ className: "chat-markdown-mermaid" })).toBeDefined();
+    expect(worker?.terminated).toBe(true);
+
+    await act(async () => renderer?.unmount());
+  });
+
+  it("falls back and terminates after a worker error", async () => {
+    reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+    globalThis.Worker = FakeWorker as unknown as typeof Worker;
+    let renderer: ReactTestRenderer | undefined;
+
+    await act(async () => {
+      renderer = create(<MermaidDiagram code={"graph LR\n ErrorA --> ErrorB"} />);
+    });
+    const worker = FakeWorker.instances[0];
+    await act(async () => worker?.emit("error"));
+
+    expect(renderer?.root.findByType("pre")).toBeDefined();
+    expect(worker?.terminated).toBe(true);
+    await act(async () => renderer?.unmount());
+  });
+
+  it("times out stalled workers and terminates workers on cleanup", async () => {
+    vi.useFakeTimers();
+    reactActEnvironment.IS_REACT_ACT_ENVIRONMENT = true;
+    globalThis.Worker = FakeWorker as unknown as typeof Worker;
+    let renderer: ReactTestRenderer | undefined;
+
+    await act(async () => {
+      renderer = create(<MermaidDiagram code={"graph LR\n TimeoutA --> TimeoutB"} />);
+    });
+    const timedOutWorker = FakeWorker.instances[0];
+    await act(async () => {
+      vi.advanceTimersByTime(3_000);
+    });
+    expect(timedOutWorker?.terminated).toBe(true);
+    expect(renderer?.root.findByType("pre")).toBeDefined();
+
+    await act(async () => {
+      renderer?.update(<MermaidDiagram code={"graph LR\n CleanupA --> CleanupB"} />);
+    });
+    const cleanupWorker = FakeWorker.instances[1];
+    await act(async () => renderer?.unmount());
+    expect(cleanupWorker?.terminated).toBe(true);
   });
 });
