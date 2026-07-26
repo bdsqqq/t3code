@@ -585,6 +585,9 @@ importers:
       effect:
         specifier: 4.0.0-beta.102
         version: 4.0.0-beta.102(patch_hash=71215759e1ac0a7f65d7b75d816986687ae6c3a6cba02d928d184ca71790d488)
+      entities:
+        specifier: ^7.0.1
+        version: 7.0.1
       jose:
         specifier: 'catalog:'
         version: 6.2.2

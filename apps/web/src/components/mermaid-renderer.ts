@@ -1,4 +1,5 @@
 import { parseMermaid, renderMermaidSVG } from "beautiful-mermaid";
+import { decodeXML } from "entities";
 import sanitizeHtml from "sanitize-html";
 
 import { prepareMermaidSource } from "./mermaid-source";
@@ -117,7 +118,10 @@ function sanitizeSvg(svg: string): string {
 }
 
 export function renderSafeMermaidSvg(code: string, namespace: string): string {
-  const source = prepareMermaidSource(code);
+  if (!/^[a-zA-Z0-9_-]+$/.test(namespace)) throw new Error("Invalid Mermaid SVG namespace");
+  const encodedSource = prepareMermaidSource(code);
+  const decoded = decodeXML(code);
+  const source = decoded === code ? encodedSource : prepareMermaidSource(decoded);
   const header =
     source
       .split("\n")
@@ -133,7 +137,9 @@ export function renderSafeMermaidSvg(code: string, namespace: string): string {
     }
   }
 
-  const rendered = renderMermaidSVG(source, {
+  // beautiful-mermaid decodes XML entities internally. Re-encode ampersands so the
+  // source validated above is exactly the source its parser and renderer receive.
+  const rendered = renderMermaidSVG(source.replaceAll("&", "&amp;"), {
     bg: "color-mix(in srgb, var(--muted) 78%, var(--background))",
     fg: "var(--foreground)",
     line: "var(--muted-foreground)",
