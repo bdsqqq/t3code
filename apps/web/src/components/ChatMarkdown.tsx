@@ -74,11 +74,7 @@ import {
 } from "../markdown-links";
 import { readLocalApi } from "../localApi";
 import { cn } from "../lib/utils";
-import {
-  assertMermaidComplexity,
-  normalizeMermaidStatements,
-  renderSafeMermaidSvg,
-} from "./mermaid-renderer";
+import { prepareMermaidSource } from "./mermaid-source";
 import { useRightPanelStore } from "../rightPanelStore";
 import { useActiveEnvironmentId } from "../state/entities";
 import { serverEnvironment } from "../state/server";
@@ -582,39 +578,6 @@ function MarkdownCodeBlockTitleContent({
   );
 }
 
-function namespaceMermaidSvg(svg: string, namespace: string): string {
-  const ids = [...svg.matchAll(/\sid="([^"]+)"/g)].flatMap((match) => (match[1] ? [match[1]] : []));
-  return ids.reduce((result, id) => {
-    const namespacedId = `${namespace}-${id}`;
-    return result
-      .replaceAll(` id="${id}"`, ` id="${namespacedId}"`)
-      .replaceAll(`url(#${id})`, `url(#${namespacedId})`);
-  }, svg);
-}
-
-const MERMAID_WORKER_TIMEOUT_MS = 3_000;
-const mermaidSvgCache = new LRUCache<string>(100, 10 * 1024 * 1024);
-
-interface MermaidRenderState {
-  readonly code: string;
-  readonly svg: string | null;
-  readonly error: unknown;
-}
-
-interface MermaidWorkerResponse {
-  readonly svg?: string;
-  readonly error?: string;
-}
-
-function renderMermaidForStaticMarkup(code: string, isStreaming: boolean): MermaidRenderState {
-  if (isStreaming || typeof Worker !== "undefined") return { code, svg: null, error: null };
-  try {
-    return { code, svg: renderSafeMermaidSvg(code), error: null };
-  } catch (error) {
-    return { code, svg: null, error };
-  }
-}
-
 function MermaidSourceFallback({ code }: { code: string }) {
   return (
     <pre>
@@ -633,81 +596,39 @@ export function MermaidDiagram({
   const reactId = React.useId();
   const namespace = `mermaid-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
   const sourceDescriptionId = `${namespace}-source`;
-  const [result, setResult] = useState<MermaidRenderState>(() =>
-    renderMermaidForStaticMarkup(code, isStreaming),
-  );
+  const [rendered, setRendered] = useState<{ code: string; svg: string | null }>({
+    code,
+    svg: null,
+  });
 
   useEffect(() => {
-    if (isStreaming) {
-      setResult({ code, svg: null, error: null });
-      return;
-    }
-
-    const cached = mermaidSvgCache.get(code);
-    if (cached) {
-      setResult({ code, svg: cached, error: null });
-      return;
-    }
-    if (typeof Worker === "undefined") {
-      setResult(renderMermaidForStaticMarkup(code, false));
-      return;
-    }
-
+    if (isStreaming) return;
     try {
-      assertMermaidComplexity(normalizeMermaidStatements(code));
-    } catch (error) {
-      setResult({ code, svg: null, error });
+      prepareMermaidSource(code);
+    } catch {
+      setRendered({ code, svg: null });
       return;
     }
 
-    setResult({ code, svg: null, error: null });
-    const worker = new Worker(new URL("./mermaid-renderer.worker.ts", import.meta.url), {
-      type: "module",
-    });
-    let active = true;
+    let cancelled = false;
     const timeout = setTimeout(() => {
-      if (!active) return;
-      active = false;
-      worker.terminate();
-      setResult({ code, svg: null, error: new Error("Mermaid rendering timed out") });
-    }, MERMAID_WORKER_TIMEOUT_MS);
-
-    worker.addEventListener("message", (event: MessageEvent<MermaidWorkerResponse>) => {
-      if (!active) return;
-      active = false;
-      clearTimeout(timeout);
-      worker.terminate();
-      if (event.data.svg) {
-        mermaidSvgCache.set(code, event.data.svg, event.data.svg.length * 2);
-        setResult({ code, svg: event.data.svg, error: null });
-      } else {
-        setResult({ code, svg: null, error: new Error(event.data.error ?? "Rendering failed") });
-      }
-    });
-    worker.addEventListener("error", () => {
-      if (!active) return;
-      active = false;
-      clearTimeout(timeout);
-      worker.terminate();
-      setResult({ code, svg: null, error: new Error("Mermaid rendering worker failed") });
-    });
-    worker.postMessage({ code });
-
+      void (async () => {
+        try {
+          const { renderSafeMermaidSvg } = await import("./mermaid-renderer");
+          if (!cancelled) setRendered({ code, svg: renderSafeMermaidSvg(code, namespace) });
+        } catch {
+          if (!cancelled) setRendered({ code, svg: null });
+        }
+      })();
+    }, 0);
     return () => {
-      active = false;
+      cancelled = true;
       clearTimeout(timeout);
-      worker.terminate();
     };
-  }, [code, isStreaming]);
+  }, [code, isStreaming, namespace]);
 
-  const renderedSvg = useMemo(
-    () => (result.code === code && result.svg ? namespaceMermaidSvg(result.svg, namespace) : null),
-    [code, namespace, result],
-  );
-
-  if (isStreaming || result.code !== code || result.error || !renderedSvg) {
-    return <MermaidSourceFallback code={code} />;
-  }
+  const svg = rendered.code === code ? rendered.svg : null;
+  if (isStreaming || !svg) return <MermaidSourceFallback code={code} />;
 
   return (
     <>
@@ -722,10 +643,7 @@ export function MermaidDiagram({
         aria-label="Mermaid diagram"
         aria-describedby={sourceDescriptionId}
       >
-        <div
-          className="chat-markdown-mermaid-canvas"
-          dangerouslySetInnerHTML={{ __html: renderedSvg }}
-        />
+        <div className="chat-markdown-mermaid-canvas" dangerouslySetInnerHTML={{ __html: svg }} />
       </div>
     </>
   );
