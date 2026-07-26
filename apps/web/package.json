@@ -36,6 +36,7 @@
     "beautiful-mermaid": "^1.1.3",
     "class-variance-authority": "^0.7.1",
     "effect": "catalog:",
+    "entities": "^7.0.1",
     "jose": "catalog:",
     "lexical": "^0.41.0",
     "lucide-react": "^0.564.0",
