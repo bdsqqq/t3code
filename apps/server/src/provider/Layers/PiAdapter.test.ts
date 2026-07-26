@@ -229,14 +229,14 @@ describe("PiAdapter", () => {
           cursor.sessionFile,
         ]);
         assert.equal(args.includes("--no-session"), false);
+        assert.equal(args.includes("--offline"), true);
         for (const arg of [
-          "--offline",
           "--no-context-files",
           "--no-extensions",
           "--no-skills",
           "--no-prompt-templates",
         ])
-          assert.equal(args.includes(arg), true);
+          assert.equal(args.includes(arg), false);
       }),
     );
   });
@@ -394,6 +394,75 @@ describe("PiAdapter", () => {
             },
           },
         });
+      }),
+    );
+  });
+
+  it.effect("classifies Pi agent-backed tools as collaboration work", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const collected = yield* Stream.take(adapter.streamEvents, 4).pipe(
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          input: "delegate this",
+          modelSelection,
+        });
+        yield* Queue.offerAll(h.client.input, [
+          {
+            type: "tool_execution_start",
+            toolCallId: "agent-1",
+            toolName: "security_scout",
+            args: { query: "Locate the authentication flow" },
+          },
+          {
+            type: "tool_execution_update",
+            toolCallId: "agent-1",
+            toolName: "security_scout",
+            partialResult: {
+              content: [{ type: "text", text: "Searching" }],
+              details: { agent: "security_scout", task: "Locate the authentication flow" },
+            },
+          },
+          {
+            type: "tool_execution_end",
+            toolCallId: "agent-1",
+            toolName: "security_scout",
+            result: {
+              content: [{ type: "text", text: "Found the flow" }],
+              details: { agent: "security_scout", task: "Locate the authentication flow" },
+            },
+            isError: false,
+          },
+        ]);
+
+        const events = Array.from(yield* Fiber.join(collected));
+        const tools = events.filter(
+          (
+            event,
+          ): event is Extract<
+            ProviderRuntimeEvent,
+            { type: "item.started" | "item.updated" | "item.completed" }
+          > =>
+            event.type === "item.started" ||
+            event.type === "item.updated" ||
+            event.type === "item.completed",
+        );
+        assert.equal(tools.length, 3);
+        assert.equal(tools[0]?.payload.itemType, "dynamic_tool_call");
+        for (const event of tools.slice(1)) {
+          assert.equal(event.payload.itemType, "collab_agent_tool_call");
+          assert.equal(event.payload.title, "Security scout agent");
+          assert.equal(event.payload.detail, "Locate the authentication flow");
+          assert.equal(
+            (event.payload.data as Record<string, unknown> | undefined)?.toolName,
+            "security_scout",
+          );
+        }
       }),
     );
   });
