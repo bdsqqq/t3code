@@ -8,8 +8,12 @@ import * as ServerConfig from "../config.ts";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import * as PairingGrantStore from "./PairingGrantStore.ts";
 import * as EnvironmentAuth from "./EnvironmentAuth.ts";
+import { resolveSessionCookieName } from "./utils.ts";
 
 import * as ServerSecretStore from "./ServerSecretStore.ts";
+
+/** Pinned so the session cookie name (which is port-scoped) is predictable. */
+const TEST_SERVER_PORT = 13_773;
 
 const makeServerConfigLayer = (overrides?: Partial<ServerConfig.ServerConfig["Service"]>) =>
   Layer.effect(
@@ -18,6 +22,7 @@ const makeServerConfigLayer = (overrides?: Partial<ServerConfig.ServerConfig["Se
       const config = yield* ServerConfig.ServerConfig;
       return {
         ...config,
+        port: TEST_SERVER_PORT,
         ...overrides,
       } satisfies ServerConfig.ServerConfig["Service"];
     }),
@@ -35,7 +40,9 @@ const makeCookieRequest = (
 ): Parameters<EnvironmentAuth.EnvironmentAuth["Service"]["authenticateHttpRequest"]>[0] =>
   ({
     cookies: {
-      t3_session: sessionToken,
+      // Derived, not hardcoded: the name is port-scoped so concurrent servers
+      // on one hostname don't share a cookie.
+      [resolveSessionCookieName({ port: TEST_SERVER_PORT })]: sessionToken,
     },
     headers: {},
   }) as unknown as Parameters<

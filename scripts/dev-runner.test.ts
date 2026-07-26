@@ -18,6 +18,7 @@ import {
   getDevRunnerModeArgs,
   resolveModePortOffsets,
   resolveOffset,
+  resolveWorktreeHome,
   runDevRunnerWithInput,
 } from "./dev-runner.ts";
 
@@ -58,6 +59,7 @@ const devServerInput = {
   port: 13_773,
   devUrl: undefined,
   dryRun: false,
+  share: false,
   runArgs: ["--inspect", "secret-token-value"],
 } as const;
 
@@ -336,8 +338,58 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
         });
 
         assert.equal(env.T3CODE_PORT, "13773");
-        assert.equal(env.VITE_HTTP_URL, "http://localhost:13773");
-        assert.equal(env.VITE_WS_URL, "ws://localhost:13773");
+        assert.equal(env.PORT, "5733");
+      }),
+    );
+
+    // Browser dev is single-origin: Vite proxies the backend, and the client
+    // resolves it from window.location.origin. Baking a localhost URL here is
+    // what breaks sharing a dev server to another device.
+    for (const mode of ["dev", "dev:web"] as const) {
+      it.effect(`leaves the client backend URLs unset in ${mode} mode`, () =>
+        Effect.gen(function* () {
+          const env = yield* createDevRunnerEnv({
+            mode,
+            baseEnv: {
+              VITE_HTTP_URL: "http://localhost:1234",
+              VITE_WS_URL: "ws://localhost:1234",
+            },
+            serverOffset: 0,
+            webOffset: 0,
+            t3Home: undefined,
+            browser: undefined,
+            autoBootstrapProjectFromCwd: undefined,
+            logWebSocketEvents: undefined,
+            host: undefined,
+            port: undefined,
+            devUrl: undefined,
+          });
+
+          assert.equal(env.VITE_HTTP_URL, undefined);
+          assert.equal(env.VITE_WS_URL, undefined);
+          assert.equal(env.T3CODE_PORT, "13773");
+        }),
+      );
+    }
+
+    it.effect("keeps explicit backend URLs for the desktop renderer", () =>
+      Effect.gen(function* () {
+        const env = yield* createDevRunnerEnv({
+          mode: "dev:desktop",
+          baseEnv: {},
+          serverOffset: 0,
+          webOffset: 0,
+          t3Home: undefined,
+          browser: undefined,
+          autoBootstrapProjectFromCwd: undefined,
+          logWebSocketEvents: undefined,
+          host: undefined,
+          port: undefined,
+          devUrl: undefined,
+        });
+
+        assert.equal(env.VITE_HTTP_URL, "http://127.0.0.1:13773");
+        assert.equal(env.VITE_WS_URL, "ws://127.0.0.1:13773");
       }),
     );
   });
@@ -511,6 +563,25 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
     );
   });
 
+  // A worktree dev server writing to the shared ~/.t3 lands on the *real*
+  // database the installed app uses, because an ambient T3CODE_HOME counts as
+  // an explicit base dir and flips the state dir from `dev` to `userdata`.
+  describe("resolveWorktreeHome", () => {
+    it.effect("keeps a worktree's data directory inside the worktree", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const home = yield* resolveWorktreeHome("/repos/app-worktree");
+        assert.equal(home, path.join("/repos/app-worktree", ".t3"));
+      }),
+    );
+
+    it.effect("leaves the main checkout on the shared home", () =>
+      Effect.gen(function* () {
+        assert.equal(yield* resolveWorktreeHome(undefined), undefined);
+      }),
+    );
+  });
+
   describe("runDevRunnerWithInput", () => {
     it.effect("preserves invalid configuration as the exact cause", () =>
       Effect.gen(function* () {
@@ -566,6 +637,60 @@ it.layer(NodeServices.layer)("dev-runner", (it) => {
         assert.ok(!error.message.includes(cause.message));
         assert.notProperty(error, "args");
         assert.notInclude(error.message, "secret-token-value");
+      });
+    });
+
+    // `tailscale serve` config outlives the process, so a dry run that shared
+    // would replace and then tear down whatever mapping the port already had.
+    // An ambient T3CODE_HOME must not drag a worktree's dev state onto the
+    // shared home: that resolves to <home>/userdata, the database the user's
+    // installed T3 Code is actively running against.
+    it.effect("keeps an ambient T3CODE_HOME from overriding the worktree home", () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const worktreeHome = yield* resolveWorktreeHome("/repos/app-worktree");
+        const env = yield* createDevRunnerEnv({
+          mode: "dev",
+          baseEnv: { T3CODE_HOME: "/home/user/.t3" },
+          serverOffset: 0,
+          webOffset: 0,
+          // Mirrors the precedence runDevRunnerWithInput applies.
+          t3Home: worktreeHome,
+          browser: undefined,
+          autoBootstrapProjectFromCwd: undefined,
+          logWebSocketEvents: undefined,
+          host: undefined,
+          port: undefined,
+          devUrl: undefined,
+        });
+
+        assert.equal(env.T3CODE_HOME, path.resolve("/repos/app-worktree/.t3"));
+      }),
+    );
+
+    it.effect("spawns nothing when --dry-run is combined with --share", () => {
+      let spawnCount = 0;
+      const spawnerLayer = Layer.succeed(
+        ChildProcessSpawner.ChildProcessSpawner,
+        ChildProcessSpawner.make(() => {
+          spawnCount += 1;
+          return Effect.succeed(mockProcess(0));
+        }),
+      );
+
+      return Effect.gen(function* () {
+        yield* runDevRunnerWithInput({
+          ...devServerInput,
+          mode: "dev",
+          port: undefined,
+          dryRun: true,
+          share: true,
+        }).pipe(
+          Effect.provide(Layer.mergeAll(emptyConfigLayer, netServiceLayer, spawnerLayer)),
+          Effect.provideService(HostProcessPlatform, "linux"),
+        );
+
+        assert.equal(spawnCount, 0);
       });
     });
 

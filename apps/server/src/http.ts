@@ -41,6 +41,16 @@ import { browserApiCorsAllowedHeaders, browserApiCorsAllowedMethods } from "./ht
 const OTLP_TRACES_PROXY_PATH = "/api/observability/v1/traces";
 const LOOPBACK_HOSTNAMES = new Set(["127.0.0.1", "::1", "localhost"]);
 const DESKTOP_RENDERER_ORIGINS = ["t3code://app", "t3code-dev://app"];
+// Paths the web dev server proxies to us. Bouncing an unmatched one back to
+// Vite would loop forever (Vite proxies it straight back), and it would answer
+// an API call with index.html — so these 404 instead.
+const DEV_PROXIED_PATH_PREFIXES = ["/api/", "/oauth/", "/.well-known/", "/ws"] as const;
+
+function isDevProxiedPath(pathname: string): boolean {
+  return DEV_PROXIED_PATH_PREFIXES.some(
+    (prefix) => pathname === prefix.replace(/\/$/, "") || pathname.startsWith(prefix),
+  );
+}
 
 export const browserApiCorsLayer = Layer.unwrap(
   Effect.gen(function* () {
@@ -48,9 +58,21 @@ export const browserApiCorsLayer = Layer.unwrap(
     const devOrigin = config.devUrl?.origin;
     // Dev uses credentialed requests from Vite or the Electron custom origin, so both must be
     // explicit. Packaged desktop omits credentials and uses Effect's default wildcard origin.
+    //
+    // T3CODE_DEV_ALLOWED_ORIGINS covers dev servers reached from a second
+    // origin — a tailnet name, a LAN IP, a phone. Browser dev normally proxies
+    // through Vite and is same-origin (no preflight at all), so this is a
+    // safety net for the desktop renderer and any direct-to-backend caller.
+    const extraDevOrigins = (process.env.T3CODE_DEV_ALLOWED_ORIGINS ?? "")
+      .split(",")
+      .map((entry) => entry.trim())
+      .filter((entry) => entry.length > 0);
     return HttpRouter.cors({
       ...(devOrigin
-        ? { allowedOrigins: [devOrigin, ...DESKTOP_RENDERER_ORIGINS], credentials: true }
+        ? {
+            allowedOrigins: [devOrigin, ...DESKTOP_RENDERER_ORIGINS, ...extraDevOrigins],
+            credentials: true,
+          }
         : {}),
       allowedMethods: browserApiCorsAllowedMethods,
       allowedHeaders: browserApiCorsAllowedHeaders,
@@ -216,6 +238,10 @@ export const staticAndDevRouteLayer = HttpRouter.add(
     }
 
     const config = yield* ServerConfig.ServerConfig;
+    if (config.devUrl && isDevProxiedPath(url.value.pathname)) {
+      return HttpServerResponse.text("Not Found", { status: 404 });
+    }
+
     if (config.devUrl && isLoopbackHostname(url.value.hostname)) {
       return HttpServerResponse.redirect(resolveDevRedirectUrl(config.devUrl, url.value), {
         status: 302,

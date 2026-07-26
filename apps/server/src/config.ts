@@ -47,6 +47,13 @@ export interface ServerDerivedPaths {
 
 export interface DeriveServerPathsOptions {
   readonly baseDirIsExplicit?: boolean;
+  /**
+   * Use this state directory verbatim instead of deriving `dev` vs `userdata`.
+   * For tooling that has already located a running server's state directory and
+   * must target it exactly, rather than re-running the heuristic and risking a
+   * different answer.
+   */
+  readonly stateDir?: string;
 }
 
 /**
@@ -98,10 +105,9 @@ export const deriveServerPaths = Effect.fn(function* (
   options: DeriveServerPathsOptions = {},
 ): Effect.fn.Return<ServerDerivedPaths, never, Path.Path> {
   const { join } = yield* Path.Path;
-  const stateDir = join(
-    baseDir,
-    devUrl !== undefined && !options.baseDirIsExplicit ? "dev" : "userdata",
-  );
+  const stateDir =
+    options.stateDir ??
+    join(baseDir, devUrl !== undefined && !options.baseDirIsExplicit ? "dev" : "userdata");
   const dbPath = join(stateDir, "state.sqlite");
   const attachmentsDir = join(stateDir, "attachments");
   const logsDir = join(stateDir, "logs");

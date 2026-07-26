@@ -69,12 +69,15 @@ it.layer(NodeServices.layer)("EnvironmentAuthPolicy.layer", (it) => {
 
       expect(descriptor.policy).toBe("loopback-browser");
       expect(descriptor.bootstrapMethods).toEqual(["one-time-token"]);
-      expect(descriptor.sessionCookieName).toBe("t3_session");
+      // Port-scoped in web mode too: cookies ignore ports, so two dev servers
+      // on one hostname would otherwise clobber each other's session.
+      expect(descriptor.sessionCookieName).toBe("t3_session_13773");
     }).pipe(
       Effect.provide(
         makeEnvironmentAuthPolicyLayer({
           mode: "web",
           host: "127.0.0.1",
+          port: 13773,
         }),
       ),
     ),

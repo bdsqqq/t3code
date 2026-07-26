@@ -14,6 +14,12 @@ export const PersistedServerRuntimeState = Schema.Struct({
   host: Schema.optional(Schema.String),
   port: Schema.Int,
   origin: Schema.String,
+  /**
+   * The web origin users actually open in dev — the Vite server, or the shared
+   * tailnet URL when the dev runner published one. Recorded so tooling can mint
+   * a pairing URL for a running server without being told where it lives.
+   */
+  devUrl: Schema.optional(Schema.String),
   startedAt: Schema.String,
 });
 export type PersistedServerRuntimeState = typeof PersistedServerRuntimeState.Type;
@@ -45,7 +51,7 @@ const runtimeOriginForConfig = (
 };
 
 export const makePersistedServerRuntimeState = (input: {
-  readonly config: Pick<ServerConfig.ServerConfig["Service"], "host">;
+  readonly config: Pick<ServerConfig.ServerConfig["Service"], "host" | "devUrl">;
   readonly port: number;
 }): Effect.Effect<PersistedServerRuntimeState> =>
   Effect.map(DateTime.now, (now) => ({
@@ -54,6 +60,7 @@ export const makePersistedServerRuntimeState = (input: {
     ...(input.config.host ? { host: input.config.host } : {}),
     port: input.port,
     origin: runtimeOriginForConfig(input.config, input.port),
+    ...(input.config.devUrl ? { devUrl: input.config.devUrl.toString() } : {}),
     startedAt: DateTime.formatIso(now),
   }));
 
@@ -98,6 +105,31 @@ export const clearPersistedServerRuntimeState = (path: string) =>
           ),
       }),
     );
+  });
+
+/**
+ * Whether the process that wrote a runtime-state file is still alive.
+ *
+ * The file is removed by a release finalizer, so a server killed with SIGKILL —
+ * or one that crashed — leaves it behind. Treating a leftover file as "the
+ * server is up" points callers at a port nothing is listening on. Signal 0
+ * performs the permission and existence checks without delivering a signal.
+ *
+ * PIDs are reused eventually, so a false positive is possible in principle;
+ * that is acceptable for local dev tooling, where the alternative is an
+ * HTTP probe that has to guess how long to wait for a starting server.
+ */
+export const isPersistedServerRuntimeStateLive = (
+  state: PersistedServerRuntimeState,
+): Effect.Effect<boolean> =>
+  Effect.sync(() => {
+    try {
+      process.kill(state.pid, 0);
+      return true;
+    } catch (cause) {
+      // EPERM means the process exists but belongs to another user.
+      return (cause as NodeJS.ErrnoException).code === "EPERM";
+    }
   });
 
 export const readPersistedServerRuntimeState = (path: string) =>

@@ -13,8 +13,21 @@ Use this skill for the web client. For iOS Simulator, Android Emulator, or physi
 2. Choose a base directory that belongs only to the current worktree or test:
    - Use the repository's ignored `.t3` directory for reusable worktree-local state.
    - Use `mktemp -d /tmp/t3code-test.XXXXXX` for disposable state and retain the printed absolute path.
-3. Start the full web stack with `vp run dev --home-dir <base-dir>`.
+3. Start the full web stack with `vp run dev --home-dir <base-dir>`. Add `--share`
+   to also publish it on the tailnet so the user can open it from another device
+   (see "Share a dev server with the user" below).
 4. Keep the terminal session alive and read the selected server port, web port, base directory, and pairing URL from its output.
+
+Ports are derived from the worktree path, so a worktree prefers the same pair on
+every run rather than racing others for the default. That is a preference, not a
+guarantee — the runner shifts both ports when either is already taken. Read the
+actual values from the dev-runner line rather than assuming `5733`/`13773`, and
+re-read them after a restart; `node scripts/dev-runner.ts dev --dry-run` prints
+them without starting anything.
+
+Inside a worktree, the dev runner defaults to that worktree's own gitignored `.t3` rather than the shared `~/.t3` — including when `T3CODE_HOME` is exported in the environment, which would otherwise resolve to `~/.t3/userdata`: the live database the user's installed T3 Code is running against. Do not override that default to the shared home.
+
+A fresh isolated database is empty, which is fine for flows you drive yourself but useless for anything that renders a list of existing work. To populate it, stop the dev server and run `bun run dev:seed` (`--threads N` to change the count), then restart. It copies recent projects and threads from the shared home read-only and refuses to write to it. Prefer this over hand-writing fixtures when you just need the UI to look real; use `references/sqlite-fixtures.md` when a test needs specific, controlled rows.
 
 Treat a base directory as disposable only when it was created or deliberately selected for the current test. Never delete or directly seed the shared `~/.t3` directory. Prefer starting with a new temporary base directory over clearing state of uncertain ownership.
 
@@ -38,24 +51,63 @@ Treat the overall testing or implementation loop—not an assistant turn or one 
 4. Wait for the pairing exchange and redirect to finish before navigating elsewhere.
 5. Continue in the same browser context so its stored bearer session remains available.
 
-Treat pairing URLs as secrets. Do not copy them into final responses, screenshots, committed files, or durable logs. A pairing token is short-lived and single-use; opening the URL in another browser or opening it twice can consume it.
+Treat pairing URLs as secrets: they grant access to the environment. Never put one anywhere it outlives the moment — screenshots, committed files, durable logs, or a PR description.
+
+The one exception is handing access to the user who asked for it: when they want to open the app themselves (see "Share a dev server with the user"), the URL is the deliverable, so give it to them directly in the response. Do not volunteer one otherwise. A pairing token is short-lived and single-use; opening the URL in another browser or opening it twice can consume it.
 
 ## Recover a consumed or expired pairing token
 
-Create another token against the same database and web URL as the running dev server:
+Ask the running server for a fresh pairing URL:
 
 ```bash
-T3CODE_PORT=<server-port> node apps/server/src/bin.ts auth pairing create \
-  --base-dir <base-dir> \
-  --dev-url <web-url> \
-  --base-url <web-url> \
-  --ttl 15m \
-  --label agent-ui-test
+bun run dev:pair                      # implicit ~/.t3 home
+bun run dev:pair -- --base-dir <base-dir>   # explicit --home-dir environment
 ```
 
-Use the `Pair URL` from this command once. Derive `<server-port>` and `<web-url>` from the current dev-runner output, including any automatically selected port offset. Setting `T3CODE_PORT` keeps the administrative CLI from probing for an unrelated free port.
+It finds the running server's own `server-runtime.json` under the base directory
+— checking both the `dev` and `userdata` state directories and verifying the
+recorded process is alive — so it needs no port and builds the URL against the
+web origin already in use, including a `--share` tailnet URL. Pass `--base-dir`
+only when the dev server was started with `--home-dir`. Add `--ttl 1h` for a
+longer window or `--json` for machine-readable output.
 
-Always pass `--dev-url` for a dev-runner environment so the generated pairing URL uses the current web origin. An explicit base directory stores runtime state in `<base-dir>/userdata`; the `<base-dir>/dev` fallback is only used by an implicit dev home. Use `auth pairing list` to inspect active token metadata; it intentionally cannot reveal token secrets.
+Use the printed `Pair URL` once. If the command reports no running server, the
+dev process has exited — restart it and use the URL from its own startup log.
+
+Use `auth pairing list` to inspect active token metadata; it intentionally cannot
+reveal token secrets. `auth pairing create` remains available for scripted cases
+that need explicit control over every flag.
+
+## Share a dev server with the user
+
+When the user wants to try the change themselves — from their laptop, their
+phone, or anything else on their tailnet — start the stack with `--share`:
+
+```bash
+bun run dev:share                     # or: vp run dev --share --home-dir <base-dir>
+```
+
+This publishes the web port over HTTPS on the machine's tailnet and prints
+`[dev-runner] shared on tailnet: https://<host>:<port>/`. The pairing URL logged
+right after is already built against that origin, so give the user that URL
+verbatim — it is the deliverable, and it works unchanged on any of their devices.
+This is the one case where a pairing URL belongs in a response: it is going to
+the person who asked for it. It still must not go anywhere durable.
+
+Dev is single-origin: Vite proxies `/api`, `/ws`, `/oauth`, and `/.well-known` to
+the backend, so one shared port covers the whole app. Do not map backend paths by
+hand, and do not set `VITE_HTTP_URL`/`VITE_WS_URL` for a shared server — absolute
+localhost URLs get compiled into the bundle and send the remote browser to its
+own machine.
+
+The mapping is removed when the dev server exits, and re-running `--share`
+replaces any mapping left behind by a run that was killed. If the tailnet is
+unavailable the dev server still starts and serves locally; the warning explains
+what to fix.
+
+Expect one failed `ws://localhost:<port>` HMR attempt in the remote console
+before Vite falls back to the page origin. That is Vite's own hot-reload socket,
+not the app's connection — ignore it.
 
 ## Inspect or seed SQLite state
 
@@ -83,7 +135,9 @@ If completion is uncertain, keep the environment alive and mention that it is re
 ## Troubleshoot predictably
 
 - If the browser shows an unauthenticated pairing screen, issue a new token instead of retrying the consumed URL.
-- If the pairing URL is no longer visible, create a replacement token with both `--dev-url` and `--base-url`.
-- If the replacement token is rejected, verify that the CLI and server use the identical absolute base directory and web URL.
+- If the pairing URL is no longer visible, run `bun run dev:pair`.
+- If the replacement token is rejected, verify that the CLI and server resolve the same state directory — pass `--base-dir` only when the server was started with `--home-dir`, and use the same path.
 - If the UI shows unexpected data, verify that every command uses the identical explicit base directory before editing anything.
 - If ports move because another instance is running, trust the current dev-runner output rather than assuming ports `13773` and `5733`.
+- If a remote browser reaches the page but the app cannot connect, check that the served bundle has no absolute `localhost` backend URL baked in: `VITE_HTTP_URL` and `VITE_WS_URL` must be unset for `dev`/`dev:web`.
+- If a shared URL returns 403 with "host is not allowed", the hostname is outside `*.ts.net`; add it to `T3CODE_DEV_ALLOWED_HOSTS` (comma-separated).

@@ -10,14 +10,15 @@ import * as Result from "effect/Result";
 
 const SESSION_COOKIE_NAME = "t3_session";
 
-export function resolveSessionCookieName(input: {
-  readonly mode: "web" | "desktop";
-  readonly port: number;
-}): string {
-  if (input.mode !== "desktop") {
-    return SESSION_COOKIE_NAME;
-  }
-
+/**
+ * Cookies are scoped by host but *not* by port, so every server reachable at a
+ * given hostname shares one cookie jar. Suffixing the port keeps concurrent
+ * instances from overwriting each other's session — otherwise two dev servers
+ * (different worktrees, or several ports behind one tailnet name) fight over
+ * `t3_session`, and whichever wrote last makes every other one reject the
+ * cookie with "Invalid session token signature" until it's cleared by hand.
+ */
+export function resolveSessionCookieName(input: { readonly port: number }): string {
   return `${SESSION_COOKIE_NAME}_${input.port}`;
 }
 

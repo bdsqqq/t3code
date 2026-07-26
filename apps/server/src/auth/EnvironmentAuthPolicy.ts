@@ -38,10 +38,7 @@ export const make = Effect.gen(function* () {
     policy,
     bootstrapMethods,
     sessionMethods: ["browser-session-cookie", "bearer-access-token", "dpop-access-token"],
-    sessionCookieName: resolveSessionCookieName({
-      mode: config.mode,
-      port: config.port,
-    }),
+    sessionCookieName: resolveSessionCookieName({ port: config.port }),
   };
 
   return EnvironmentAuthPolicy.of({

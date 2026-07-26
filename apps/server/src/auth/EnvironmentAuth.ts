@@ -36,7 +36,9 @@ import { verifyRequestDpopProof } from "./dpop.ts";
 import { layerConfig as SqlitePersistenceLayer } from "../persistence/Layers/Sqlite.ts";
 
 export const DEFAULT_SESSION_SUBJECT = "cli-issued-session";
-export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT = "administrative-bootstrap";
+// Re-exported from PairingGrantStore, which keys the dev startup-token TTL off it.
+export const INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT =
+  PairingGrantStore.INTERNAL_ADMINISTRATIVE_BOOTSTRAP_SUBJECT;
 
 export interface IssuedPairingLink {
   readonly id: string;

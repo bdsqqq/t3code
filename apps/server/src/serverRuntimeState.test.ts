@@ -43,6 +43,35 @@ describe("serverRuntimeState", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  // A server killed with SIGKILL never runs its release finalizer, so the file
+  // survives it. Trusting a leftover file points callers at a dead port.
+  describe("isPersistedServerRuntimeStateLive", () => {
+    const stateForPid = (pid: number): ServerRuntimeState.PersistedServerRuntimeState => ({
+      version: 1,
+      pid,
+      port: 4_971,
+      origin: "http://127.0.0.1:4971",
+      startedAt: "2026-06-20T00:00:00.000Z",
+    });
+
+    it.effect("recognizes the current process as live", () =>
+      Effect.gen(function* () {
+        assert.isTrue(
+          yield* ServerRuntimeState.isPersistedServerRuntimeStateLive(stateForPid(process.pid)),
+        );
+      }),
+    );
+
+    it.effect("reports a pid that no longer exists as dead", () =>
+      Effect.gen(function* () {
+        // Above the default pid_max, so it cannot be a live process.
+        assert.isFalse(
+          yield* ServerRuntimeState.isPersistedServerRuntimeStateLive(stateForPid(0x7ffffffe)),
+        );
+      }),
+    );
+  });
+
   it.effect("treats a missing runtime state file as absent", () =>
     Effect.gen(function* () {
       const fileSystem = yield* FileSystem.FileSystem;
