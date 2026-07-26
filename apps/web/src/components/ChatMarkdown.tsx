@@ -1,6 +1,7 @@
 import { useAtomValue } from "@effect/atom-react";
 import { DiffsHighlighter, getSharedHighlighter, SupportedLanguages } from "@pierre/diffs";
 import { renderMermaidSVG } from "beautiful-mermaid";
+import sanitizeHtml from "sanitize-html";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -541,13 +542,88 @@ function MarkdownCodeBlockTitleContent({
   );
 }
 
+const MAX_MERMAID_SOURCE_LENGTH = 20_000;
+const MAX_MERMAID_STATEMENTS = 200;
+const MAX_MERMAID_CONNECTORS = 200;
+const MAX_MERMAID_CACHE_ENTRIES = 100;
+const MAX_MERMAID_CACHE_MEMORY_BYTES = 10 * 1024 * 1024;
+const mermaidSvgCache = new LRUCache<string>(
+  MAX_MERMAID_CACHE_ENTRIES,
+  MAX_MERMAID_CACHE_MEMORY_BYTES,
+);
+
+const MERMAID_SVG_TAGS = [
+  "svg",
+  "style",
+  "defs",
+  "marker",
+  "polygon",
+  "polyline",
+  "rect",
+  "text",
+  "tspan",
+  "g",
+  "circle",
+  "line",
+  "path",
+  "title",
+];
+const MERMAID_SVG_ATTRIBUTES = [
+  "xmlns",
+  "viewBox",
+  "width",
+  "height",
+  "style",
+  "aria-hidden",
+  "focusable",
+  "id",
+  "class",
+  "data-*",
+  "markerWidth",
+  "markerHeight",
+  "refX",
+  "refY",
+  "orient",
+  "marker-start",
+  "marker-end",
+  "points",
+  "fill",
+  "fill-opacity",
+  "stroke",
+  "stroke-width",
+  "stroke-linejoin",
+  "stroke-linecap",
+  "stroke-dasharray",
+  "opacity",
+  "x",
+  "y",
+  "x1",
+  "y1",
+  "x2",
+  "y2",
+  "cx",
+  "cy",
+  "r",
+  "rx",
+  "ry",
+  "d",
+  "dy",
+  "transform",
+  "text-anchor",
+  "font-size",
+  "font-weight",
+  "font-style",
+  "text-decoration",
+];
+
 function normalizeMermaidStatements(code: string): string {
   let normalized = "";
   let quoted = false;
   let escaped = false;
   let bracketDepth = 0;
 
-  for (const character of code) {
+  for (let index = 0; index < code.length; index += 1) {
+    const character = code[index] ?? "";
     if (escaped) {
       normalized += character;
       escaped = false;
@@ -563,6 +639,13 @@ function normalizeMermaidStatements(code: string): string {
       normalized += character;
       continue;
     }
+    if (!quoted && character === "%" && code[index + 1] === "%") {
+      const lineEnd = code.indexOf("\n", index);
+      if (lineEnd === -1) return normalized + code.slice(index);
+      normalized += code.slice(index, lineEnd + 1);
+      index = lineEnd;
+      continue;
+    }
     if (!quoted && "([{".includes(character)) bracketDepth += 1;
     if (!quoted && ")]}".includes(character)) bracketDepth = Math.max(0, bracketDepth - 1);
     normalized += character === ";" && !quoted && bracketDepth === 0 ? "\n" : character;
@@ -571,64 +654,132 @@ function normalizeMermaidStatements(code: string): string {
   return normalized;
 }
 
-function prepareMermaidSvg(svg: string, namespace: string): string {
+function assertMermaidComplexity(code: string): void {
+  if (code.length > MAX_MERMAID_SOURCE_LENGTH) {
+    throw new Error("Mermaid diagram source is too large");
+  }
+  const statements = code
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0 && !line.startsWith("%%"));
+  if (statements.length > MAX_MERMAID_STATEMENTS) {
+    throw new Error("Mermaid diagram has too many statements");
+  }
+  const connectorCount = code.match(/--|->|<-|==/g)?.length ?? 0;
+  if (connectorCount > MAX_MERMAID_CONNECTORS) {
+    throw new Error("Mermaid diagram has too many connectors");
+  }
+}
+
+function assertLocalMermaidSvgReferences(svg: string): void {
+  for (const match of svg.matchAll(/url\(\s*(['"]?)(.*?)\1\s*\)/gi)) {
+    if (!match[2]?.trim().startsWith("#")) {
+      throw new Error("Mermaid diagram contains an external resource reference");
+    }
+  }
+}
+
+function sanitizeMermaidSvg(svg: string): string {
   const withoutRemoteFonts = svg
     .replace(/\s*@import url\('[^']+'\);/g, "")
     .replace("<svg ", '<svg aria-hidden="true" focusable="false" ');
-  const ids = [...withoutRemoteFonts.matchAll(/\sid="([^"]+)"/g)].flatMap((match) =>
-    match[1] ? [match[1]] : [],
-  );
+  assertLocalMermaidSvgReferences(withoutRemoteFonts);
+  const sanitized = sanitizeHtml(withoutRemoteFonts, {
+    allowedTags: MERMAID_SVG_TAGS,
+    allowedAttributes: {
+      "*": MERMAID_SVG_ATTRIBUTES.filter((attribute) => attribute !== "style"),
+      svg: MERMAID_SVG_ATTRIBUTES,
+    },
+    allowedSchemes: [],
+    allowProtocolRelative: false,
+    parser: { lowerCaseAttributeNames: false, lowerCaseTags: false },
+  });
+  if (!sanitized.startsWith("<svg ")) {
+    throw new Error("Mermaid renderer did not return a safe SVG");
+  }
+  return sanitized;
+}
+
+function namespaceMermaidSvg(svg: string, namespace: string): string {
+  const ids = [...svg.matchAll(/\sid="([^"]+)"/g)].flatMap((match) => (match[1] ? [match[1]] : []));
   return ids.reduce((result, id) => {
     const namespacedId = `${namespace}-${id}`;
     return result
       .replaceAll(` id="${id}"`, ` id="${namespacedId}"`)
-      .replaceAll(`url(#${id})`, `url(#${namespacedId})`)
-      .replaceAll(`href="#${id}"`, `href="#${namespacedId}"`);
-  }, withoutRemoteFonts);
+      .replaceAll(`url(#${id})`, `url(#${namespacedId})`);
+  }, svg);
 }
 
-export function MermaidDiagram({ code }: { code: string }) {
+function renderSafeMermaidSvg(code: string): string {
+  const normalized = normalizeMermaidStatements(code);
+  assertMermaidComplexity(normalized);
+  const cached = mermaidSvgCache.get(normalized);
+  if (cached) return cached;
+  const rendered = renderMermaidSVG(normalized, {
+    bg: "color-mix(in srgb, var(--muted) 78%, var(--background))",
+    fg: "var(--foreground)",
+    line: "var(--muted-foreground)",
+    accent: "var(--foreground)",
+    border: "var(--border)",
+    font: "DM Sans Variable",
+    transparent: true,
+    interactive: false,
+  });
+  const sanitized = sanitizeMermaidSvg(rendered);
+  mermaidSvgCache.set(normalized, sanitized, sanitized.length * 2);
+  return sanitized;
+}
+
+function MermaidSourceFallback({ code }: { code: string }) {
+  return (
+    <pre>
+      <code className="language-mermaid">{code}</code>
+    </pre>
+  );
+}
+
+export function MermaidDiagram({
+  code,
+  isStreaming = false,
+}: {
+  code: string;
+  isStreaming?: boolean;
+}) {
   const reactId = React.useId();
   const namespace = `mermaid-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const sourceDescriptionId = `${namespace}-source`;
   const result = useMemo(() => {
+    if (isStreaming) return { svg: null, error: new Error("Diagram is still streaming") };
     try {
-      const rendered = renderMermaidSVG(normalizeMermaidStatements(code), {
-        bg: "color-mix(in srgb, var(--muted) 78%, var(--background))",
-        fg: "var(--foreground)",
-        line: "var(--muted-foreground)",
-        accent: "var(--foreground)",
-        border: "var(--border)",
-        font: "DM Sans Variable",
-        transparent: true,
-        interactive: true,
-      });
-      return { svg: prepareMermaidSvg(rendered, namespace), error: null };
+      return { svg: namespaceMermaidSvg(renderSafeMermaidSvg(code), namespace), error: null };
     } catch (error) {
       return { svg: null, error };
     }
-  }, [code, namespace]);
+  }, [code, isStreaming, namespace]);
 
   if (result.error || !result.svg) {
-    return (
-      <pre>
-        <code className="language-mermaid">{code}</code>
-      </pre>
-    );
+    return <MermaidSourceFallback code={code} />;
   }
 
   return (
-    <div
-      className="chat-markdown-mermaid"
-      data-language="mermaid"
-      data-markdown-copy={`\`\`\`mermaid\n${code.replace(/\n$/, "")}\n\`\`\``}
-      role="img"
-      aria-label="Mermaid diagram"
-    >
+    <>
+      <span id={sourceDescriptionId} className="sr-only">
+        Mermaid diagram source: {code}
+      </span>
       <div
-        className="chat-markdown-mermaid-canvas"
-        dangerouslySetInnerHTML={{ __html: result.svg }}
-      />
-    </div>
+        className="chat-markdown-mermaid"
+        data-language="mermaid"
+        data-markdown-copy={`\`\`\`mermaid\n${code.replace(/\n$/, "")}\n\`\`\``}
+        role="img"
+        aria-label="Mermaid diagram"
+        aria-describedby={sourceDescriptionId}
+      >
+        <div
+          className="chat-markdown-mermaid-canvas"
+          dangerouslySetInnerHTML={{ __html: result.svg }}
+        />
+      </div>
+    </>
   );
 }
 
@@ -1596,7 +1747,7 @@ function ChatMarkdown({
 
         const language = extractFenceLanguage(codeBlock.className);
         if (language.toLowerCase() === "mermaid") {
-          return <MermaidDiagram code={codeBlock.code} />;
+          return <MermaidDiagram code={codeBlock.code} isStreaming={isStreaming} />;
         }
 
         const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
