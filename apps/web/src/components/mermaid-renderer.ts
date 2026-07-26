@@ -5,6 +5,7 @@ import { prepareMermaidSource } from "./mermaid-source";
 
 const MAX_SVG_LENGTH = 2_000_000;
 const MAX_FLOWCHART_NODES = 150;
+const MAX_FLOWCHART_EDGES = 100;
 const SVG_TAGS = [
   "svg",
   "style",
@@ -123,8 +124,12 @@ export function renderSafeMermaidSvg(code: string, namespace: string): string {
       .map((line) => line.trim())
       .find((line) => line.length > 0 && !line.startsWith("%%")) ?? "";
   if (/^(?:(?:graph|flowchart)\s+(?:TD|TB|LR|BT|RL)|stateDiagram(?:-v2)?)$/i.test(header)) {
-    if (parseMermaid(source).nodes.size > MAX_FLOWCHART_NODES) {
+    const graph = parseMermaid(source);
+    if (graph.nodes.size > MAX_FLOWCHART_NODES) {
       throw new Error("Mermaid diagram has too many nodes");
+    }
+    if (graph.edges.length > MAX_FLOWCHART_EDGES) {
+      throw new Error("Mermaid diagram has too many edges");
     }
   }
 
