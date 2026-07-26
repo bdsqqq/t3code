@@ -1,5 +1,6 @@
 import { useAtomValue } from "@effect/atom-react";
 import { DiffsHighlighter, getSharedHighlighter, SupportedLanguages } from "@pierre/diffs";
+import { renderMermaidSVG } from "beautiful-mermaid";
 import {
   CheckIcon,
   ChevronRightIcon,
@@ -537,6 +538,97 @@ function MarkdownCodeBlockTitleContent({
       </TooltipTrigger>
       <TooltipPopup side="top">{language}</TooltipPopup>
     </Tooltip>
+  );
+}
+
+function normalizeMermaidStatements(code: string): string {
+  let normalized = "";
+  let quoted = false;
+  let escaped = false;
+  let bracketDepth = 0;
+
+  for (const character of code) {
+    if (escaped) {
+      normalized += character;
+      escaped = false;
+      continue;
+    }
+    if (character === "\\" && quoted) {
+      normalized += character;
+      escaped = true;
+      continue;
+    }
+    if (character === '"') {
+      quoted = !quoted;
+      normalized += character;
+      continue;
+    }
+    if (!quoted && "([{".includes(character)) bracketDepth += 1;
+    if (!quoted && ")]}".includes(character)) bracketDepth = Math.max(0, bracketDepth - 1);
+    normalized += character === ";" && !quoted && bracketDepth === 0 ? "\n" : character;
+  }
+
+  return normalized;
+}
+
+function prepareMermaidSvg(svg: string, namespace: string): string {
+  const withoutRemoteFonts = svg
+    .replace(/\s*@import url\('[^']+'\);/g, "")
+    .replace("<svg ", '<svg aria-hidden="true" focusable="false" ');
+  const ids = [...withoutRemoteFonts.matchAll(/\sid="([^"]+)"/g)].flatMap((match) =>
+    match[1] ? [match[1]] : [],
+  );
+  return ids.reduce((result, id) => {
+    const namespacedId = `${namespace}-${id}`;
+    return result
+      .replaceAll(` id="${id}"`, ` id="${namespacedId}"`)
+      .replaceAll(`url(#${id})`, `url(#${namespacedId})`)
+      .replaceAll(`href="#${id}"`, `href="#${namespacedId}"`);
+  }, withoutRemoteFonts);
+}
+
+export function MermaidDiagram({ code }: { code: string }) {
+  const reactId = React.useId();
+  const namespace = `mermaid-${reactId.replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const result = useMemo(() => {
+    try {
+      const rendered = renderMermaidSVG(normalizeMermaidStatements(code), {
+        bg: "color-mix(in srgb, var(--muted) 78%, var(--background))",
+        fg: "var(--foreground)",
+        line: "var(--muted-foreground)",
+        accent: "var(--foreground)",
+        border: "var(--border)",
+        font: "DM Sans Variable",
+        transparent: true,
+        interactive: true,
+      });
+      return { svg: prepareMermaidSvg(rendered, namespace), error: null };
+    } catch (error) {
+      return { svg: null, error };
+    }
+  }, [code, namespace]);
+
+  if (result.error || !result.svg) {
+    return (
+      <pre>
+        <code className="language-mermaid">{code}</code>
+      </pre>
+    );
+  }
+
+  return (
+    <div
+      className="chat-markdown-mermaid"
+      data-language="mermaid"
+      data-markdown-copy={`\`\`\`mermaid\n${code.replace(/\n$/, "")}\n\`\`\``}
+      role="img"
+      aria-label="Mermaid diagram"
+    >
+      <div
+        className="chat-markdown-mermaid-canvas"
+        dangerouslySetInnerHTML={{ __html: result.svg }}
+      />
+    </div>
   );
 }
 
@@ -1503,6 +1595,10 @@ function ChatMarkdown({
         }
 
         const language = extractFenceLanguage(codeBlock.className);
+        if (language.toLowerCase() === "mermaid") {
+          return <MermaidDiagram code={codeBlock.code} />;
+        }
+
         const fenceTitle = extractFenceTitle(extractPreCodeMeta(node));
         return (
           <MarkdownCodeBlock

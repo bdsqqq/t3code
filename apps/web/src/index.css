@@ -1330,6 +1330,47 @@ label:has(> select#reasoning-effort) select {
   background: color-mix(in srgb, var(--muted) 78%, var(--background));
 }
 
+.chat-markdown .chat-markdown-mermaid {
+  max-width: 100%;
+  max-height: min(32rem, 70vh);
+  margin: 0.65rem 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: color-mix(in srgb, var(--muted) 78%, var(--background));
+  padding: 0.8rem 0.9rem;
+  color: var(--foreground);
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--border) 78%, transparent) transparent;
+}
+
+.chat-markdown .chat-markdown-mermaid::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+.chat-markdown .chat-markdown-mermaid::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.chat-markdown .chat-markdown-mermaid::-webkit-scrollbar-thumb {
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--border) 78%, transparent);
+}
+
+.chat-markdown .chat-markdown-mermaid-canvas {
+  display: flex;
+  width: max-content;
+  min-width: 100%;
+  justify-content: center;
+}
+
+.chat-markdown .chat-markdown-mermaid-canvas svg {
+  display: block;
+  max-width: none;
+  flex: none;
+}
+
 .chat-markdown .chat-markdown-codeblock-header {
   display: flex;
   align-items: center;
