@@ -1,6 +1,5 @@
 const MAX_SOURCE_LENGTH = 20_000;
 const MAX_STATEMENTS = 100;
-const MAX_EDGES = 100;
 const MAX_CHART_SERIES = 10;
 const MAX_CHART_DATA_POINTS = 200;
 const MAX_CHART_CATEGORIES = 100;
@@ -72,20 +71,6 @@ function assertChartSize(code: string): void {
   }
 }
 
-function assertParallelEdgeExpansion(code: string): void {
-  const arrow = /<?(?:-->|-\.->|==>|---|-\.-|===)(?:\|[^|]*\|)?/g;
-  let edges = 0;
-  for (const line of code.split("\n")) {
-    const groups = line.split(arrow);
-    for (let index = 1; index < groups.length; index += 1) {
-      const sources = groups[index - 1]?.split("&").length ?? 1;
-      const targets = groups[index]?.split("&").length ?? 1;
-      edges += sources * targets;
-      if (edges > MAX_EDGES) throw new Error("Mermaid diagram expands to too many edges");
-    }
-  }
-}
-
 export function prepareMermaidSource(code: string): string {
   const normalized = normalizeMermaidStatements(code);
   if (normalized.length > MAX_SOURCE_LENGTH) throw new Error("Mermaid diagram source is too large");
@@ -98,7 +83,6 @@ export function prepareMermaidSource(code: string): string {
     throw new Error("Mermaid diagram has too many statements");
   }
 
-  assertParallelEdgeExpansion(normalized);
   assertChartSize(normalized);
   return normalized;
 }
