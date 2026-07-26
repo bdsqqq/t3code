@@ -86,7 +86,7 @@ export const makePiRpcTransport = Effect.fn("PiRpcClient.makeTransport")(functio
   options: PiRpcTransportOptions = {},
 ): Effect.fn.Return<PiRpcClient, never, Scope.Scope> {
   const timeoutMs = options.requestTimeoutMs ?? 120_000;
-  const maxLineLength = options.maxLineLength ?? 1024 * 1024;
+  const maxLineLength = options.maxLineLength;
   const pending = yield* Ref.make(new Map<string, Deferred.Deferred<PiRpcResponse, PiRpcError>>());
   const nextId = yield* Ref.make(1);
   const events = yield* Queue.unbounded<PiRpcEvent>();
@@ -133,7 +133,7 @@ export const makePiRpcTransport = Effect.fn("PiRpcClient.makeTransport")(functio
   const parseLine = (lineWithCr: string) => {
     const line = lineWithCr.endsWith("\r") ? lineWithCr.slice(0, -1) : lineWithCr;
     if (line.length === 0) return Effect.void;
-    if (line.length > maxLineLength) {
+    if (maxLineLength !== undefined && line.length > maxLineLength) {
       return Queue.offer(events, {
         _tag: "PiRpcProtocolFailureEvent",
         reason: "LineTooLong",
@@ -189,7 +189,7 @@ export const makePiRpcTransport = Effect.fn("PiRpcClient.makeTransport")(functio
       const lines = input.split("\n");
       remainder = lines.pop() ?? "";
       const effects: Array<Effect.Effect<void>> = lines.map(parseLine);
-      if (remainder.length > maxLineLength) {
+      if (maxLineLength !== undefined && remainder.length > maxLineLength) {
         remainder = "";
         discardingOversizedLine = true;
         effects.push(
