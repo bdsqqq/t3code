@@ -53,13 +53,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 
 const PROVIDER = ProviderDriverKind.make("pi");
 const isPiRpcCommandError = Schema.is(PiRpcCommandError);
-const DETERMINISTIC_ARGS = [
-  "--offline",
-  "--no-context-files",
-  "--no-extensions",
-  "--no-skills",
-  "--no-prompt-templates",
-] as const;
+const DETERMINISTIC_ARGS = ["--offline"] as const;
 
 export type PiRpcClientFactory = (
   options: PiRpcSpawnOptions,
@@ -126,23 +120,56 @@ const piToolText = (value: unknown): string | undefined => {
 const piToolPath = (args: Record<string, unknown>): string | undefined =>
   trimmedString(args.path) ?? trimmedString(args.file_path);
 
+/**
+ * Pi's agent-backed extensions share `details.agent` and `details.task`.
+ * Classifying that result metadata keeps new agents working without a T3 tool-name allowlist.
+ */
+const piSubagentPresentation = (
+  args: Record<string, unknown>,
+  output: Record<string, unknown> | undefined,
+) => {
+  const outputDetails = isRecord(output?.details) ? output.details : undefined;
+  const agent = trimmedString(outputDetails?.agent);
+  if (!agent) return undefined;
+  const label = agent.replace(/[_-]+/gu, " ");
+  const detail =
+    trimmedString(outputDetails?.task) ??
+    trimmedString(args.description) ??
+    trimmedString(args.task) ??
+    trimmedString(args.query) ??
+    trimmedString(args.objective) ??
+    trimmedString(args.goal) ??
+    trimmedString(args.prompt) ??
+    trimmedString(args.diff_description) ??
+    trimmedString(args.name) ??
+    trimmedString(args.scriptPath);
+
+  return {
+    title: `${label.charAt(0).toUpperCase()}${label.slice(1)} agent`,
+    detail,
+  };
+};
+
 const piToolPresentation = (event: Record<string, unknown>) => {
   const toolName = string(event.toolName) ?? "tool";
   const normalizedName = toolName.toLowerCase();
   const args = isRecord(event.args) ? event.args : {};
   const output = event.result ?? event.partialResult;
   const outputRecord = isRecord(output) ? output : undefined;
+  const subagent = piSubagentPresentation(args, outputRecord);
   const outputText = piToolText(output);
   const path = piToolPath(args);
   const toolCallId = string(event.toolCallId) ?? string(event.toolCallID);
-  const itemType =
-    normalizedName === "bash"
+  const itemType = subagent
+    ? ("collab_agent_tool_call" as const)
+    : normalizedName === "bash"
       ? ("command_execution" as const)
       : normalizedName === "write" || normalizedName === "edit"
         ? ("file_change" as const)
         : ("dynamic_tool_call" as const);
-  const title =
-    normalizedName === "bash"
+  const title = subagent
+    ? subagent.title
+    : normalizedName === "bash"
       ? "Ran command"
       : normalizedName === "read"
         ? "Read file"
@@ -157,8 +184,9 @@ const piToolPresentation = (event: Record<string, unknown>) => {
                 : normalizedName === "ls"
                   ? "Listed directory"
                   : toolName;
-  const invocationDetail =
-    normalizedName === "grep"
+  const invocationDetail = subagent
+    ? subagent.detail
+    : normalizedName === "grep"
       ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? "."}`
       : normalizedName === "find"
         ? `${trimmedString(args.pattern) ?? "files"} in ${path ?? "."}`
