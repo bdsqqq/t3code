@@ -4,6 +4,12 @@ const MAX_CHART_SERIES = 10;
 const MAX_CHART_DATA_POINTS = 200;
 const MAX_CHART_CATEGORIES = 100;
 
+function endsXmlEntity(code: string, index: number): boolean {
+  return /&(?:amp|lt|gt|quot|apos|#\d+|#x[\da-f]+);$/i.test(
+    code.slice(Math.max(0, index - 64), index + 1),
+  );
+}
+
 export function normalizeMermaidStatements(code: string): string {
   let normalized = "";
   let quoted = false;
@@ -39,7 +45,7 @@ export function normalizeMermaidStatements(code: string): string {
     }
     if (!quoted && "([{".includes(character)) bracketDepth += 1;
     if (!quoted && ")]}".includes(character)) bracketDepth = Math.max(0, bracketDepth - 1);
-    if (character === ";" && !quoted && bracketDepth === 0) {
+    if (character === ";" && !quoted && bracketDepth === 0 && !endsXmlEntity(code, index)) {
       normalized += "\n";
       atStatementStart = true;
       continue;
@@ -72,8 +78,8 @@ function assertChartSize(code: string): void {
 }
 
 export function prepareMermaidSource(code: string): string {
+  if (code.length > MAX_SOURCE_LENGTH) throw new Error("Mermaid diagram source is too large");
   const normalized = normalizeMermaidStatements(code);
-  if (normalized.length > MAX_SOURCE_LENGTH) throw new Error("Mermaid diagram source is too large");
 
   const statements = normalized
     .split("\n")
