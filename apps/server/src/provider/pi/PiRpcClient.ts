@@ -68,6 +68,7 @@ export interface PiRpcClient {
   readonly prompt: (
     message: string,
     images?: ReadonlyArray<PiRpcImage>,
+    streamingBehavior?: "steer" | "followUp",
   ) => Effect.Effect<void, PiRpcError>;
   readonly abort: () => Effect.Effect<void, PiRpcError>;
   readonly close: () => Effect.Effect<void>;
@@ -274,10 +275,14 @@ export const makePiRpcTransport = Effect.fn("PiRpcClient.makeTransport")(functio
     getAvailableModels: () => request("get_available_models", {}, decodeModels),
     setModel: (provider, modelId) => request("set_model", { provider, modelId }, decodeModel),
     setThinkingLevel: (level) => request("set_thinking_level", { level }, () => Effect.void),
-    prompt: (message, images) =>
+    prompt: (message, images, streamingBehavior) =>
       request(
         "prompt",
-        { message, ...(images && images.length > 0 ? { images } : {}) },
+        {
+          message,
+          ...(images && images.length > 0 ? { images } : {}),
+          ...(streamingBehavior ? { streamingBehavior } : {}),
+        },
         () => Effect.void,
       ),
     abort: () => request("abort", {}, () => Effect.void),

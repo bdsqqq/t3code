@@ -45,10 +45,15 @@ class FakeClient implements PiRpcClient {
     close: 0,
     abort: 0,
     prompt: 0,
-    prompts: [] as Array<{ message: string; images: ReadonlyArray<PiRpcImage> | undefined }>,
+    prompts: [] as Array<{
+      message: string;
+      images: ReadonlyArray<PiRpcImage> | undefined;
+      streamingBehavior?: "steer" | "followUp";
+    }>,
     thinking: [] as PiThinkingLevel[],
   };
-  state: { sessionFile?: string; sessionId?: string } = {};
+  state: { sessionFile?: string; sessionId?: string; isStreaming?: boolean } = {};
+  getStateResults: Array<typeof this.state> = [];
   failPrompt = false;
   fatalPrompt = false;
   abortBeforeSettle = false;
@@ -66,7 +71,7 @@ class FakeClient implements PiRpcClient {
     return Effect.gen(function* () {
       if (self.getStateEntered) yield* Deferred.succeed(self.getStateEntered, undefined);
       if (self.getStateGate) yield* Deferred.await(self.getStateGate);
-      return self.state;
+      return self.getStateResults.shift() ?? self.state;
     });
   };
   getAvailableModels = () => {
@@ -83,11 +88,19 @@ class FakeClient implements PiRpcClient {
     Effect.sync(() => {
       this.calls.thinking.push(level);
     });
-  prompt = (message: string, images?: ReadonlyArray<PiRpcImage>) => {
+  prompt = (
+    message: string,
+    images?: ReadonlyArray<PiRpcImage>,
+    streamingBehavior?: "steer" | "followUp",
+  ) => {
     const self = this;
     return Effect.gen(function* () {
       self.calls.prompt += 1;
-      self.calls.prompts.push({ message, images });
+      self.calls.prompts.push({
+        message,
+        images,
+        ...(streamingBehavior ? { streamingBehavior } : {}),
+      });
       if (self.promptEntered) yield* Deferred.succeed(self.promptEntered, undefined);
       if (self.promptGate) yield* Deferred.await(self.promptGate);
       if (self.failPrompt)
@@ -793,7 +806,7 @@ describe("PiAdapter", () => {
     }),
   );
 
-  it.effect("serializes concurrent sends into one accepted and terminal turn", () => {
+  it.effect("serializes concurrent sends into one turn with a steering message", () => {
     const h = makeHarness();
     return withAdapter(h, (adapter) =>
       Effect.gen(function* () {
@@ -819,9 +832,20 @@ describe("PiAdapter", () => {
         const results = yield* Effect.all([send("one"), send("two")], {
           concurrency: "unbounded",
         });
-        assert.equal(results.filter((result) => result._tag === "Success").length, 1);
-        assert.equal(results.filter((result) => result._tag === "Failure").length, 1);
-        assert.equal(h.client.calls.prompt, 1);
+        assert.equal(results.filter((result) => result._tag === "Success").length, 2);
+        assert.equal(
+          new Set(
+            results.flatMap((result) =>
+              result._tag === "Success" ? [String(result.success.turnId)] : [],
+            ),
+          ).size,
+          1,
+        );
+        assert.equal(h.client.calls.prompt, 2);
+        assert.deepEqual(
+          h.client.calls.prompts.map(({ streamingBehavior }) => streamingBehavior),
+          [undefined, "steer"],
+        );
         yield* Queue.offer(h.client.input, { type: "agent_settled" });
         yield* Deferred.await(firstTerminalSeen);
         const sentinel = yield* adapter.sendTurn({
@@ -838,6 +862,157 @@ describe("PiAdapter", () => {
           firstEvents.map((event) => event.type),
           ["turn.started", "turn.completed"],
         );
+      }),
+    );
+  });
+
+  it.effect("defers settlement until a steering prompt is accepted", () =>
+    Effect.gen(function* () {
+      const h = makeHarness();
+      h.client.promptEntered = yield* Deferred.make<void>();
+      h.client.promptGate = yield* Deferred.make<void>();
+      yield* withAdapter(h, (adapter) =>
+        Effect.gen(function* () {
+          yield* start(adapter);
+          yield* Deferred.succeed(h.client.promptGate!, undefined);
+          const first = yield* adapter.sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "first",
+            modelSelection,
+          });
+
+          h.client.promptEntered = yield* Deferred.make<void>();
+          h.client.promptGate = yield* Deferred.make<void>();
+          const steering = yield* adapter
+            .sendTurn({
+              threadId: ThreadId.make("thread"),
+              input: "steer",
+              modelSelection,
+            })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(h.client.promptEntered!);
+          yield* Queue.offer(h.client.input, { type: "agent_settled" });
+          yield* Effect.yieldNow;
+          assert.equal((yield* adapter.listSessions())[0]?.status, "running");
+          yield* Deferred.succeed(h.client.promptGate!, undefined);
+
+          const steered = yield* Fiber.join(steering);
+          assert.equal(steered.turnId, first.turnId);
+          while ((yield* adapter.listSessions())[0]?.status === "running") yield* Effect.yieldNow;
+          assert.equal((yield* adapter.listSessions())[0]?.status, "ready");
+        }),
+      );
+    }),
+  );
+
+  it.effect("rechecks a settlement snapshot when steering starts during get_state", () =>
+    Effect.gen(function* () {
+      const h = makeHarness();
+      yield* withAdapter(h, (adapter) =>
+        Effect.gen(function* () {
+          yield* start(adapter);
+          const first = yield* adapter.sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "first",
+            modelSelection,
+          });
+          h.client.getStateEntered = yield* Deferred.make<void>();
+          h.client.getStateGate = yield* Deferred.make<void>();
+          h.client.getStateResults.push(
+            { ...h.client.state, isStreaming: false },
+            { ...h.client.state, isStreaming: true },
+          );
+
+          yield* Queue.offer(h.client.input, { type: "agent_settled" });
+          yield* Deferred.await(h.client.getStateEntered!);
+          const steered = yield* adapter.sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "steer",
+            modelSelection,
+          });
+          yield* Deferred.succeed(h.client.getStateGate!, undefined);
+          while (h.client.getStateResults.length > 0) yield* Effect.yieldNow;
+
+          assert.equal(steered.turnId, first.turnId);
+          const running = (yield* adapter.listSessions())[0];
+          assert.equal(running?.status, "running");
+          assert.equal(running?.activeTurnId, first.turnId);
+
+          h.client.getStateEntered = undefined;
+          h.client.getStateGate = undefined;
+          h.client.state.isStreaming = false;
+          yield* Queue.offer(h.client.input, { type: "agent_settled" });
+        }),
+      );
+    }),
+  );
+
+  it.effect("does not let a blocked steering prompt prevent interruption", () =>
+    Effect.gen(function* () {
+      const h = makeHarness();
+      yield* withAdapter(h, (adapter) =>
+        Effect.gen(function* () {
+          yield* start(adapter);
+          const first = yield* adapter.sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "first",
+            modelSelection,
+          });
+
+          h.client.promptEntered = yield* Deferred.make<void>();
+          h.client.promptGate = yield* Deferred.make<void>();
+          const steering = yield* adapter
+            .sendTurn({
+              threadId: ThreadId.make("thread"),
+              input: "steer",
+              modelSelection,
+            })
+            .pipe(Effect.forkChild);
+          yield* Deferred.await(h.client.promptEntered!);
+
+          yield* adapter.interruptTurn(ThreadId.make("thread"), first.turnId);
+          assert.equal(h.client.calls.abort, 1);
+          const interruptingSteer = yield* Fiber.interrupt(steering).pipe(Effect.forkChild);
+          yield* Deferred.succeed(h.client.promptGate!, undefined);
+          yield* Fiber.join(interruptingSteer);
+          const running = (yield* adapter.listSessions())[0];
+          assert.equal(running?.status, "running");
+          assert.equal(running?.activeTurnId, first.turnId);
+          assert.equal(h.client.calls.close, 0);
+          assert.equal(h.client.calls.abort, 2);
+
+          yield* Queue.offer(h.client.input, { type: "agent_settled" });
+        }),
+      );
+    }),
+  );
+
+  it.effect("leaves the active turn running when a steering prompt fails", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const first = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          input: "first",
+          modelSelection,
+        });
+        h.client.failPrompt = true;
+
+        const failed = yield* adapter
+          .sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "steer",
+            modelSelection,
+          })
+          .pipe(Effect.result);
+        assert.equal(failed._tag, "Failure");
+        const running = (yield* adapter.listSessions())[0];
+        assert.equal(running?.status, "running");
+        assert.equal(running?.activeTurnId, first.turnId);
+
+        h.client.failPrompt = false;
+        yield* Queue.offer(h.client.input, { type: "agent_settled" });
       }),
     );
   });
