@@ -159,7 +159,7 @@ describe("PiRpcClient transport", () => {
       yield* Fiber.join(first);
 
       const withImage = yield* client
-        .prompt("inspect", [{ type: "image", data: "cG5n", mimeType: "image/png" }])
+        .prompt("inspect", [{ type: "image", data: "cG5n", mimeType: "image/png" }], "steer")
         .pipe(Effect.forkScoped);
       const imageWrite = yield* Queue.take(test.writes);
       expect(imageWrite).toContain('"type":"prompt"');
@@ -167,6 +167,7 @@ describe("PiRpcClient transport", () => {
       expect(imageWrite).toContain(
         '"images":[{"type":"image","data":"cG5n","mimeType":"image/png"}]',
       );
+      expect(imageWrite).toContain('"streamingBehavior":"steer"');
       yield* respondTo(test.stdout, imageWrite);
       yield* Fiber.join(withImage);
 
