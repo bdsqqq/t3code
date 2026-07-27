@@ -91,6 +91,9 @@ interface SessionContext {
   readonly scope: Scope.Closeable;
   eventFiber: Fiber.Fiber<void>;
   activeTurn: ActiveTurn | undefined;
+  steeringPromptsInFlight: number;
+  steeringGeneration: number;
+  deferredSettlement: PiRpcEvent | undefined;
   closing: boolean;
   stopped: boolean;
 }
@@ -477,16 +480,32 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
       return;
     }
     if (type === "agent_settled") {
-      const state = yield* ctx.client.getState().pipe(
-        Effect.mapError((cause) => request("get_state", cause)),
-        Effect.exit,
-      );
+      if (ctx.steeringPromptsInFlight > 0) {
+        ctx.deferredSettlement = native;
+        return;
+      }
+      const state = yield* Effect.gen(function* () {
+        while (ctx.steeringPromptsInFlight === 0) {
+          const steeringGeneration = ctx.steeringGeneration;
+          const snapshot = yield* ctx.client.getState().pipe(
+            Effect.mapError((cause) => request("get_state", cause)),
+            Effect.exit,
+          );
+          if (ctx.steeringGeneration === steeringGeneration) return snapshot;
+        }
+        return undefined;
+      });
+      if (state === undefined) {
+        ctx.deferredSettlement = native;
+        return;
+      }
       if (ctx.activeTurn !== turn || turn.terminal || ctx.closing || ctx.stopped) return;
       if (Exit.isFailure(state) || !piStateMatchesCursor(state.value, ctx.cursor)) {
         yield* failActive(ctx, "Pi session identity drifted during settlement.", native);
         yield* close(ctx);
         return;
       }
+      if (state.value.isStreaming === true) return;
       const terminalEvents: ProviderRuntimeEvent[] = [];
       if (turn.assistantText.trim().length > 0) {
         terminalEvents.push({
@@ -705,6 +724,9 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
             scope,
             eventFiber: undefined as never,
             activeTurn: undefined,
+            steeringPromptsInFlight: 0,
+            steeringGeneration: 0,
+            deferredSettlement: undefined,
             closing: false,
             stopped: false,
           };
@@ -736,12 +758,14 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
       ),
     );
 
-  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) =>
-    withThreadLock(
+  const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) => {
+    let createdTurn: ActiveTurn | undefined;
+    return withThreadLock(
       input.threadId,
       Effect.gen(function* () {
         const ctx = yield* requireSession(input.threadId);
-        if (ctx.activeTurn || ctx.session.status !== "ready")
+        const steeringTurn = ctx.activeTurn?.terminal === false ? ctx.activeTurn : undefined;
+        if (!steeringTurn && ctx.session.status !== "ready")
           return yield* validation("sendTurn", "Pi session must be idle before prompting.");
         if (!input.input && (!input.attachments || input.attachments.length === 0))
           return yield* validation("sendTurn", "Pi requires non-empty text or attachments.");
@@ -774,6 +798,36 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
         const parsed = selection ? decodePiModelSlug(selection.model) : undefined;
         if (!parsed)
           return yield* validation("sendTurn", "A valid Pi model selection is required.");
+        if (steeringTurn && ctx.activeTurn === steeringTurn) {
+          ctx.steeringPromptsInFlight += 1;
+          ctx.steeringGeneration += 1;
+          return {
+            _tag: "Steer" as const,
+            effect: ctx.client.prompt(input.input ?? "", images, "steer").pipe(
+              Effect.mapError((cause) => request("prompt", cause)),
+              Effect.tap(() =>
+                steeringTurn.interruptRequested
+                  ? ctx.client.abort().pipe(Effect.mapError((cause) => request("abort", cause)))
+                  : Effect.void,
+              ),
+              Effect.ensuring(
+                Effect.gen(function* () {
+                  ctx.steeringPromptsInFlight -= 1;
+                  const deferredSettlement = ctx.deferredSettlement;
+                  ctx.deferredSettlement = undefined;
+                  if (deferredSettlement)
+                    yield* handleEvent(ctx, deferredSettlement).pipe(Effect.orDie);
+                }),
+              ),
+              Effect.uninterruptible,
+              Effect.as({
+                threadId: input.threadId,
+                turnId: steeringTurn.id,
+                resumeCursor: ctx.cursor,
+              }),
+            ),
+          };
+        }
         const available = yield* ctx.client
           .getAvailableModels()
           .pipe(Effect.mapError((cause) => request("get_available_models", cause)));
@@ -816,6 +870,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
           interruptRequested: false,
           terminal: false,
         };
+        createdTurn = turn;
         ctx.activeTurn = turn;
         ctx.session = {
           ...ctx.session,
@@ -835,16 +890,23 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
           if (!reusable) yield* close(ctx);
           return yield* request("prompt", prompted.failure);
         }
-        return { threadId: input.threadId, turnId, resumeCursor: ctx.cursor };
-      }).pipe(
-        Effect.onInterrupt(() =>
-          Effect.suspend(() => {
-            const ctx = sessions.get(input.threadId);
-            return ctx ? close(ctx) : Effect.void;
-          }),
-        ),
+        return {
+          _tag: "Started" as const,
+          result: { threadId: input.threadId, turnId, resumeCursor: ctx.cursor },
+        };
+      }),
+    ).pipe(
+      Effect.flatMap((action) =>
+        action._tag === "Steer" ? action.effect : Effect.succeed(action.result),
+      ),
+      Effect.onInterrupt(() =>
+        Effect.suspend(() => {
+          const ctx = sessions.get(input.threadId);
+          return ctx && ctx.activeTurn === createdTurn ? close(ctx) : Effect.void;
+        }),
       ),
     );
+  };
 
   const interruptTurn: ProviderAdapterShape<ProviderAdapterError>["interruptTurn"] = (
     threadId,
