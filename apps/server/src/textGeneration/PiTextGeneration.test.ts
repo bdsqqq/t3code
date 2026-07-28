@@ -19,7 +19,7 @@ import {
 import type { PiRpcEvent, PiThinkingLevel } from "../provider/pi/PiRpcSchema.ts";
 import { makePiTextGeneration } from "./PiTextGeneration.ts";
 
-const assert = NodeAssert;
+const assert: typeof NodeAssert = NodeAssert;
 
 class FakeClient implements PiRpcClient {
   // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- The synchronous fake exposes its queue through the PiRpcClient stream interface.
