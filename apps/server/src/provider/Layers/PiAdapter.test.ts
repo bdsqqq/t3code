@@ -1,7 +1,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
-import * as fs from "node:fs";
-import * as os from "node:os";
-import * as path from "node:path";
+import * as NodeFS from "node:fs";
+import * as NodeOS from "node:os";
+import * as NodePath from "node:path";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
@@ -18,7 +18,7 @@ import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
-import assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 
 import {
   PiRpcCommandError,
@@ -32,6 +32,10 @@ import type { ProviderAdapterError } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { makePiAdapter, type PiRpcClientFactory } from "./PiAdapter.ts";
 
+const assert = NodeAssert;
+const fs = NodeFS;
+const os = NodeOS;
+const path = NodePath;
 const instanceId = ProviderInstanceId.make("pi-test");
 const modelSelection = createModelSelection(instanceId, "openai/gpt-5", [
   { id: "thinkingLevel", value: "max" },
@@ -39,6 +43,7 @@ const modelSelection = createModelSelection(instanceId, "openai/gpt-5", [
 type Adapter = ProviderAdapterShape<ProviderAdapterError>;
 
 class FakeClient implements PiRpcClient {
+  // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- The synchronous fake exposes its queue through the PiRpcClient stream interface.
   input = Effect.runSync(Queue.unbounded<PiRpcEvent>());
   events: Stream.Stream<PiRpcEvent> = Stream.fromQueue(this.input);
   readonly calls = {

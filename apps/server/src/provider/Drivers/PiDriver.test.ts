@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { ProviderInstanceId } from "@t3tools/contracts";
@@ -11,6 +11,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import { PiDriver } from "./PiDriver.ts";
 
+const assert = NodeAssert;
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "pi-driver-test-",
 }).pipe(
