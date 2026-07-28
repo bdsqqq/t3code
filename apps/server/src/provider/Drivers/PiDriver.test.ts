@@ -11,7 +11,7 @@ import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import { PiDriver } from "./PiDriver.ts";
 
-const assert = NodeAssert;
+const assert: typeof NodeAssert = NodeAssert;
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "pi-driver-test-",
 }).pipe(
