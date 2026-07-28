@@ -111,6 +111,8 @@ function sanitizeSvg(svg: string): string {
     },
     allowedSchemes: [],
     allowProtocolRelative: false,
+    // The renderer owns this static theme block; resource URLs are rejected above.
+    allowVulnerableTags: true,
     parser: { lowerCaseAttributeNames: false, lowerCaseTags: false },
   });
   if (!sanitized.startsWith("<svg ")) throw new Error("Mermaid renderer did not return a safe SVG");

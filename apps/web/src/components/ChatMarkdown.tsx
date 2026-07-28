@@ -610,19 +610,20 @@ export function MermaidDiagram({
       return;
     }
 
-    let cancelled = false;
+    const controller = new AbortController();
     const timeout = setTimeout(() => {
       void (async () => {
         try {
-          const { renderSafeMermaidSvg } = await import("./mermaid-renderer");
-          if (!cancelled) setRendered({ code, svg: renderSafeMermaidSvg(code, namespace) });
+          const { renderMermaidInWorker } = await import("./mermaid-renderer-client");
+          const svg = await renderMermaidInWorker(code, namespace, controller.signal);
+          if (!controller.signal.aborted) setRendered({ code, svg });
         } catch {
-          if (!cancelled) setRendered({ code, svg: null });
+          if (!controller.signal.aborted) setRendered({ code, svg: null });
         }
       })();
     }, 0);
     return () => {
-      cancelled = true;
+      controller.abort();
       clearTimeout(timeout);
     };
   }, [code, isStreaming, namespace]);

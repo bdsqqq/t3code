@@ -1,0 +1,161 @@
+diff --git a/dist/index.js b/dist/index.js
+index e7e087bcb6f29d0d8f36cd558e0183bc0f162fcb..7260cd8dafc749344c70bb8b09b494cff7d5736c 100644
+--- a/dist/index.js
++++ b/dist/index.js
+@@ -5940,22 +5940,55 @@ function ensureElk() {
+   if (elk) return;
+   const pending = [];
+   const origSetTimeout = globalThis.setTimeout;
+-  globalThis.setTimeout = (fn, delay) => {
+-    if (delay === 0) {
+-      pending.push(fn);
+-      return 0;
++  const ownSelfDescriptor = Object.getOwnPropertyDescriptor(globalThis, "self");
++  const ownGlobalDescriptor = Object.getOwnPropertyDescriptor(globalThis, "global");
++  const shouldHideSelf = "self" in globalThis && typeof globalThis.document === "undefined";
++  let shadowedGlobal = false;
++  let shadowedSelf = false;
++  try {
++    globalThis.setTimeout = (fn, delay) => {
++      if (delay === 0) {
++        pending.push(fn);
++        return 0;
++      }
++      return origSetTimeout(fn, delay);
++    };
++    if (shouldHideSelf) {
++      Object.defineProperty(globalThis, "global", {
++        configurable: true,
++        value: globalThis
++      });
++      shadowedGlobal = true;
++      Object.defineProperty(globalThis, "self", {
++        configurable: true,
++        value: void 0
++      });
++      shadowedSelf = true;
++    }
++    elk = new ELKBundled();
++  } finally {
++    try {
++      if (shadowedSelf) {
++        if (ownSelfDescriptor) {
++          Object.defineProperty(globalThis, "self", ownSelfDescriptor);
++        } else {
++          delete globalThis.self;
++        }
++      }
++    } finally {
++      try {
++        if (shadowedGlobal) {
++          if (ownGlobalDescriptor) {
++            Object.defineProperty(globalThis, "global", ownGlobalDescriptor);
++          } else {
++            delete globalThis.global;
++          }
++        }
++      } finally {
++        globalThis.setTimeout = origSetTimeout;
++      }
+     }
+-    return origSetTimeout(fn, delay);
+-  };
+-  const g = globalThis;
+-  const hadSelf = "self" in g;
+-  const origSelf = g.self;
+-  if (hadSelf && typeof g.document === "undefined") {
+-    delete g.self;
+-  }
+-  elk = new ELKBundled();
+-  if (hadSelf) g.self = origSelf;
+-  globalThis.setTimeout = origSetTimeout;
++  }
+   pending.forEach((fn) => fn());
+   rawWorker = elk.worker.worker;
+ }
+diff --git a/src/elk-instance.ts b/src/elk-instance.ts
+index 6406f3d38edf5bf4dbdf18237e704e9fe11ce7f5..5c8b06efc8b88bc4d4da28b933bc8830f00c428f 100644
+--- a/src/elk-instance.ts
++++ b/src/elk-instance.ts
+@@ -42,30 +42,59 @@ function ensureElk(): void {
+   // Capture setTimeout(0) callbacks queued during ELK construction
+   const pending: (() => void)[] = []
+   const origSetTimeout = globalThis.setTimeout
+-  // @ts-ignore — simplified signature for our interception
+-  globalThis.setTimeout = (fn: () => void, delay?: number) => {
+-    if (delay === 0) { pending.push(fn); return 0 }
+-    return origSetTimeout(fn, delay)
+-  }
+-
+-  // Bun defines `self` (= globalThis) but not `document`, which tricks
+-  // elk-worker.min.js into taking the Web Worker branch instead of the
+-  // CJS branch. Temporarily hide `self` so it exports {Worker: FakeWorker}.
+-  const g = globalThis as Record<string, unknown>
+-  const hadSelf = 'self' in g
+-  const origSelf = g.self
+-  if (hadSelf && typeof g.document === 'undefined') {
+-    delete g.self
++  // Bun and browser workers define `self` but not `document`, which tricks
++  // elk-worker.min.js into taking its outer-worker branch instead of exporting
++  // the FakeWorker expected by elk.bundled.js. Browser `self` is inherited, so
++  // deleting an own property does not hide it; shadow it during construction.
++  const ownSelfDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'self')
++  const ownGlobalDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'global')
++  const shouldHideSelf = 'self' in globalThis && typeof globalThis.document === 'undefined'
++  let shadowedGlobal = false
++  let shadowedSelf = false
++
++  try {
++    // @ts-ignore — simplified signature for our interception
++    globalThis.setTimeout = (fn: () => void, delay?: number) => {
++      if (delay === 0) { pending.push(fn); return 0 }
++      return origSetTimeout(fn, delay)
++    }
++    if (shouldHideSelf) {
++      Object.defineProperty(globalThis, 'global', {
++        configurable: true,
++        value: globalThis,
++      })
++      shadowedGlobal = true
++      Object.defineProperty(globalThis, 'self', {
++        configurable: true,
++        value: undefined,
++      })
++      shadowedSelf = true
++    }
++    elk = new ELKBundled()
++  } finally {
++    try {
++      if (shadowedSelf) {
++        if (ownSelfDescriptor) {
++          Object.defineProperty(globalThis, 'self', ownSelfDescriptor)
++        } else {
++          delete (globalThis as Record<string, unknown>).self
++        }
++      }
++    } finally {
++      try {
++        if (shadowedGlobal) {
++          if (ownGlobalDescriptor) {
++            Object.defineProperty(globalThis, 'global', ownGlobalDescriptor)
++          } else {
++            delete (globalThis as Record<string, unknown>).global
++          }
++        }
++      } finally {
++        globalThis.setTimeout = origSetTimeout
++      }
++    }
+   }
+ 
+-  elk = new ELKBundled()
+-
+-  // Restore self
+-  if (hadSelf) g.self = origSelf
+-
+-  // Restore setTimeout immediately
+-  globalThis.setTimeout = origSetTimeout
+-
+   // Flush captured callbacks synchronously — registers layout algorithms
+   pending.forEach(fn => fn())
+ 
