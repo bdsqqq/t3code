@@ -101,6 +101,39 @@ describe("instance-scoped model selection", () => {
     ).toBe("openai/gpt-5.5");
   });
 
+  it("preserves a custom slug that collides with a provider alias", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("claudeAgent"),
+        instanceId: "claude_openrouter",
+        models: ["claude-opus-4-8"],
+      }),
+    ];
+    const settings: UnifiedSettings = {
+      ...settingsWithProviderInstances(),
+      providerInstances: {
+        ...settingsWithProviderInstances().providerInstances,
+        [ProviderInstanceId.make("claude_openrouter")]: {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          config: { customModels: ["opus"] },
+        },
+      },
+    };
+    const openrouter = deriveProviderInstanceEntries(providers)[0]!;
+
+    expect(
+      getAppModelOptionsForInstance(settings, openrouter).map((option) => option.slug),
+    ).toEqual(["claude-opus-4-8", "opus"]);
+    expect(
+      resolveAppModelSelectionForInstance(
+        ProviderInstanceId.make("claude_openrouter"),
+        settings,
+        providers,
+        "opus",
+      ),
+    ).toBe("opus");
+  });
+
   it("includes Grok custom models from the selected provider instance", () => {
     const providers = [provider({ provider: ProviderDriverKind.make("grok"), instanceId: "grok" })];
     const settings: UnifiedSettings = {
@@ -120,6 +153,35 @@ describe("instance-scoped model selection", () => {
     expect(getAppModelOptionsForInstance(settings, grok).map((option) => option.slug)).toContain(
       "grok-test-custom-model",
     );
+  });
+
+  it("projects Pi's discovered and custom models without a hardcoded catalog", () => {
+    const providers = [
+      provider({
+        provider: ProviderDriverKind.make("pi"),
+        instanceId: "pi",
+        models: ["anthropic/claude-sonnet-4-6", "openai/gpt-5.4"],
+      }),
+    ];
+    const settings: UnifiedSettings = {
+      ...DEFAULT_UNIFIED_SETTINGS,
+      providerInstances: {
+        [ProviderInstanceId.make("pi")]: {
+          driver: ProviderDriverKind.make("pi"),
+          config: { customModels: ["local/custom-model"] },
+        },
+      },
+    };
+    const pi = deriveProviderInstanceEntries(providers)[0]!;
+
+    expect(getAppModelOptionsForInstance(settings, pi).map((option) => option.slug)).toEqual([
+      "anthropic/claude-sonnet-4-6",
+      "openai/gpt-5.4",
+      "local/custom-model",
+    ]);
+    expect(
+      resolveAppModelSelectionForInstance(ProviderInstanceId.make("pi"), settings, providers, null),
+    ).toBe("anthropic/claude-sonnet-4-6");
   });
 
   it("does not inject an unknown selected slug into the stock instance list", () => {

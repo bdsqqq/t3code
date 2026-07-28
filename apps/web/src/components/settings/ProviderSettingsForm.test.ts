@@ -18,6 +18,7 @@ describe("ProviderSettingsForm helpers", () => {
       "binaryPath",
       "homePath",
       "shadowHomePath",
+      "launchArgs",
     ]);
   });
 
@@ -34,6 +35,13 @@ describe("ProviderSettingsForm helpers", () => {
       description: "Stored in plain text on disk.",
       control: "password",
     });
+  });
+
+  it("exposes Pi with its binary path setting", () => {
+    const pi = DRIVER_OPTION_BY_VALUE[ProviderDriverKind.make("pi")];
+
+    expect(pi).toMatchObject({ label: "Pi", value: "pi" });
+    expect(deriveProviderSettingsFields(pi!).map((field) => field.key)).toEqual(["binaryPath"]);
   });
 
   it("preserves unknown config keys while omitting empty configurable fields", () => {

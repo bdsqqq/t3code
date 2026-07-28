@@ -9,11 +9,10 @@ import type {
   ServerProviderState,
 } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
-import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process";
-import { normalizeModelSlug } from "@t3tools/shared/model";
+import { normalizeCustomModelSlug } from "@t3tools/shared/model";
 import { isWindowsCommandNotFound } from "../processRunner.ts";
 import { createProviderVersionAdvisory } from "./providerMaintenance.ts";
 import { collectUint8StreamText } from "../stream/collectUint8StreamText.ts";
@@ -68,8 +67,24 @@ export function nonEmptyTrimmed(value: string | undefined): string | undefined {
 }
 
 export function isCommandMissingCause(error: unknown): boolean {
-  if (isProviderCommandNotFoundError(error)) return true;
-  return error instanceof PlatformError.PlatformError && error.reason._tag === "NotFound";
+  const seen = new Set<object>();
+  const visit = (candidate: unknown): boolean => {
+    if (isProviderCommandNotFoundError(candidate)) return true;
+    if (typeof candidate !== "object" || candidate === null || seen.has(candidate)) return false;
+    seen.add(candidate);
+    if (
+      candidate instanceof Error &&
+      "_tag" in candidate &&
+      candidate._tag === "NotFound" &&
+      "module" in candidate &&
+      typeof candidate.module === "string" &&
+      "method" in candidate &&
+      typeof candidate.method === "string"
+    )
+      return true;
+    return "cause" in candidate && visit(candidate.cause);
+  };
+  return visit(error);
 }
 
 export const spawnAndCollect = (binaryPath: string, command: ChildProcess.Command) =>
@@ -140,7 +155,6 @@ export function parseGenericCliVersion(output: string): string | null {
 
 export function providerModelsFromSettings(
   builtInModels: ReadonlyArray<ServerProviderModel>,
-  provider: ProviderDriverKind,
   customModels: ReadonlyArray<string>,
   customModelCapabilities: ModelCapabilities,
 ): ReadonlyArray<ServerProviderModel> {
@@ -149,7 +163,7 @@ export function providerModelsFromSettings(
   const customEntries: ServerProviderModel[] = [];
 
   for (const candidate of customModels) {
-    const normalized = normalizeModelSlug(candidate, provider);
+    const normalized = normalizeCustomModelSlug(candidate);
     if (!normalized || seen.has(normalized)) {
       continue;
     }

@@ -16,7 +16,7 @@ import {
   type ProviderInstanceId,
   type ServerProviderModel,
 } from "@t3tools/contracts";
-import { normalizeModelSlug } from "@t3tools/shared/model";
+import { normalizeCustomModelSlug } from "@t3tools/shared/model";
 
 import { cn } from "../../lib/utils";
 import { sortModelsForProviderInstance } from "../../modelOrdering";
@@ -35,6 +35,7 @@ const CUSTOM_MODEL_PLACEHOLDER_BY_KIND: Partial<Record<ProviderDriverKind, strin
   [ProviderDriverKind.make("claudeAgent")]: "claude-sonnet-5",
   [ProviderDriverKind.make("cursor")]: "claude-sonnet-4-6",
   [ProviderDriverKind.make("opencode")]: "openai/gpt-5",
+  [ProviderDriverKind.make("pi")]: "provider/model-name",
 };
 
 interface ProviderModelsSectionProps {
@@ -111,7 +112,7 @@ export function ProviderModelsSection({
   }, [favoriteModelSet, modelOrder, models]);
 
   const handleAdd = () => {
-    const normalized = driverKind ? normalizeModelSlug(input, driverKind) : input.trim() || null;
+    const normalized = normalizeCustomModelSlug(input);
     if (!normalized) {
       setError("Enter a model slug.");
       return;
@@ -185,7 +186,7 @@ export function ProviderModelsSection({
   };
 
   return (
-    <div className="border-t border-border/60 px-4 py-3 sm:px-5">
+    <div>
       <div className="text-xs font-medium text-foreground">Models</div>
       <div className="mt-1 text-xs text-muted-foreground">
         {models.length} model{models.length === 1 ? "" : "s"} available.

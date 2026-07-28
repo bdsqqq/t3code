@@ -38,7 +38,10 @@ import {
   ProviderCommandReactor,
   type ProviderCommandReactorShape,
 } from "../Services/ProviderCommandReactor.ts";
-import { ServerSettingsService } from "../../serverSettings.ts";
+import {
+  resolveSourceControlWriterModelSelection,
+  ServerSettingsService,
+} from "../../serverSettings.ts";
 import { VcsStatusBroadcaster } from "../../vcs/VcsStatusBroadcaster.ts";
 import { GitWorkflowService } from "../../git/GitWorkflowService.ts";
 const isProviderAdapterRequestError = Schema.is(ProviderAdapterRequestError);
@@ -288,15 +291,20 @@ const make = Effect.gen(function* () {
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
-    const session = thread?.session;
-    if (!session) {
+    if (!thread) {
       return;
     }
+    const session = thread.session;
     yield* setThreadSession({
       threadId: input.threadId,
       session: {
-        ...session,
-        status: session.status === "stopped" ? "stopped" : "ready",
+        ...(session ?? {
+          threadId: input.threadId,
+          providerName: null,
+          providerInstanceId: thread.modelSelection.instanceId,
+          runtimeMode: thread.runtimeMode,
+        }),
+        status: session?.status === "stopped" ? "stopped" : "error",
         activeTurnId: null,
         lastError: input.detail,
         updatedAt: input.createdAt,
@@ -354,6 +362,7 @@ const make = Effect.gen(function* () {
     createdAt: string,
     options?: {
       readonly modelSelection?: ModelSelection;
+      readonly pendingTurnStart?: boolean;
     },
   ) {
     const thread = yield* resolveThread(threadId);
@@ -428,6 +437,22 @@ const make = Effect.gen(function* () {
       });
     }
     const preferredProvider: ProviderDriverKind = desiredDriverKind;
+    if (options?.pendingTurnStart === true && thread.session?.status !== "running") {
+      yield* setThreadSession({
+        threadId,
+        session: {
+          threadId,
+          status: "starting",
+          providerName: activeSession?.provider ?? preferredProvider,
+          providerInstanceId: activeSession?.providerInstanceId ?? desiredInstanceId,
+          runtimeMode: desiredRuntimeMode,
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: createdAt,
+        },
+        createdAt,
+      });
+    }
     if (thread.session !== null) {
       yield* rejectStartedThreadModelChangeIfRequired({
         threadId,
@@ -474,16 +499,21 @@ const make = Effect.gen(function* () {
     const startProviderSession = (input?: {
       readonly resumeCursor?: unknown;
       readonly provider?: ProviderDriverKind;
+      readonly activeSession?: "reuse" | "replace";
     }) =>
-      providerService.startSession(threadId, {
+      providerService.startSession(
         threadId,
-        ...(preferredProvider ? { provider: preferredProvider } : {}),
-        providerInstanceId: desiredInstanceId,
-        ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
-        modelSelection: desiredModelSelection,
-        ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
-        runtimeMode: desiredRuntimeMode,
-      });
+        {
+          threadId,
+          ...(preferredProvider ? { provider: preferredProvider } : {}),
+          providerInstanceId: desiredInstanceId,
+          ...(effectiveCwd ? { cwd: effectiveCwd } : {}),
+          modelSelection: desiredModelSelection,
+          ...(input?.resumeCursor !== undefined ? { resumeCursor: input.resumeCursor } : {}),
+          runtimeMode: desiredRuntimeMode,
+        },
+        { activeSession: input?.activeSession ?? "reuse" },
+      );
 
     const bindSessionToThread = (session: ProviderSession) =>
       Effect.gen(function* () {
@@ -498,7 +528,10 @@ const make = Effect.gen(function* () {
           threadId,
           session: {
             threadId,
-            status: mapProviderSessionStatusToOrchestrationStatus(session.status),
+            status:
+              options?.pendingTurnStart === true && session.status === "ready"
+                ? "starting"
+                : mapProviderSessionStatusToOrchestrationStatus(session.status),
             providerName: session.provider,
             providerInstanceId: session.providerInstanceId,
             runtimeMode: desiredRuntimeMode,
@@ -564,7 +597,9 @@ const make = Effect.gen(function* () {
         hasResumeCursor: resumeCursor !== undefined,
       });
       const restartedSession = yield* startProviderSession(
-        resumeCursor !== undefined ? { resumeCursor } : undefined,
+        resumeCursor !== undefined
+          ? { resumeCursor, activeSession: "replace" }
+          : { activeSession: "replace" },
       );
       yield* Effect.logInfo("provider command reactor restarted provider session", {
         threadId,
@@ -597,11 +632,10 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(
-      input.threadId,
-      input.createdAt,
-      input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {},
-    );
+    yield* ensureSessionForThread(input.threadId, input.createdAt, {
+      ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+      pendingTurnStart: true,
+    });
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
@@ -664,8 +698,14 @@ const make = Effect.gen(function* () {
     const cwd = input.worktreePath;
     const attachments = input.attachments ?? [];
     yield* Effect.gen(function* () {
-      const { textGenerationModelSelection: modelSelection } =
-        yield* serverSettingsService.getSettings;
+      const settings = yield* serverSettingsService.getSettings;
+      const modelSelection =
+        settings.sourceControlWriterModelSelection === null
+          ? settings.textGenerationModelSelection
+          : resolveSourceControlWriterModelSelection(
+              settings,
+              yield* providerRegistry.getProviders,
+            );
 
       const generated = yield* textGeneration.generateBranchName({
         cwd,
