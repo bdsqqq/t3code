@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { PiSettings } from "@t3tools/contracts";
@@ -11,6 +11,7 @@ import * as Stream from "effect/Stream";
 import { PiRpcCommandError, PiRpcProtocolError, type PiRpcClient } from "../pi/PiRpcClient.ts";
 import { checkPiProviderStatus } from "./PiProvider.ts";
 
+const assert = NodeAssert;
 const settings = Schema.decodeSync(PiSettings)({ binaryPath: "fake-pi" });
 
 const unusedClientMethods = {
@@ -40,6 +41,13 @@ it.effect("maps Pi RPC inventory into selectable models", () =>
             assert.equal(options.command, "fake-pi");
             assert.equal(options.env?.PI_TOKEN, "test");
             assert.equal(options.args?.includes("--no-session"), true);
+            for (const arg of [
+              "--no-context-files",
+              "--no-extensions",
+              "--no-skills",
+              "--no-prompt-templates",
+            ])
+              assert.equal(options.args?.includes(arg), false);
           }),
         ),
       ),

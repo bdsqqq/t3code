@@ -33,14 +33,7 @@ import {
   sanitizeThreadTitle,
 } from "./TextGenerationUtils.ts";
 
-const DETERMINISTIC_ARGS = [
-  "--no-session",
-  "--offline",
-  "--no-context-files",
-  "--no-extensions",
-  "--no-skills",
-  "--no-prompt-templates",
-] as const;
+const DETERMINISTIC_ARGS = ["--no-session", "--offline"] as const;
 type PiRpcClientFactory = (
   options: PiRpcSpawnOptions,
 ) => Effect.Effect<PiRpcClient, PiRpcError, ChildProcessSpawner.ChildProcessSpawner | Scope.Scope>;
