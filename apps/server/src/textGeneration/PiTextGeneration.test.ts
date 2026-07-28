@@ -1,4 +1,4 @@
-import assert from "node:assert/strict";
+import * as NodeAssert from "node:assert/strict";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { PiSettings, ProviderInstanceId, TextGenerationError } from "@t3tools/contracts";
@@ -19,7 +19,10 @@ import {
 import type { PiRpcEvent, PiThinkingLevel } from "../provider/pi/PiRpcSchema.ts";
 import { makePiTextGeneration } from "./PiTextGeneration.ts";
 
+const assert = NodeAssert;
+
 class FakeClient implements PiRpcClient {
+  // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- The synchronous fake exposes its queue through the PiRpcClient stream interface.
   readonly queue = Effect.runSync(Queue.unbounded<PiRpcEvent>());
   readonly events = Stream.fromQueue(this.queue);
   readonly models: Array<[string, string]> = [];
@@ -116,6 +119,13 @@ it.effect("selects the decoded model and thinking level, then parses assistant t
     assert.equal(spawns[0]?.cwd, input.cwd);
     assert.equal(spawns[0]?.env?.PI_TOKEN, "test");
     assert.equal(spawns[0]?.args?.includes("--no-session"), true);
+    for (const arg of [
+      "--no-context-files",
+      "--no-extensions",
+      "--no-skills",
+      "--no-prompt-templates",
+    ])
+      assert.equal(spawns[0]?.args?.includes(arg), false);
     assert.equal(client.closeCalls, 1);
   });
 });

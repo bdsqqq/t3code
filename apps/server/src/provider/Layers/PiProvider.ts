@@ -24,14 +24,7 @@ const PRESENTATION = {
   showInteractionModeToggle: false,
   requiresNewThreadForModelChange: false,
 } as const;
-const DETERMINISTIC_ARGS = [
-  "--no-session",
-  "--offline",
-  "--no-context-files",
-  "--no-extensions",
-  "--no-skills",
-  "--no-prompt-templates",
-] as const;
+const DETERMINISTIC_ARGS = ["--no-session", "--offline"] as const;
 
 type PiRpcClientFactory = (
   options: PiRpcSpawnOptions,
