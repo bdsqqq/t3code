@@ -32,7 +32,7 @@ import type { ProviderAdapterError } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { makePiAdapter, type PiRpcClientFactory } from "./PiAdapter.ts";
 
-const assert = NodeAssert;
+const assert: typeof NodeAssert = NodeAssert;
 const fs = NodeFS;
 const os = NodeOS;
 const path = NodePath;

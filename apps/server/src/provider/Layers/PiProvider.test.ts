@@ -11,7 +11,7 @@ import * as Stream from "effect/Stream";
 import { PiRpcCommandError, PiRpcProtocolError, type PiRpcClient } from "../pi/PiRpcClient.ts";
 import { checkPiProviderStatus } from "./PiProvider.ts";
 
-const assert = NodeAssert;
+const assert: typeof NodeAssert = NodeAssert;
 const settings = Schema.decodeSync(PiSettings)({ binaryPath: "fake-pi" });
 
 const unusedClientMethods = {
