@@ -14,23 +14,31 @@ describe("PiModel", () => {
     (slug) => expect(decodePiModelSlug(slug)).toBeUndefined(),
   );
 
-  it("maps only discovered models and preserves provider, id, and thinking levels through max", () => {
+  it("maps Pi's configured model and thinking defaults", () => {
     expect(
-      mapPiDiscoveredModels([
+      mapPiDiscoveredModels(
+        [
+          {
+            provider: "anthropic",
+            id: "claude/opus",
+            name: "Claude Opus",
+            thinkingLevels: ["low", "high", "max"],
+          },
+          { provider: " ", id: "bad", name: "Bad" },
+        ],
         {
           provider: "anthropic",
-          id: "claude/opus",
-          name: "Claude Opus",
-          thinkingLevels: ["low", "high", "max"],
+          modelId: "claude/opus",
+          thinkingLevel: "high",
         },
-        { provider: " ", id: "bad", name: "Bad" },
-      ]),
+      ),
     ).toEqual([
       {
         slug: "anthropic/claude%2Fopus",
         name: "Claude Opus",
         subProvider: "anthropic",
         isCustom: false,
+        isDefault: true,
         capabilities: {
           optionDescriptors: [
             {
@@ -42,7 +50,7 @@ describe("PiModel", () => {
                 { id: "high", label: "high" },
                 { id: "max", label: "max" },
               ],
-              currentValue: "max",
+              currentValue: "high",
             },
           ],
         },

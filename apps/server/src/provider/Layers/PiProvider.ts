@@ -63,18 +63,21 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
 ): Effect.fn.Return<ServerProviderDraft, never, ChildProcessSpawner.ChildProcessSpawner> {
   const checkedAt = DateTime.formatIso(yield* DateTime.now);
   if (!settings.enabled) return yield* makePendingPiProvider(settings);
-  const inventory = yield* Effect.scoped(
+  const discovery = yield* Effect.scoped(
     Effect.gen(function* () {
       const client = yield* makeRpcClient({
         command: settings.binaryPath,
         args: DETERMINISTIC_ARGS,
         env: environment,
       });
-      return yield* client.getAvailableModels();
+      return yield* Effect.all({
+        inventory: client.getAvailableModels(),
+        state: client.getState(),
+      });
     }),
   ).pipe(Effect.exit);
-  if (inventory._tag === "Failure") {
-    const error = Cause.squash(inventory.cause);
+  if (discovery._tag === "Failure") {
+    const error = Cause.squash(discovery.cause);
     return buildServerProvider({
       presentation: PRESENTATION,
       enabled: true,
@@ -90,12 +93,21 @@ export const checkPiProviderStatus = Effect.fn("checkPiProviderStatus")(function
     });
   }
   const discovered = mapPiDiscoveredModels(
-    inventory.value.models.map((model) => ({
+    discovery.value.inventory.models.map((model) => ({
       provider: model.provider,
       id: model.id,
       name: model.name?.trim() || model.id,
       ...(model.reasoning === undefined ? {} : { reasoning: model.reasoning }),
     })),
+    discovery.value.state.model
+      ? {
+          provider: discovery.value.state.model.provider,
+          modelId: discovery.value.state.model.id,
+          ...(discovery.value.state.thinkingLevel
+            ? { thinkingLevel: discovery.value.state.thinkingLevel }
+            : {}),
+        }
+      : undefined,
   );
   return buildServerProvider({
     presentation: PRESENTATION,

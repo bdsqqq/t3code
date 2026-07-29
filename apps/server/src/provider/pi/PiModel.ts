@@ -1,11 +1,19 @@
 import type { ServerProviderModel } from "@t3tools/contracts";
 
+import type { PiThinkingLevel } from "./PiRpcSchema.ts";
+
 export interface PiDiscoveredModel {
   readonly provider: string;
   readonly id: string;
   readonly name: string;
   readonly reasoning?: boolean;
   readonly thinkingLevels?: ReadonlyArray<string>;
+}
+
+export interface PiModelDefaults {
+  readonly provider: string;
+  readonly modelId: string;
+  readonly thinkingLevel?: PiThinkingLevel;
 }
 
 const validSegment = (value: string): boolean => value.length > 0 && value.trim() === value;
@@ -37,16 +45,23 @@ export function decodePiModelSlug(
 
 export function piDiscoveredModelToServerProviderModel(
   model: PiDiscoveredModel,
+  defaults?: PiModelDefaults,
 ): ServerProviderModel | undefined {
   const slug = encodePiModelSlug(model.provider, model.id);
   if (!slug || !validSegment(model.name)) return undefined;
   const thinkingLevels =
     model.thinkingLevels?.filter(validSegment) ?? (model.reasoning ? PI_THINKING_LEVELS : []);
+  const isDefault = defaults?.provider === model.provider && defaults.modelId === model.id;
+  const defaultThinkingLevel =
+    defaults?.thinkingLevel && thinkingLevels.includes(defaults.thinkingLevel)
+      ? defaults.thinkingLevel
+      : undefined;
   return {
     slug,
     name: model.name,
     subProvider: model.provider,
     isCustom: false,
+    ...(isDefault ? { isDefault: true } : {}),
     capabilities:
       thinkingLevels.length === 0
         ? null
@@ -57,7 +72,7 @@ export function piDiscoveredModelToServerProviderModel(
                 label: "Thinking level",
                 type: "select",
                 options: thinkingLevels.map((level) => ({ id: level, label: level })),
-                currentValue: thinkingLevels.includes("max") ? "max" : thinkingLevels.at(-1),
+                ...(defaultThinkingLevel ? { currentValue: defaultThinkingLevel } : {}),
               },
             ],
           },
@@ -66,9 +81,10 @@ export function piDiscoveredModelToServerProviderModel(
 
 export function mapPiDiscoveredModels(
   models: ReadonlyArray<PiDiscoveredModel>,
+  defaults?: PiModelDefaults,
 ): ReadonlyArray<ServerProviderModel> {
   return models.flatMap((model) => {
-    const mapped = piDiscoveredModelToServerProviderModel(model);
+    const mapped = piDiscoveredModelToServerProviderModel(model, defaults);
     return mapped ? [mapped] : [];
   });
 }
