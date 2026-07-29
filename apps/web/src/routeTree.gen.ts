@@ -24,8 +24,11 @@ import { Route as SettingsBetaRouteImport } from './routes/settings.beta'
 import { Route as SettingsArchivedRouteImport } from './routes/settings.archived'
 import { Route as SettingsAppearanceRouteImport } from './routes/settings.appearance'
 import { Route as ConnectCallbackRouteImport } from './routes/connect_.callback'
+import { Route as PiEnvironmentIdIndexRouteImport } from './routes/pi.$environmentId.index'
+import { Route as PiEnvironmentIdSessionKeyRouteImport } from './routes/pi.$environmentId.$sessionKey'
 import { Route as ChatDraftDraftIdRouteImport } from './routes/_chat.draft.$draftId'
 import { Route as ChatEnvironmentIdThreadIdRouteImport } from './routes/_chat.$environmentId.$threadId'
+import { Route as PiEnvironmentIdRuntimeRuntimeIdRouteImport } from './routes/pi.$environmentId.runtime.$runtimeId'
 
 const SettingsRoute = SettingsRouteImport.update({
   id: '/settings',
@@ -101,6 +104,17 @@ const ConnectCallbackRoute = ConnectCallbackRouteImport.update({
   path: '/connect/callback',
   getParentRoute: () => rootRouteImport,
 } as any)
+const PiEnvironmentIdIndexRoute = PiEnvironmentIdIndexRouteImport.update({
+  id: '/pi/$environmentId/',
+  path: '/pi/$environmentId/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const PiEnvironmentIdSessionKeyRoute =
+  PiEnvironmentIdSessionKeyRouteImport.update({
+    id: '/pi/$environmentId/$sessionKey',
+    path: '/pi/$environmentId/$sessionKey',
+    getParentRoute: () => rootRouteImport,
+  } as any)
 const ChatDraftDraftIdRoute = ChatDraftDraftIdRouteImport.update({
   id: '/draft/$draftId',
   path: '/draft/$draftId',
@@ -111,6 +125,12 @@ const ChatEnvironmentIdThreadIdRoute =
     id: '/$environmentId/$threadId',
     path: '/$environmentId/$threadId',
     getParentRoute: () => ChatRoute,
+  } as any)
+const PiEnvironmentIdRuntimeRuntimeIdRoute =
+  PiEnvironmentIdRuntimeRuntimeIdRouteImport.update({
+    id: '/pi/$environmentId/runtime/$runtimeId',
+    path: '/pi/$environmentId/runtime/$runtimeId',
+    getParentRoute: () => rootRouteImport,
   } as any)
 
 export interface FileRoutesByFullPath {
@@ -130,6 +150,9 @@ export interface FileRoutesByFullPath {
   '/settings/source-control': typeof SettingsSourceControlRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/pi/$environmentId/$sessionKey': typeof PiEnvironmentIdSessionKeyRoute
+  '/pi/$environmentId/': typeof PiEnvironmentIdIndexRoute
+  '/pi/$environmentId/runtime/$runtimeId': typeof PiEnvironmentIdRuntimeRuntimeIdRoute
 }
 export interface FileRoutesByTo {
   '/connect': typeof ConnectRoute
@@ -148,6 +171,9 @@ export interface FileRoutesByTo {
   '/': typeof ChatIndexRoute
   '/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/pi/$environmentId/$sessionKey': typeof PiEnvironmentIdSessionKeyRoute
+  '/pi/$environmentId': typeof PiEnvironmentIdIndexRoute
+  '/pi/$environmentId/runtime/$runtimeId': typeof PiEnvironmentIdRuntimeRuntimeIdRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
@@ -168,6 +194,9 @@ export interface FileRoutesById {
   '/_chat/': typeof ChatIndexRoute
   '/_chat/$environmentId/$threadId': typeof ChatEnvironmentIdThreadIdRoute
   '/_chat/draft/$draftId': typeof ChatDraftDraftIdRoute
+  '/pi/$environmentId/$sessionKey': typeof PiEnvironmentIdSessionKeyRoute
+  '/pi/$environmentId/': typeof PiEnvironmentIdIndexRoute
+  '/pi/$environmentId/runtime/$runtimeId': typeof PiEnvironmentIdRuntimeRuntimeIdRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
@@ -188,6 +217,9 @@ export interface FileRouteTypes {
     | '/settings/source-control'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/pi/$environmentId/$sessionKey'
+    | '/pi/$environmentId/'
+    | '/pi/$environmentId/runtime/$runtimeId'
   fileRoutesByTo: FileRoutesByTo
   to:
     | '/connect'
@@ -206,6 +238,9 @@ export interface FileRouteTypes {
     | '/'
     | '/$environmentId/$threadId'
     | '/draft/$draftId'
+    | '/pi/$environmentId/$sessionKey'
+    | '/pi/$environmentId'
+    | '/pi/$environmentId/runtime/$runtimeId'
   id:
     | '__root__'
     | '/_chat'
@@ -225,6 +260,9 @@ export interface FileRouteTypes {
     | '/_chat/'
     | '/_chat/$environmentId/$threadId'
     | '/_chat/draft/$draftId'
+    | '/pi/$environmentId/$sessionKey'
+    | '/pi/$environmentId/'
+    | '/pi/$environmentId/runtime/$runtimeId'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
@@ -233,6 +271,9 @@ export interface RootRouteChildren {
   PairRoute: typeof PairRoute
   SettingsRoute: typeof SettingsRouteWithChildren
   ConnectCallbackRoute: typeof ConnectCallbackRoute
+  PiEnvironmentIdSessionKeyRoute: typeof PiEnvironmentIdSessionKeyRoute
+  PiEnvironmentIdIndexRoute: typeof PiEnvironmentIdIndexRoute
+  PiEnvironmentIdRuntimeRuntimeIdRoute: typeof PiEnvironmentIdRuntimeRuntimeIdRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -342,6 +383,20 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof ConnectCallbackRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/pi/$environmentId/': {
+      id: '/pi/$environmentId/'
+      path: '/pi/$environmentId'
+      fullPath: '/pi/$environmentId/'
+      preLoaderRoute: typeof PiEnvironmentIdIndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/pi/$environmentId/$sessionKey': {
+      id: '/pi/$environmentId/$sessionKey'
+      path: '/pi/$environmentId/$sessionKey'
+      fullPath: '/pi/$environmentId/$sessionKey'
+      preLoaderRoute: typeof PiEnvironmentIdSessionKeyRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/_chat/draft/$draftId': {
       id: '/_chat/draft/$draftId'
       path: '/draft/$draftId'
@@ -355,6 +410,13 @@ declare module '@tanstack/react-router' {
       fullPath: '/$environmentId/$threadId'
       preLoaderRoute: typeof ChatEnvironmentIdThreadIdRouteImport
       parentRoute: typeof ChatRoute
+    }
+    '/pi/$environmentId/runtime/$runtimeId': {
+      id: '/pi/$environmentId/runtime/$runtimeId'
+      path: '/pi/$environmentId/runtime/$runtimeId'
+      fullPath: '/pi/$environmentId/runtime/$runtimeId'
+      preLoaderRoute: typeof PiEnvironmentIdRuntimeRuntimeIdRouteImport
+      parentRoute: typeof rootRouteImport
     }
   }
 }
@@ -407,6 +469,9 @@ const rootRouteChildren: RootRouteChildren = {
   PairRoute: PairRoute,
   SettingsRoute: SettingsRouteWithChildren,
   ConnectCallbackRoute: ConnectCallbackRoute,
+  PiEnvironmentIdSessionKeyRoute: PiEnvironmentIdSessionKeyRoute,
+  PiEnvironmentIdIndexRoute: PiEnvironmentIdIndexRoute,
+  PiEnvironmentIdRuntimeRuntimeIdRoute: PiEnvironmentIdRuntimeRuntimeIdRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)

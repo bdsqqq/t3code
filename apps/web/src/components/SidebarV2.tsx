@@ -89,7 +89,7 @@ import { useClientSettings, useUpdateClientSettings } from "../hooks/useSettings
 import { useCopyToClipboard } from "../hooks/useCopyToClipboard";
 import { useNowMinute } from "../hooks/useNowMinute";
 import { useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
-import { useProjects, useThreadShells } from "../state/entities";
+import { useActiveEnvironmentId, useProjects, useThreadShells } from "../state/entities";
 import { environmentServerConfigsAtom, primaryServerKeybindingsAtom } from "../state/server";
 import { vcsEnvironment } from "../state/vcs";
 import { threadEnvironment } from "../state/threads";
@@ -1057,6 +1057,7 @@ export default function SidebarV2() {
   );
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const activeEnvironmentId = useActiveEnvironmentId();
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const toggleThreadSelection = useThreadSelectionStore((s) => s.toggleThread);
@@ -1074,6 +1075,7 @@ export default function SidebarV2() {
     [routeDraftThread, routeTarget],
   );
   const routeThreadKey = routeThreadRef ? scopedThreadKey(routeThreadRef) : null;
+  const nativePiEnvironmentId = routeThreadRef?.environmentId ?? activeEnvironmentId;
   const routeTargetRef = useRef(routeTarget);
   routeTargetRef.current = routeTarget;
   // Post-settle navigation validates against the CURRENT route, not the one
@@ -2759,6 +2761,25 @@ export default function SidebarV2() {
           </DialogFooter>
         </DialogPopup>
       </Dialog>
+      {(nativePiEnvironmentId
+        ? [nativePiEnvironmentId]
+        : environments.map((environment) => environment.environmentId)
+      ).map((environmentId) => (
+        <Button
+          key={environmentId}
+          variant="ghost"
+          className="mx-2 justify-start"
+          aria-label={`Open Native Pi in ${environmentLabelById.get(environmentId) ?? "environment"}`}
+          onClick={() =>
+            void router.navigate({ to: "/pi/$environmentId", params: { environmentId } })
+          }
+        >
+          <MessageSquareIcon /> Native Pi
+          {nativePiEnvironmentId
+            ? ""
+            : ` · ${environmentLabelById.get(environmentId) ?? "Environment"}`}
+        </Button>
+      ))}
       <SidebarChromeFooter />
     </>
   );

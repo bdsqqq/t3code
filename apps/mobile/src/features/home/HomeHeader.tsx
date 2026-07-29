@@ -42,6 +42,7 @@ export function HomeHeader(props: {
   readonly onProjectSortOrderChange: (sortOrder: HomeProjectSortOrder) => void;
   readonly onThreadSortOrderChange: (sortOrder: SidebarThreadSortOrder) => void;
   readonly onOpenSettings: () => void;
+  readonly onOpenNativePi: () => void;
   readonly onStartNewTask: () => void;
 }) {
   if (Platform.OS === "android") {
@@ -238,6 +239,14 @@ function AndroidHomeHeader(props: HomeHeaderProps) {
                 match exactly (ControlPill sizes via Tailwind classes and
                 resolves to a different box). */}
             <Pressable
+              accessibilityLabel="Open Native Pi"
+              accessibilityRole="button"
+              onPress={props.onOpenNativePi}
+              className="size-11 items-center justify-center rounded-full bg-subtle"
+            >
+              <SymbolView name="terminal" size={18} tintColor={iconColor} type="monochrome" />
+            </Pressable>
+            <Pressable
               accessibilityLabel="Open settings"
               accessibilityRole="button"
               onPress={props.onOpenSettings}
@@ -311,6 +320,14 @@ function IosHomeHeader(props: HomeHeaderProps) {
             Platform.OS === "ios"
               ? () => [
                   withNativeGlassHeaderItem({
+                    accessibilityLabel: "Open Native Pi",
+                    icon: { name: "terminal", type: "sfSymbol" } as const,
+                    identifier: "home-native-pi",
+                    label: "",
+                    onPress: props.onOpenNativePi,
+                    type: "button",
+                  }),
+                  withNativeGlassHeaderItem({
                     accessibilityLabel: "Open settings",
                     icon: { name: "ellipsis", type: "sfSymbol" } as const,
                     identifier: "home-settings",
@@ -358,6 +375,11 @@ function IosHomeHeader(props: HomeHeaderProps) {
 
       {Platform.OS === "ios" ? null : (
         <NativeHeaderToolbar placement="right">
+          <NativeHeaderToolbar.Button
+            accessibilityLabel="Open Native Pi"
+            icon="terminal"
+            onPress={props.onOpenNativePi}
+          />
           <NativeHeaderToolbar.Button
             accessibilityLabel="Open settings"
             icon="gearshape"

@@ -79,6 +79,7 @@ import { isMacPlatform } from "../lib/utils";
 import {
   readThreadShell,
   useProject,
+  useActiveEnvironmentId,
   useProjects,
   useThreadShells,
   useThreadShellsForProjectRefs,
@@ -3039,6 +3040,8 @@ export default function Sidebar() {
   const shortcutModifiers = useShortcutModifierState();
   const { environments } = useEnvironments();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const activeEnvironmentId = useActiveEnvironmentId();
+  const nativePiEnvironmentId = routeThreadRef?.environmentId ?? activeEnvironmentId;
   const environmentLabelById = useMemo(
     () =>
       new Map(
@@ -3635,6 +3638,23 @@ export default function Sidebar() {
             projectsLength={projects.length}
           />
 
+          {(nativePiEnvironmentId
+            ? [nativePiEnvironmentId]
+            : environments.map((environment) => environment.environmentId)
+          ).map((environmentId) => (
+            <Button
+              key={environmentId}
+              variant="ghost"
+              className="mx-2 justify-start"
+              aria-label={`Open Native Pi in ${environmentLabelById.get(environmentId) ?? "environment"}`}
+              onClick={() => void navigate({ to: "/pi/$environmentId", params: { environmentId } })}
+            >
+              <TerminalIcon /> Native Pi
+              {nativePiEnvironmentId
+                ? ""
+                : ` · ${environmentLabelById.get(environmentId) ?? "Environment"}`}
+            </Button>
+          ))}
           <SidebarSeparator />
           <SidebarChromeFooter />
         </>

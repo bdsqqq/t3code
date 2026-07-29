@@ -113,6 +113,8 @@ import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
+import { makeSessionCatalog } from "./piNative/SessionCatalog.ts";
+import { makeSupervisorClient } from "./piNative/SupervisorClient.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
@@ -302,6 +304,10 @@ const RPC_REQUIRED_SCOPE = new Map<string, AuthEnvironmentScope>([
   [ORCHESTRATION_WS_METHODS.subscribeShell, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.getArchivedShellSnapshot, AuthOrchestrationReadScope],
   [ORCHESTRATION_WS_METHODS.subscribeThread, AuthOrchestrationReadScope],
+  [WS_METHODS.piNativeList, AuthOrchestrationReadScope],
+  [WS_METHODS.piNativeRead, AuthOrchestrationReadScope],
+  [WS_METHODS.piNativeDispatch, AuthOrchestrationOperateScope],
+  [WS_METHODS.piNativeSubscribe, AuthOrchestrationReadScope],
   [WS_METHODS.serverProbe, AuthOrchestrationReadScope],
   [WS_METHODS.serverGetConfig, AuthOrchestrationReadScope],
   [WS_METHODS.serverRefreshProviders, AuthOrchestrationOperateScope],
@@ -414,6 +420,8 @@ const makeWsRpcLayer = (
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
+      const piNativeCatalog = makeSessionCatalog();
+      const piNativeSupervisor = makeSupervisorClient();
       const crypto = yield* Crypto.Crypto;
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
@@ -1068,6 +1076,76 @@ const makeWsRpcLayer = (
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
+        [WS_METHODS.piNativeList]: () =>
+          observeRpcEffect(
+            WS_METHODS.piNativeList,
+            Effect.all([
+              piNativeCatalog.list(),
+              piNativeSupervisor.list().pipe(Effect.orElseSucceed(() => [])),
+            ]).pipe(
+              Effect.map(([sessions, runtimes]) => {
+                const catalogedRuntimeIds = new Set<string>();
+                const cataloged = sessions.map((session) => {
+                  const runtime = runtimes.find(
+                    (candidate) =>
+                      candidate.sessionFile === session.sessionFile &&
+                      candidate.status !== "exited",
+                  );
+                  if (runtime) catalogedRuntimeIds.add(runtime.runtimeId);
+                  return runtime ? { ...session, liveness: "live" as const, runtime } : session;
+                });
+                return {
+                  sessions: cataloged,
+                  runtimes: runtimes.filter(
+                    (runtime) =>
+                      runtime.status !== "exited" && !catalogedRuntimeIds.has(runtime.runtimeId),
+                  ),
+                };
+              }),
+            ),
+          ),
+        [WS_METHODS.piNativeRead]: ({ sessionKey }) =>
+          observeRpcEffect(
+            WS_METHODS.piNativeRead,
+            Effect.all([
+              piNativeCatalog.read(sessionKey),
+              piNativeSupervisor.list().pipe(Effect.orElseSucceed(() => [])),
+            ]).pipe(
+              Effect.map(([result, runtimes]) => {
+                const runtime = runtimes.find(
+                  (candidate) =>
+                    candidate.sessionFile === result.session.sessionFile &&
+                    candidate.status !== "exited",
+                );
+                return runtime
+                  ? {
+                      ...result,
+                      session: { ...result.session, liveness: "live" as const, runtime },
+                    }
+                  : result;
+              }),
+            ),
+          ),
+        [WS_METHODS.piNativeDispatch]: (command) =>
+          observeRpcEffect(
+            WS_METHODS.piNativeDispatch,
+            command.type === "resume"
+              ? piNativeCatalog.read(command.sessionKey).pipe(
+                  Effect.flatMap(({ session }) =>
+                    piNativeSupervisor.dispatch({
+                      ...command,
+                      cwd: session.cwd,
+                      sessionFile: session.sessionFile,
+                    }),
+                  ),
+                )
+              : piNativeSupervisor.dispatch(command),
+          ),
+        [WS_METHODS.piNativeSubscribe]: ({ runtimeId, cursor }) =>
+          observeRpcStream(
+            WS_METHODS.piNativeSubscribe,
+            piNativeSupervisor.subscribe(runtimeId, cursor),
+          ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,

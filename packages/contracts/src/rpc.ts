@@ -144,6 +144,16 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  PiNativeCommand,
+  PiNativeCommandReceipt,
+  PiNativeError,
+  PiNativeListResult,
+  PiNativeReadInput,
+  PiNativeReadResult,
+  PiNativeSubscribeInput,
+  PiNativeStreamItem,
+} from "./piNative.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -225,6 +235,12 @@ export const WS_METHODS = {
   sourceControlLookupRepository: "sourceControl.lookupRepository",
   sourceControlCloneRepository: "sourceControl.cloneRepository",
   sourceControlPublishRepository: "sourceControl.publishRepository",
+
+  // Native pi control
+  piNativeList: "piNative.list",
+  piNativeRead: "piNative.read",
+  piNativeDispatch: "piNative.dispatch",
+  piNativeSubscribe: "piNative.subscribe",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -690,7 +706,33 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
   stream: true,
 });
 
+export const WsPiNativeListRpc = Rpc.make(WS_METHODS.piNativeList, {
+  payload: Schema.Struct({}),
+  success: PiNativeListResult,
+  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
+});
+export const WsPiNativeReadRpc = Rpc.make(WS_METHODS.piNativeRead, {
+  payload: PiNativeReadInput,
+  success: PiNativeReadResult,
+  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
+});
+export const WsPiNativeDispatchRpc = Rpc.make(WS_METHODS.piNativeDispatch, {
+  payload: PiNativeCommand,
+  success: PiNativeCommandReceipt,
+  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
+});
+export const WsPiNativeSubscribeRpc = Rpc.make(WS_METHODS.piNativeSubscribe, {
+  payload: PiNativeSubscribeInput,
+  success: PiNativeStreamItem,
+  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
 export const WsRpcGroup = RpcGroup.make(
+  WsPiNativeListRpc,
+  WsPiNativeReadRpc,
+  WsPiNativeDispatchRpc,
+  WsPiNativeSubscribeRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,
