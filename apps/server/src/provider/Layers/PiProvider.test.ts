@@ -16,19 +16,23 @@ const settings = Schema.decodeSync(PiSettings)({ binaryPath: "fake-pi" });
 
 const unusedClientMethods = {
   events: Stream.empty,
-  getState: () => Effect.die("unused"),
   setModel: () => Effect.die("unused"),
   setThinkingLevel: () => Effect.die("unused"),
   prompt: () => Effect.die("unused"),
   abort: () => Effect.die("unused"),
   close: () => Effect.void,
-} satisfies Omit<PiRpcClient, "getAvailableModels">;
+} satisfies Omit<PiRpcClient, "getAvailableModels" | "getState">;
 
 it.effect("maps Pi RPC inventory into selectable models", () =>
   Effect.gen(function* () {
     const snapshot = yield* checkPiProviderStatus(settings, { PI_TOKEN: "test" }, (options) =>
       Effect.succeed({
         ...unusedClientMethods,
+        getState: () =>
+          Effect.succeed({
+            model: { provider: "openai compatible", id: "gpt/5", reasoning: true },
+            thinkingLevel: "medium" as const,
+          }),
         getAvailableModels: () =>
           Effect.succeed({
             models: [
@@ -57,7 +61,9 @@ it.effect("maps Pi RPC inventory into selectable models", () =>
     assert.equal(snapshot.auth.status, "authenticated");
     assert.equal(snapshot.models[0]?.slug, "openai%20compatible/gpt%2F5");
     assert.equal(snapshot.models[0]?.name, "GPT Five");
+    assert.equal(snapshot.models[0]?.isDefault, true);
     assert.equal(snapshot.models[0]?.capabilities?.optionDescriptors?.[0]?.id, "thinkingLevel");
+    assert.equal(snapshot.models[0]?.capabilities?.optionDescriptors?.[0]?.currentValue, "medium");
   }).pipe(Effect.provide(NodeServices.layer)),
 );
 
