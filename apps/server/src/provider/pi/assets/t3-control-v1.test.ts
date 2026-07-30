@@ -1,8 +1,25 @@
 import { describe, expect, it } from "@effect/vitest";
 
-import { CommandDeduper, JsonLineDecoder, parseBridgeCommand } from "./t3-control-v1.ts";
+import {
+  CommandDeduper,
+  JsonLineDecoder,
+  messageText,
+  parseBridgeCommand,
+} from "./t3-control-v1.ts";
 
 describe("t3-control-v1 extension protocol", () => {
+  it("extracts exact delivered user text for queue reconciliation", () => {
+    expect(
+      messageText({
+        role: "user",
+        content: [
+          { type: "text", text: "first" },
+          { type: "text", text: " second" },
+        ],
+      }),
+    ).toBe("first second");
+  });
+
   it("decodes complete LF-delimited JSON while retaining a partial line", () => {
     const decoder = new JsonLineDecoder();
 

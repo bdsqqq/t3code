@@ -78,6 +78,15 @@ export function parseBridgeCommand(value: unknown): BridgeCommand | undefined {
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+export function messageText(value: unknown): string | undefined {
+  if (!isRecord(value)) return;
+  if (typeof value.content === "string") return value.content;
+  if (!Array.isArray(value.content)) return;
+  const text = value.content.flatMap((part) =>
+    isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+  );
+  return text.length > 0 ? text.join("") : undefined;
+}
 
 type SessionManager = {
   getSessionId(): string;
@@ -114,6 +123,9 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
   let reconnectAttempt = 0;
   let eventId = 0;
   let currentContext: ExtensionContext | undefined;
+  let pendingSteering: string[] = [];
+  let pendingFollowUp: string[] = [];
+  let userMessageSeen = false;
   const deduper = new CommandDeduper();
 
   const write = (message: WireMessage): void => {
@@ -186,6 +198,8 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
         cwd: currentContext.cwd,
         pid: process.pid,
         isStreaming: !currentContext.isIdle(),
+        steering: pendingSteering,
+        followUp: pendingFollowUp,
       });
     });
     candidate.on("data", (chunk: string) => {
@@ -223,10 +237,38 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
   });
   pi.on("agent_start", () => forward("agent_start"));
   pi.on("agent_end", () => forward("agent_end"));
-  pi.on("agent_settled", (_event, ctx) =>
-    forward("agent_settled", { idle: ctx.isIdle(), pending: ctx.hasPendingMessages() }),
-  );
-  pi.on("message_start", (event) => forward("message_start", { message: event.message }));
+  pi.on("agent_settled", (_event, ctx) => {
+    pendingSteering = [];
+    pendingFollowUp = [];
+    forward("queue_update", { steering: pendingSteering, followUp: pendingFollowUp });
+    forward("agent_settled", { idle: ctx.isIdle(), pending: ctx.hasPendingMessages() });
+  });
+  pi.on("message_start", (event) => {
+    const message = isRecord(event.message) ? event.message : undefined;
+    const delivered = message?.role === "user" ? messageText(message) : undefined;
+    if (delivered !== undefined) {
+      const steeringIndex = pendingSteering.indexOf(delivered);
+      const followUpIndex = pendingFollowUp.indexOf(delivered);
+      let reconciled = false;
+      if (steeringIndex >= 0) {
+        pendingSteering.splice(steeringIndex, 1);
+        reconciled = true;
+      } else if (followUpIndex >= 0) {
+        pendingFollowUp.splice(followUpIndex, 1);
+        reconciled = true;
+      } else if (userMessageSeen && pendingSteering.length > 0) {
+        pendingSteering.shift();
+        reconciled = true;
+      } else if (userMessageSeen && pendingFollowUp.length > 0) {
+        pendingFollowUp.shift();
+        reconciled = true;
+      }
+      if (reconciled)
+        forward("queue_update", { steering: pendingSteering, followUp: pendingFollowUp });
+      userMessageSeen = true;
+    }
+    forward("message_start", { message: event.message });
+  });
   pi.on("message_update", (event) =>
     forward("message_update", { update: event.assistantMessageEvent }),
   );
@@ -254,8 +296,14 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
     }),
   );
   pi.on("input", (event) => {
+    const text = typeof event.text === "string" ? event.text : "";
+    if (event.streamingBehavior === "steer") pendingSteering.push(text);
+    if (event.streamingBehavior === "followUp") pendingFollowUp.push(text);
     if (event.streamingBehavior !== undefined)
-      forward("queue", { source: event.source, deliverAs: event.streamingBehavior });
+      forward("queue_update", {
+        steering: pendingSteering,
+        followUp: pendingFollowUp,
+      });
   });
   pi.on("session_shutdown", () => {
     if (!active) return;

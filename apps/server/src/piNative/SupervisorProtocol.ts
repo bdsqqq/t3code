@@ -29,6 +29,8 @@ export type BridgeFrame =
       readonly cwd: string;
       readonly pid: number;
       readonly isStreaming?: boolean;
+      readonly steering?: ReadonlyArray<string>;
+      readonly followUp?: ReadonlyArray<string>;
     }
   | {
       readonly type: "event";

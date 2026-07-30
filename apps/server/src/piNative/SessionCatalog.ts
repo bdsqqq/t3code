@@ -18,7 +18,7 @@ const SESSION_ENTRY_LIMIT = 1_000;
 const SESSION_HEAD_BYTES = 256 * 1024;
 const SESSION_TAIL_BYTES = 16 * 1024 * 1024;
 const SESSION_LIST_ENTRY_LIMIT = 50;
-const SESSION_LIST_TAIL_BYTES = 1024 * 1024;
+const SESSION_LIST_TAIL_BYTES = 64 * 1024;
 const keyFor = (file: string) =>
   NodeCrypto.createHash("sha256").update(file).digest("hex") as PiNativeSessionKey;
 const record = Schema.is(Schema.Record(Schema.String, Schema.Unknown));
@@ -106,6 +106,22 @@ async function readBoundedEntries(
     await handle.close();
   }
 }
+function titleFrom(entries: ReadonlyArray<PiNativeJsonlEntry>): string {
+  for (let index = entries.length - 1; index >= 0; index--)
+    if (entries[index]?.type === "session_info") {
+      const title = textFrom(entries[index]);
+      if (title) return title;
+    }
+  for (const entry of entries)
+    if (
+      entry.type === "message" &&
+      (entry.role === "user" || (record(entry.message) && entry.message.role === "user"))
+    ) {
+      const title = textFrom(entry);
+      if (title) return title;
+    }
+  return "Untitled pi session";
+}
 
 export class SessionCatalog extends Context.Service<
   SessionCatalog,
@@ -156,21 +172,6 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
           typeof header.cwd !== "string"
         )
           return undefined;
-        let title: string | undefined;
-        for (let i = bounded.metadataEntries.length - 1; i >= 0; i--)
-          if (bounded.metadataEntries[i]?.type === "session_info") {
-            title = textFrom(bounded.metadataEntries[i]);
-            if (title) break;
-          }
-        if (!title)
-          for (const entry of bounded.metadataEntries)
-            if (
-              entry.type === "message" &&
-              (entry.role === "user" || (record(entry.message) && entry.message.role === "user"))
-            ) {
-              title = textFrom(entry);
-              if (title) break;
-            }
         const created =
           typeof header.timestamp === "string" ? header.timestamp : stat.birthtime.toISOString();
         return {
@@ -179,7 +180,7 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
             sessionFile: canonical,
             sessionId: header.id,
             cwd: header.cwd,
-            title: title ?? "Untitled pi session",
+            title: titleFrom(bounded.metadataEntries),
             createdAt: created,
             updatedAt: stat.mtime.toISOString(),
             liveness: "historical" as const,
@@ -203,14 +204,45 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
     read: (key) =>
       Effect.tryPromise({
         try: async () => {
-          const found = (await scan()).find((row) => row.session.sessionKey === key);
-          if (!found) throw new Error("unknown sessionKey");
-          const stat = await NodeFS.promises.stat(found.session.sessionFile);
-          const bounded = await readBoundedEntries(found.session.sessionFile, stat.size, {
+          const root = await NodeFS.promises.realpath(configuredRoot);
+          let sessionFile: string | undefined;
+          for (const candidate of await walk(root)) {
+            const canonical = await NodeFS.promises.realpath(candidate);
+            if (canonical.startsWith(`${root}${NodePath.sep}`) && keyFor(canonical) === key) {
+              sessionFile = canonical;
+              break;
+            }
+          }
+          if (!sessionFile) throw new Error("unknown sessionKey");
+          const stat = await NodeFS.promises.stat(sessionFile);
+          const bounded = await readBoundedEntries(sessionFile, stat.size, {
             entryLimit: SESSION_ENTRY_LIMIT,
             tailBytes: SESSION_TAIL_BYTES,
           });
-          return { ...found, entries: bounded.entries };
+          const header = bounded.metadataEntries[0];
+          if (
+            !header ||
+            header.type !== "session" ||
+            typeof header.id !== "string" ||
+            typeof header.cwd !== "string"
+          )
+            throw new Error("invalid session header");
+          return {
+            session: {
+              sessionKey: key,
+              sessionFile,
+              sessionId: header.id,
+              cwd: header.cwd,
+              title: titleFrom(bounded.metadataEntries),
+              createdAt:
+                typeof header.timestamp === "string"
+                  ? header.timestamp
+                  : stat.birthtime.toISOString(),
+              updatedAt: stat.mtime.toISOString(),
+              liveness: "historical" as const,
+            },
+            entries: bounded.entries,
+          };
         },
         catch: failure,
       }),

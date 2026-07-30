@@ -25,9 +25,11 @@ the supervisor, not the t3 server scope, owns child processes. clients may
 detach without stopping work. each canonical session file has at most one
 registered writer.
 
-the command ledger stores hashes and receipts only. prompts and model output
-remain in pi's jsonl. an atomic `started` receipt fences retries before a command
-is delivered.
+the command ledger stores a queued command until delivery starts, then retains
+only its hash and receipt. queued commands can be replayed safely on a stable-ID
+retry; a command whose delivery began remains indeterminate after a supervisor
+crash because pi does not persist t3's command id. model output remains in pi's
+jsonl.
 
 runtime events receive a `(runtimeId, sequence)` cursor and stay in a bounded
 ring. subscription installs its live buffer before reading a snapshot, then
@@ -49,8 +51,11 @@ sequenceDiagram
   S-->>C: live events
 ```
 
-the ring is not history. after settlement, jsonl is authoritative and the
-transient overlay is cleared.
+the ring is not history. cumulative streaming updates are projected to deltas
+for replay, while snapshots retain one bounded in-progress representation.
+the latest complete steering and follow-up queues are retained separately so a
+reconnect cannot evict pending turn intents. after settlement, jsonl is
+authoritative and the transient overlay is cleared.
 
 ## limits
 

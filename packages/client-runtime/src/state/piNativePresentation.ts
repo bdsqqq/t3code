@@ -31,7 +31,35 @@ function contentText(value: unknown): string | null {
 
 export function presentPiNativeUnknown(value: unknown): PiNativePresentation {
   if (!isRecord(value)) return { label: "event", text: typeof value === "string" ? value : null };
-  const nested = value.event ?? value.message ?? value.assistantMessageEvent;
+  const queue =
+    value.type === "queue_update"
+      ? value
+      : value.event === "queue_update" && isRecord(value.data)
+        ? value.data
+        : undefined;
+  if (queue) {
+    const steering = Array.isArray(queue.steering)
+      ? queue.steering.filter((item): item is string => typeof item === "string")
+      : [];
+    const followUp = Array.isArray(queue.followUp)
+      ? queue.followUp.filter((item): item is string => typeof item === "string")
+      : [];
+    const omitted =
+      (typeof queue.omittedSteering === "number" ? queue.omittedSteering : 0) +
+      (typeof queue.omittedFollowUp === "number" ? queue.omittedFollowUp : 0);
+    return {
+      label: `pending · ${steering.length + followUp.length + omitted}`,
+      text: [
+        ...steering.map((text) => `steer: ${text}`),
+        ...followUp.map((text) => `follow-up: ${text}`),
+        ...(omitted > 0
+          ? [`${omitted} more pending intent${omitted === 1 ? "" : "s"} omitted`]
+          : []),
+      ].join("\n"),
+    };
+  }
+  const nested =
+    value.data ?? value.update ?? value.event ?? value.message ?? value.assistantMessageEvent;
   const type = stringAt(value, ["type", "eventType", "kind"]);
   const role = stringAt(value, ["role"]);
   const direct = stringAt(value, ["text_delta", "delta", "text"]);

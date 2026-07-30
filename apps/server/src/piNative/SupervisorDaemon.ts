@@ -35,25 +35,39 @@ const LEDGER = path.join(ROOT, "commands.json");
 const RING_SIZE = 1_000;
 const EXITED_RETENTION_MS = 60_000;
 const MAX_SOCKET_QUEUE_BYTES = 16 * 1024 * 1024;
+const MAX_STREAM_ITEM_BYTES = 32 * 1024 * 1024;
+const MAX_OVERLAY_BYTES = 8 * 1024 * 1024;
+const MAX_RING_BYTES = 16 * 1024 * 1024;
+const MAX_PENDING_QUEUE_BYTES = 4 * 1024 * 1024;
 const SNAPSHOT_ENTRY_LIMIT = 1_000;
 const SNAPSHOT_HEAD_BYTES = 256 * 1024;
 const SNAPSHOT_TAIL_BYTES = 16 * 1024 * 1024;
 class IndeterminateCommandError extends Error {}
 class RpcCommandRejectedError extends Error {}
-type LedgerEntry = { hash: string; receipt: PiNativeCommandReceipt };
+type LedgerEntry = {
+  hash: string;
+  command?: Record<string, unknown>;
+  phase?: "queued" | "delivering";
+  receipt: PiNativeCommandReceipt;
+};
 type Runtime = {
   state: PiNativeRuntimeState;
   child?: ChildProcessWithoutNullStreams;
   bridge?: Socket;
   bridgeExpiry?: NodeJS.Timeout;
   ring: PiNativeStreamItem[];
+  ringBytes: number;
+  ringEvictedThrough: number;
   overlayEvents: PiNativeStreamEvent[];
+  overlayBytes: number;
+  pendingQueueEvent?: PiNativeStreamEvent;
   sessionReadOffset: number;
   subscribers: Set<{
     socket: Socket;
     requestId: string;
     ready: boolean;
     buffer: PiNativeStreamItem[];
+    bufferBytes: number;
   }>;
   nextRpcId: number;
   pending: Map<
@@ -100,6 +114,10 @@ const atomicLedger = async () => {
 const writeBounded = (socket: Socket, value: unknown): boolean => {
   if (socket.destroyed) return false;
   const line = encodeLine(value);
+  if (Buffer.byteLength(line) > MAX_STREAM_ITEM_BYTES) {
+    socket.destroy(new Error("supervisor stream item exceeds byte limit"));
+    return false;
+  }
   const state = socketWrites.get(socket) ?? { blocked: false, queue: [], queuedBytes: 0 };
   socketWrites.set(socket, state);
   const flush = () => {
@@ -130,13 +148,50 @@ const writeBounded = (socket: Socket, value: unknown): boolean => {
   }
   return true;
 };
+export const projectReplayItem = (item: PiNativeStreamItem): PiNativeStreamItem => {
+  if (item.type !== "event" || !isRecord(item.event)) return item;
+  const eventType = overlayEventType(item.event);
+  if (eventType === "message_update") {
+    if (
+      item.event.type === "event" &&
+      isRecord(item.event.data) &&
+      isRecord(item.event.data.update)
+    ) {
+      const { partial: _partial, ...update } = item.event.data.update;
+      return { ...item, event: { ...item.event, data: { ...item.event.data, update } } };
+    }
+    const { message: _message, assistantMessageEvent, ...eventPayload } = item.event;
+    if (!isRecord(assistantMessageEvent)) return { ...item, event: eventPayload };
+    const { partial: _partial, ...delta } = assistantMessageEvent;
+    return { ...item, event: { ...eventPayload, assistantMessageEvent: delta } };
+  }
+  if (eventType === "tool_execution_update") {
+    if (item.event.type === "event" && isRecord(item.event.data)) {
+      const { partialResult: _partialResult, ...data } = item.event.data;
+      return { ...item, event: { ...item.event, data } };
+    }
+    const { partialResult: _partialResult, ...eventPayload } = item.event;
+    return { ...item, event: eventPayload };
+  }
+  return item;
+};
 const emit = (runtime: Runtime, item: PiNativeStreamItem) => {
-  runtime.ring.push(item);
-  if (runtime.ring.length > RING_SIZE) runtime.ring.shift();
+  const replayItem = projectReplayItem(item);
+  const replayBytes = Buffer.byteLength(JSON.stringify(replayItem));
+  runtime.ring.push(replayItem);
+  runtime.ringBytes += replayBytes;
+  while (runtime.ring.length > RING_SIZE || runtime.ringBytes > MAX_RING_BYTES) {
+    const removed = runtime.ring.shift();
+    if (!removed) break;
+    runtime.ringEvictedThrough = Math.max(runtime.ringEvictedThrough, streamItemSequence(removed));
+    runtime.ringBytes -= Buffer.byteLength(JSON.stringify(removed));
+  }
   for (const subscriber of runtime.subscribers) {
     if (!subscriber.ready) {
-      subscriber.buffer.push(item);
-      if (subscriber.buffer.length > RING_SIZE)
+      const buffered = projectReplayItem(item);
+      subscriber.buffer.push(buffered);
+      subscriber.bufferBytes += Buffer.byteLength(JSON.stringify(buffered));
+      if (subscriber.buffer.length > RING_SIZE || subscriber.bufferBytes > MAX_RING_BYTES)
         subscriber.socket.destroy(new Error("slow supervisor client"));
     } else if (
       !writeBounded(subscriber.socket, { type: "stream", requestId: subscriber.requestId, item })
@@ -146,7 +201,136 @@ const emit = (runtime: Runtime, item: PiNativeStreamItem) => {
 };
 const streamItemSequence = (item: PiNativeStreamItem): number =>
   item.type === "snapshot" ? item.runtime.sequence : item.sequence;
+export const shouldUseSnapshot = (
+  cursor: number | undefined,
+  ringEvictedThrough: number,
+  oldestSequence: number | undefined,
+): boolean =>
+  cursor === undefined ||
+  cursor <= ringEvictedThrough ||
+  (cursor !== undefined && oldestSequence !== undefined && cursor < oldestSequence - 1);
+const overlayEventType = (payload: unknown): string | undefined => {
+  if (!isRecord(payload)) return;
+  if (payload.type === "event" && typeof payload.event === "string") return payload.event;
+  return typeof payload.type === "string" ? payload.type : undefined;
+};
+const encodedBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
+const boundedQueue = (
+  queue: unknown,
+): {
+  values: string[];
+  omitted: number;
+  bytes: number;
+} => {
+  if (!Array.isArray(queue)) return { values: [], omitted: 0, bytes: 0 };
+  const strings = queue.filter((value): value is string => typeof value === "string");
+  const values: string[] = [];
+  let bytes = 0;
+  for (const value of strings) {
+    const next = encodedBytes(value);
+    if (bytes + next > MAX_PENDING_QUEUE_BYTES) break;
+    values.push(value);
+    bytes += next;
+  }
+  return { values, omitted: strings.length - values.length, bytes };
+};
+export const projectQueuePayload = (payload: unknown): unknown => {
+  if (!isRecord(payload) || overlayEventType(payload) !== "queue_update") return payload;
+  const queue = payload.type === "event" && isRecord(payload.data) ? payload.data : payload;
+  const steering = boundedQueue(queue.steering);
+  const followUpBudget = MAX_PENDING_QUEUE_BYTES - steering.bytes;
+  const followUpValues = Array.isArray(queue.followUp)
+    ? queue.followUp.filter((value): value is string => typeof value === "string")
+    : [];
+  const followUp: string[] = [];
+  let followUpBytes = 0;
+  for (const value of followUpValues) {
+    const next = encodedBytes(value);
+    if (followUpBytes + next > followUpBudget) break;
+    followUp.push(value);
+    followUpBytes += next;
+  }
+  const projected = {
+    steering: steering.values,
+    followUp,
+    omittedSteering: steering.omitted,
+    omittedFollowUp: followUpValues.length - followUp.length,
+  };
+  return payload.type === "event" ? { ...payload, data: projected } : { ...payload, ...projected };
+};
+export const queuePayloadHasPending = (payload: unknown): boolean =>
+  isRecord(payload) &&
+  ((Array.isArray(payload.steering) && payload.steering.length > 0) ||
+    (Array.isArray(payload.followUp) && payload.followUp.length > 0) ||
+    (typeof payload.omittedSteering === "number" && payload.omittedSteering > 0) ||
+    (typeof payload.omittedFollowUp === "number" && payload.omittedFollowUp > 0));
+export const projectOverlayPayload = (payload: unknown, eventType: string | undefined): unknown => {
+  if (!isRecord(payload) || eventType !== "message_update") return payload;
+  if (payload.type === "event" && isRecord(payload.data) && isRecord(payload.data.update)) {
+    const { partial, ...update } = payload.data.update;
+    return {
+      ...payload,
+      data: { ...payload.data, update: partial === undefined ? update : { partial } },
+    };
+  }
+  const { assistantMessageEvent: _assistantMessageEvent, ...projected } = payload;
+  return projected;
+};
+const eventToolCallId = (payload: unknown): string | undefined => {
+  if (!isRecord(payload)) return;
+  if (typeof payload.toolCallId === "string") return payload.toolCallId;
+  return isRecord(payload.data) && typeof payload.data.toolCallId === "string"
+    ? payload.data.toolCallId
+    : undefined;
+};
+const retainOverlayEvent = (
+  runtime: Runtime,
+  item: PiNativeStreamEvent,
+  eventType: string | undefined,
+) => {
+  if (eventType === "queue_update") {
+    const payload =
+      isRecord(item.event) && item.event.type === "event" && isRecord(item.event.data)
+        ? item.event.data
+        : item.event;
+    const hasPending = queuePayloadHasPending(payload);
+    if (hasPending) runtime.pendingQueueEvent = item;
+    else delete runtime.pendingQueueEvent;
+    return;
+  }
+  const projected = { ...item, event: projectOverlayPayload(item.event, eventType) };
+  const toolCallId = eventToolCallId(item.event);
+  const replace = (candidate: PiNativeStreamEvent) => {
+    const candidateType = overlayEventType(candidate.event);
+    if (eventType === "message_update") return candidateType === eventType;
+    if (eventType === "tool_execution_update" && toolCallId)
+      return candidateType === eventType && eventToolCallId(candidate.event) === toolCallId;
+    if (eventType === "tool_execution_end" && toolCallId)
+      return (
+        candidateType === "tool_execution_update" && eventToolCallId(candidate.event) === toolCallId
+      );
+    return false;
+  };
+  const retained = runtime.overlayEvents.filter((candidate) => !replace(candidate));
+  retained.push(projected);
+  runtime.overlayEvents = retained;
+  runtime.overlayBytes = retained.reduce(
+    (total, candidate) => total + Buffer.byteLength(JSON.stringify(candidate)),
+    0,
+  );
+  while (runtime.overlayEvents.length > RING_SIZE || runtime.overlayBytes > MAX_OVERLAY_BYTES) {
+    const removed = runtime.overlayEvents.shift();
+    if (!removed) break;
+    runtime.overlayBytes -= Buffer.byteLength(JSON.stringify(removed));
+  }
+};
+const clearOverlay = (runtime: Runtime, clearPendingQueue = false) => {
+  runtime.overlayEvents.length = 0;
+  runtime.overlayBytes = 0;
+  if (clearPendingQueue) delete runtime.pendingQueueEvent;
+};
 const event = (runtime: Runtime, payload: unknown) => {
+  payload = projectQueuePayload(payload);
   const sequence = runtime.state.sequence + 1;
   runtime.state = { ...runtime.state, sequence };
   const item: PiNativeStreamEvent = {
@@ -156,8 +340,7 @@ const event = (runtime: Runtime, payload: unknown) => {
     eventId: `${runtime.state.runtimeId}:${sequence}` as never,
     event: payload,
   };
-  runtime.overlayEvents.push(item);
-  if (runtime.overlayEvents.length > RING_SIZE) runtime.overlayEvents.shift();
+  retainOverlayEvent(runtime, item, overlayEventType(payload));
   emit(runtime, item);
 };
 const publishSettledSnapshot = async (runtime: Runtime, settledSequence: number) => {
@@ -193,7 +376,8 @@ const setExited = (runtime: Runtime, exitCode?: number) => {
     if (runtimes.get(runtime.state.runtimeId) === runtime) {
       runtimes.delete(runtime.state.runtimeId);
       runtime.ring.length = 0;
-      runtime.overlayEvents.length = 0;
+      runtime.ringBytes = 0;
+      clearOverlay(runtime, true);
       runtime.subscribers.clear();
     }
   }, EXITED_RETENTION_MS);
@@ -255,7 +439,12 @@ const attachRpc = (runtime: Runtime) => {
         }
         const eventType =
           isRecord(value) && typeof value.type === "string" ? value.type : undefined;
-        if (eventType === "agent_start") runtime.overlayEvents.length = 0;
+        if (eventType === "agent_start") clearOverlay(runtime);
+        const pendingMessageCount =
+          eventType === "queue_update" && isRecord(value)
+            ? (Array.isArray(value.steering) ? value.steering.length : 0) +
+              (Array.isArray(value.followUp) ? value.followUp.length : 0)
+            : undefined;
         const streaming =
           eventType === "agent_start"
             ? true
@@ -268,12 +457,13 @@ const attachRpc = (runtime: Runtime) => {
           overlay: {
             ...(runtime.state.overlay ?? { isStreaming: false, pendingMessageCount: 0 }),
             isStreaming: streaming,
+            ...(pendingMessageCount === undefined ? {} : { pendingMessageCount }),
             ...(eventType ? { lastEventType: eventType } : {}),
           },
         };
         event(runtime, value);
         if (eventType === "agent_settled") {
-          runtime.overlayEvents.length = 0;
+          clearOverlay(runtime, true);
           void publishSettledSnapshot(runtime, runtime.state.sequence);
         }
       }
@@ -319,7 +509,10 @@ async function spawnRuntime(command: Record<string, unknown>): Promise<Runtime> 
     },
     child,
     ring: [],
+    ringBytes: 0,
+    ringEvictedThrough: -1,
     overlayEvents: [],
+    overlayBytes: 0,
     sessionReadOffset: 0,
     subscribers: new Set(),
     nextRpcId: 0,
@@ -493,14 +686,23 @@ async function dispatch(command: Record<string, unknown>): Promise<PiNativeComma
   const prior = ledger[id];
   if (prior) {
     if (prior.hash !== hash) throw new Error("commandId payload conflict");
-    return prior.receipt.status === "started"
-      ? { ...prior.receipt, status: "indeterminate" }
-      : prior.receipt;
+    if (prior.receipt.status !== "started") return prior.receipt;
+    if (prior.phase !== "queued" || !prior.command)
+      return { ...prior.receipt, status: "indeterminate" };
+    command = prior.command;
   }
   const started = { commandId: id as never, status: "started" as const };
-  ledger[id] = { hash, receipt: started };
-  const work = atomicLedger()
-    .then(() => execute(command))
+  let queuedWrite = Promise.resolve();
+  if (!prior) {
+    ledger[id] = { hash, command, phase: "queued", receipt: started };
+    queuedWrite = atomicLedger();
+  }
+  const work = queuedWrite
+    .then(async () => {
+      ledger[id] = { hash, command, phase: "delivering", receipt: started };
+      await atomicLedger();
+      return execute(command);
+    })
     .then(
       async (receipt) => {
         ledger[id] = { hash, receipt };
@@ -525,6 +727,19 @@ async function dispatch(command: Record<string, unknown>): Promise<PiNativeComma
   liveCommands.set(id, { hash, work });
   return work;
 }
+async function readSessionHeaderLine(sessionFile: string): Promise<string | undefined> {
+  const handle = await fs.open(sessionFile, "r");
+  try {
+    const buffer = Buffer.alloc(64 * 1024);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, 0);
+    const contents = buffer.subarray(0, bytesRead).toString("utf8");
+    const newline = contents.indexOf("\n");
+    if (newline < 0) return bytesRead < buffer.byteLength ? contents : undefined;
+    return contents.slice(0, newline).replace(/\r$/, "");
+  } finally {
+    await handle.close();
+  }
+}
 async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
   const sessionId = String(frame.sessionId);
   if (typeof frame.sessionFile !== "string") {
@@ -541,7 +756,7 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
     );
     return;
   }
-  const firstLine = (await fs.readFile(sessionFile, "utf8")).split(/\r?\n/, 1)[0];
+  const firstLine = await readSessionHeaderLine(sessionFile);
   let header: unknown;
   try {
     header = JSON.parse(firstLine ?? "");
@@ -588,7 +803,10 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
         state: { sessionId, cwd: frame.cwd, pid: frame.pid },
       },
       ring: [],
+      ringBytes: 0,
+      ringEvictedThrough: -1,
       overlayEvents: [],
+      overlayBytes: 0,
       sessionReadOffset: (await readSessionFile(sessionFile)).offset,
       subscribers: new Set(),
       nextRpcId: 0,
@@ -602,12 +820,19 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
     typeof frame.isStreaming === "boolean"
       ? frame.isStreaming
       : runtime.state.overlay?.isStreaming === true;
+  const steering = Array.isArray(frame.steering)
+    ? frame.steering.filter((value): value is string => typeof value === "string")
+    : [];
+  const followUp = Array.isArray(frame.followUp)
+    ? frame.followUp.filter((value): value is string => typeof value === "string")
+    : [];
   runtime.state = {
     ...runtime.state,
     status: bridgeIsStreaming ? "streaming" : "idle",
     overlay: {
       ...(runtime.state.overlay ?? { pendingMessageCount: 0 }),
       isStreaming: bridgeIsStreaming,
+      pendingMessageCount: steering.length + followUp.length,
       lastEventType: existing ? "bridge_reconnected" : "bridge_registered",
     },
     state: { sessionId, cwd: frame.cwd, pid: frame.pid },
@@ -615,7 +840,13 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
   };
   runtimes.set(runtime.state.runtimeId, runtime);
   writers.set(sessionFile, runtime.state.runtimeId);
+  event(runtime, {
+    type: "event",
+    event: "queue_update",
+    data: { steering, followUp },
+  });
   if (existing) event(runtime, { type: "bridge_reconnected", isStreaming: bridgeIsStreaming });
+  if (existing && !bridgeIsStreaming) void publishSettledSnapshot(runtime, runtime.state.sequence);
   const cleanup = () => {
     if (runtime.state.status === "exited" || runtime.bridge !== socket) return;
     delete runtime.bridge;
@@ -695,12 +926,15 @@ async function readAppendedEntries(sessionFile: string | undefined, offset: numb
   try {
     handle = await fs.open(sessionFile, "r");
     const stat = await handle.stat();
-    const start = stat.size < offset ? 0 : offset;
-    const buffer = Buffer.alloc(Math.max(0, stat.size - start));
+    if (stat.size < offset) return readSessionFile(sessionFile);
+    const start = Math.max(offset, stat.size - SNAPSHOT_TAIL_BYTES);
+    const buffer = Buffer.alloc(stat.size - start);
     const { bytesRead } = await handle.read(buffer, 0, buffer.byteLength, start);
+    const raw = buffer.subarray(0, bytesRead).toString("utf8");
+    const complete = start > offset ? raw.slice(raw.indexOf("\n") + 1) : raw;
     return {
-      entries: parseSessionEntries(buffer.subarray(0, bytesRead).toString("utf8")),
-      offset: start + bytesRead,
+      entries: parseSessionEntries(complete).slice(-SNAPSHOT_ENTRY_LIMIT),
+      offset: stat.size,
     };
   } catch {
     return { entries: [], offset } as const;
@@ -804,18 +1038,23 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
   const bridged = [...runtimes.values()].find((candidate) => candidate.bridge === socket);
   if (value.type === "event") {
     if (bridged) {
-      if (value.event === "agent_start") bridged.overlayEvents.length = 0;
+      if (value.event === "agent_start") clearOverlay(bridged);
       const streaming =
         value.event === "agent_start"
           ? true
           : value.event === "agent_settled"
             ? false
             : (bridged.state.overlay?.isStreaming ?? false);
+      const queueData = value.event === "queue_update" && isRecord(value.data) ? value.data : {};
+      const pendingMessageCount =
+        (Array.isArray(queueData.steering) ? queueData.steering.length : 0) +
+        (Array.isArray(queueData.followUp) ? queueData.followUp.length : 0);
       bridged.state = {
         ...bridged.state,
         overlay: {
           ...(bridged.state.overlay ?? { isStreaming: false, pendingMessageCount: 0 }),
           isStreaming: streaming,
+          ...(value.event === "queue_update" ? { pendingMessageCount } : {}),
           ...(typeof value.event === "string" ? { lastEventType: value.event } : {}),
         },
         status:
@@ -827,7 +1066,7 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
       };
       event(bridged, value);
       if (value.event === "agent_settled") {
-        bridged.overlayEvents.length = 0;
+        clearOverlay(bridged, true);
         void publishSettledSnapshot(bridged, bridged.state.sequence);
       }
     }
@@ -874,16 +1113,23 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
         requestId: value.requestId,
         ready: false,
         buffer: [] as PiNativeStreamItem[],
+        bufferBytes: 0,
       };
       runtime.subscribers.add(subscriber);
       const cursor = typeof value.cursor === "number" ? value.cursor : undefined;
       const oldest = runtime.ring[0];
       const snapshotState = runtime.state;
-      const snapshotOverlayEvents = runtime.overlayEvents.filter(
-        (item) => item.sequence <= snapshotState.sequence,
+      const snapshotOverlayEvents = [
+        ...runtime.overlayEvents,
+        ...(runtime.pendingQueueEvent ? [runtime.pendingQueueEvent] : []),
+      ]
+        .filter((item) => item.sequence <= snapshotState.sequence)
+        .sort((a, b) => a.sequence - b.sequence);
+      const needsSnapshot = shouldUseSnapshot(
+        cursor,
+        runtime.ringEvictedThrough,
+        oldest ? streamItemSequence(oldest) : undefined,
       );
-      const needsSnapshot =
-        cursor === undefined || (oldest && cursor < streamItemSequence(oldest) - 1);
       if (needsSnapshot) {
         const snapshot = await readSessionFile(snapshotState.sessionFile);
         const entries = snapshot.entries;
@@ -905,10 +1151,11 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
         )
           return;
       } else {
+        const replayCursor = cursor ?? -1;
         for (const item of runtime.ring) {
           const itemSequence = streamItemSequence(item);
           if (
-            itemSequence > cursor &&
+            itemSequence > replayCursor &&
             itemSequence <= snapshotState.sequence &&
             !writeBounded(socket, { type: "stream", requestId: value.requestId, item })
           )
@@ -924,6 +1171,7 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
           return;
       }
       subscriber.buffer.length = 0;
+      subscriber.bufferBytes = 0;
       subscriber.ready = true;
       writeBounded(socket, {
         type: "stream",
