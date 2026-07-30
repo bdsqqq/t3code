@@ -6,17 +6,22 @@ import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 
+import * as BackgroundPolicy from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { BUILT_IN_DRIVERS } from "../builtInDrivers.ts";
 import { PiDriver } from "./PiDriver.ts";
 
 const assert: typeof NodeAssert = NodeAssert;
+const backgroundPolicyLayer = Layer.mock(BackgroundPolicy.BackgroundPolicy)({
+  shouldRunScopeWork: () => Effect.succeed(true),
+});
 const testLayer = ServerConfig.layerTest(process.cwd(), {
   prefix: "pi-driver-test-",
 }).pipe(
   Layer.provideMerge(NodeServices.layer),
   Layer.provideMerge(ServerSettingsService.layerTest()),
+  Layer.provideMerge(backgroundPolicyLayer),
 );
 
 it("registers Pi as a built-in driver", () => {

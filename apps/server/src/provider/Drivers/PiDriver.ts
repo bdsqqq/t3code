@@ -1,5 +1,4 @@
 import { PiSettings, ProviderDriverKind, type ServerProvider } from "@t3tools/contracts";
-import * as Duration from "effect/Duration";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as FileSystem from "effect/FileSystem";
@@ -7,6 +6,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
+import { BackgroundPolicy } from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makePiTextGeneration } from "../../textGeneration/PiTextGeneration.ts";
@@ -32,6 +32,7 @@ const DRIVER_KIND = ProviderDriverKind.make("pi");
 const decodeSettings = Schema.decodeSync(PiSettings);
 
 export type PiDriverEnv =
+  | BackgroundPolicy
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
   | FileSystem.FileSystem
@@ -97,7 +98,6 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
           Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
           Effect.map(stamp),
         ),
-        refreshInterval: Duration.minutes(5),
       }).pipe(
         Effect.mapError(
           (cause) =>
