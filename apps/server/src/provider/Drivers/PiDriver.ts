@@ -7,6 +7,7 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
+import { BackgroundPolicy } from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makePiTextGeneration } from "../../textGeneration/PiTextGeneration.ts";
@@ -32,6 +33,7 @@ const DRIVER_KIND = ProviderDriverKind.make("pi");
 const decodeSettings = Schema.decodeSync(PiSettings);
 
 export type PiDriverEnv =
+  | BackgroundPolicy
   | ChildProcessSpawner.ChildProcessSpawner
   | Crypto.Crypto
   | FileSystem.FileSystem
