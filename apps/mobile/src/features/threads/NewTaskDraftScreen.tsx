@@ -7,7 +7,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useThemeColor } from "../../lib/useThemeColor";
 import { useFontFamily } from "../../lib/useFontFamily";
 
-import { EnvironmentId } from "@t3tools/contracts";
+import { CommandId, EnvironmentId, MessageId } from "@t3tools/contracts";
 import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
@@ -39,10 +39,13 @@ import {
   clearComposerDraftContent,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
+  nativePiStartPayloadFingerprint,
+  persistComposerDraftNativePiStartIdentity,
+  reusableNativePiStartIdentity,
   restoreComposerDraftSnapshot,
   type ComposerDraft,
 } from "../../state/use-composer-drafts";
-import { useProjects } from "../../state/entities";
+import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import { enqueueThreadOutboxMessage, removeThreadOutboxMessage } from "../../state/thread-outbox";
@@ -50,6 +53,9 @@ import { useRemoteConnectionStatus } from "../../state/use-remote-environment-re
 import { branchBadgeLabel, useNewTaskFlow } from "./new-task-flow-provider";
 import { useCreateProjectThread } from "./use-project-actions";
 import { useIncomingShare } from "../sharing/IncomingShareProvider";
+import { piExternalEnvironment } from "../../state/shell";
+import { useAtomCommand } from "../../state/use-atom-command";
+import { newTaskTargetRequiresProvider } from "../../state/thread-outbox-model";
 
 function formatWorkspaceLabel(input: {
   readonly workspaceMode: string;
@@ -62,7 +68,6 @@ function formatWorkspaceLabel(input: {
   }
   return branchName ? `Current · ${branchName}` : "Current checkout";
 }
-
 export function NewTaskDraftScreen(props: {
   readonly initialProjectRef?: {
     readonly environmentId?: string;
@@ -75,8 +80,13 @@ export function NewTaskDraftScreen(props: {
 }) {
   const projects = useProjects();
   const createProjectThread = useCreateProjectThread();
+  const createNativePiSession = useAtomCommand(piExternalEnvironment.createSession, {
+    reportFailure: false,
+  });
   const flow = useNewTaskFlow();
   const navigation = useNavigation();
+  const [runTarget, setRunTarget] = useState<"t3" | "pi">("t3");
+  const nativeStartInFlightRef = useRef(false);
   const {
     consumeShare,
     getShare,
@@ -95,6 +105,14 @@ export function NewTaskDraftScreen(props: {
     connectedEnvironments.find(
       (environment) => environment.environmentId === selectedProject.environmentId,
     )?.connectionState === "connected";
+  const selectedEnvironmentServerConfig = useEnvironmentServerConfig(
+    selectedProject?.environmentId ?? null,
+  );
+  const nativePiSupported =
+    selectedEnvironmentServerConfig?.environment.capabilities.piExternalThreads === true;
+  useEffect(() => {
+    if (!nativePiSupported && runTarget === "pi") setRunTarget("t3");
+  }, [nativePiSupported, runTarget]);
   const promptInputRef = useRef<ComposerEditorHandle>(null);
   const loadedBranchesProjectKeyRef = useRef<string | null>(null);
   const [isComposerFocused, setIsComposerFocused] = useState(false);
@@ -680,6 +698,25 @@ export function NewTaskDraftScreen(props: {
     flow.startFromOrigin,
     flow.workspaceMode,
   ]);
+  const runTargetMenuActions = useMemo(
+    () => [
+      {
+        id: "run-target:t3",
+        title: "T3 managed",
+        state: runTarget === "t3" ? ("on" as const) : undefined,
+      },
+      ...(nativePiSupported
+        ? [
+            {
+              id: "run-target:pi",
+              title: "Native Pi",
+              state: runTarget === "pi" ? ("on" as const) : undefined,
+            },
+          ]
+        : []),
+    ],
+    [nativePiSupported, runTarget],
+  );
 
   const selectedEnvironmentLabel =
     flow.environments.find(
@@ -761,6 +798,19 @@ export function NewTaskDraftScreen(props: {
     }
   }
 
+  function handleRunTargetMenuAction(event: string) {
+    if (event === "run-target:t3") setRunTarget("t3");
+    if (event !== "run-target:pi") return;
+    if (flow.attachments.length > 0) {
+      Alert.alert(
+        "Remove image attachments",
+        "Native Pi sessions do not support image attachments yet.",
+      );
+      return;
+    }
+    setRunTarget("pi");
+  }
+
   async function handlePickImages(): Promise<void> {
     if (isIncomingShareTransferPending) {
       return;
@@ -806,15 +856,117 @@ export function NewTaskDraftScreen(props: {
     const initialMessageText = draft.text.trim();
 
     if (
-      !modelSelection ||
+      (newTaskTargetRequiresProvider(runTarget) && !modelSelection) ||
       initialMessageText.length === 0 ||
       flow.submitting ||
-      (workspaceMode === "worktree" && !selectedBranchName)
+      (runTarget === "t3" && workspaceMode === "worktree" && !selectedBranchName)
     ) {
       return;
     }
 
     const editingPendingTask = flow.editingPendingTask;
+
+    if (runTarget === "pi") {
+      if (nativeStartInFlightRef.current) return;
+      if (!nativePiSupported || !environmentConnected || editingPendingTask) {
+        Alert.alert(
+          "Native Pi unavailable",
+          "Connect to the environment and start a new task to create a native Pi session.",
+        );
+        return;
+      }
+      if (draft.attachments.length > 0) {
+        Alert.alert(
+          "Remove image attachments",
+          "Native Pi sessions do not support image attachments yet.",
+        );
+        return;
+      }
+      nativeStartInFlightRef.current = true;
+      flow.setSubmitting(true);
+      try {
+        const payloadFingerprint = nativePiStartPayloadFingerprint({
+          environmentId: selectedProject.environmentId,
+          cwd: selectedProject.workspaceRoot,
+          text: initialMessageText,
+          modelSelection,
+          runtimeMode,
+          interactionMode,
+        });
+        const persistedIdentity = reusableNativePiStartIdentity(
+          draft.nativePiStartIdentity,
+          payloadFingerprint,
+        );
+        const metadata = persistedIdentity ?? makeTurnCommandMetadata();
+        const createCommandId =
+          persistedIdentity?.createCommandId ?? `pi-create:${metadata.messageId}`;
+        try {
+          await persistComposerDraftNativePiStartIdentity(draftKey, {
+            createCommandId,
+            commandId: metadata.commandId,
+            messageId: metadata.messageId,
+            createdAt: metadata.createdAt,
+            payloadFingerprint,
+          });
+        } catch (error) {
+          Alert.alert(
+            "Could not save native Pi task",
+            error instanceof Error ? error.message : "The task identity could not be saved.",
+          );
+          return;
+        }
+        const result = await createNativePiSession({
+          environmentId: selectedProject.environmentId,
+          input: {
+            cwd: selectedProject.workspaceRoot,
+            commandId: CommandId.make(createCommandId),
+          },
+        });
+        if (result._tag === "Failure") {
+          const error = squashAtomCommandFailure(result);
+          Alert.alert(
+            "Could not create native Pi session",
+            error instanceof Error ? error.message : "The session could not be created.",
+          );
+          return;
+        }
+        try {
+          await enqueueThreadOutboxMessage({
+            environmentId: selectedProject.environmentId,
+            threadId: result.value.threadId,
+            messageId: MessageId.make(metadata.messageId),
+            commandId: CommandId.make(metadata.commandId),
+            text: initialMessageText,
+            attachments: [],
+            ...(modelSelection === null ? {} : { modelSelection }),
+            runtimeMode,
+            interactionMode,
+            awaitThreadVisibility: true,
+            createdAt: metadata.createdAt,
+          });
+        } catch (error) {
+          Alert.alert(
+            "Could not queue task",
+            error instanceof Error ? error.message : "The task could not be saved.",
+          );
+          return;
+        }
+        clearComposerDraftContent(draftKey);
+        navigation.dispatch(
+          StackActions.replace("Thread", {
+            environmentId: String(selectedProject.environmentId),
+            threadId: String(result.value.threadId),
+          }),
+        );
+      } finally {
+        nativeStartInFlightRef.current = false;
+        flow.setSubmitting(false);
+      }
+      return;
+    }
+    if (!modelSelection) {
+      return;
+    }
 
     if (!environmentConnected) {
       // Offline: park the task in the outbox; the drain sends it when the
@@ -937,12 +1089,12 @@ export function NewTaskDraftScreen(props: {
   const isExpanded = !isAndroid || isComposerFocused;
   const canStart =
     Boolean(flow.selectedProject) &&
-    Boolean(flow.selectedModel) &&
+    (!newTaskTargetRequiresProvider(runTarget) || Boolean(flow.selectedModel)) &&
     flow.prompt.trim().length > 0 &&
     isIncomingShareReady &&
     !isImportingShare &&
     !flow.submitting &&
-    !(flow.workspaceMode === "worktree" && !flow.selectedBranchName);
+    !(runTarget === "t3" && flow.workspaceMode === "worktree" && !flow.selectedBranchName);
   const promptEditor = (
     <ComposerEditor
       ref={promptInputRef}
@@ -955,7 +1107,7 @@ export function NewTaskDraftScreen(props: {
       onChangeText={flow.setPrompt}
       onFocus={() => setIsComposerFocused(true)}
       onBlur={() => setIsComposerFocused(false)}
-      onPasteImages={(uris) => void handleNativePasteImages(uris)}
+      onPasteImages={runTarget === "pi" ? undefined : (uris) => void handleNativePasteImages(uris)}
       placeholder={`Describe a coding task in ${selectedProject.title}`}
       // Same collapsed centering as ThreadComposer: native vertical gravity
       // in a pill-height box.
@@ -978,32 +1130,51 @@ export function NewTaskDraftScreen(props: {
 
   const toolbarPills = (
     <>
-      <ComposerToolbarButton
-        icon="plus"
-        onPress={() => void handlePickImages()}
-        showChevron={false}
-        disabled={isIncomingShareTransferPending}
-      />
-      <ControlPillMenu
-        actions={modelMenuActions}
-        onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
-      >
-        <ComposerToolbarTrigger
-          accessibilityLabel="Model"
+      {runTarget === "t3" ? (
+        <ComposerToolbarButton
+          icon="plus"
+          onPress={() => void handlePickImages()}
+          showChevron={false}
           disabled={isIncomingShareTransferPending}
-          iconNode={<ProviderIcon provider={flow.selectedModelOption?.providerDriver} size={16} />}
-          label={flow.selectedModelOption?.label ?? "Model"}
         />
-      </ControlPillMenu>
+      ) : null}
+      {runTarget === "t3" ? (
+        <>
+          <ControlPillMenu
+            actions={modelMenuActions}
+            onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
+          >
+            <ComposerToolbarTrigger
+              accessibilityLabel="Model"
+              disabled={isIncomingShareTransferPending}
+              iconNode={
+                <ProviderIcon provider={flow.selectedModelOption?.providerDriver} size={16} />
+              }
+              label={flow.selectedModelOption?.label ?? "Model"}
+            />
+          </ControlPillMenu>
+          <ControlPillMenu
+            actions={optionsMenuActions}
+            onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
+          >
+            <ComposerToolbarTrigger
+              accessibilityLabel="Configuration"
+              disabled={isIncomingShareTransferPending}
+              icon="slider.horizontal.3"
+              label={configurationLabel}
+            />
+          </ControlPillMenu>
+        </>
+      ) : null}
       <ControlPillMenu
-        actions={optionsMenuActions}
-        onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
+        actions={runTargetMenuActions}
+        onPressAction={({ nativeEvent }) => handleRunTargetMenuAction(nativeEvent.event)}
       >
         <ComposerToolbarTrigger
-          accessibilityLabel="Configuration"
+          accessibilityLabel="Run target"
           disabled={isIncomingShareTransferPending}
-          icon="slider.horizontal.3"
-          label={configurationLabel}
+          icon="terminal"
+          label={runTarget === "pi" ? "Native Pi" : "T3 managed"}
         />
       </ControlPillMenu>
       <ControlPillMenu
@@ -1017,17 +1188,19 @@ export function NewTaskDraftScreen(props: {
           label={selectedEnvironmentLabel}
         />
       </ControlPillMenu>
-      <ControlPillMenu
-        actions={workspaceMenuActions}
-        onPressAction={({ nativeEvent }) => handleWorkspaceMenuAction(nativeEvent.event)}
-      >
-        <ComposerToolbarTrigger
-          accessibilityLabel="Workspace"
-          disabled={isIncomingShareTransferPending}
-          icon="point.topleft.down.curvedto.point.bottomright.up"
-          label={workspaceLabel}
-        />
-      </ControlPillMenu>
+      {runTarget === "t3" ? (
+        <ControlPillMenu
+          actions={workspaceMenuActions}
+          onPressAction={({ nativeEvent }) => handleWorkspaceMenuAction(nativeEvent.event)}
+        >
+          <ComposerToolbarTrigger
+            accessibilityLabel="Workspace"
+            disabled={isIncomingShareTransferPending}
+            icon="point.topleft.down.curvedto.point.bottomright.up"
+            label={workspaceLabel}
+          />
+        </ControlPillMenu>
+      ) : null}
     </>
   );
 

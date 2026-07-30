@@ -34,11 +34,6 @@ import { ThreadRouteScreen } from "./features/threads/ThreadRouteScreen";
 import { ConnectionsRouteScreen } from "./features/connection/ConnectionsRouteScreen";
 import { ConnectionsNewRouteScreen } from "./features/connection/ConnectionsNewRouteScreen";
 import { HomeRouteScreen } from "./features/home/HomeRouteScreen";
-import {
-  NativePiDetailScreen,
-  NativePiListScreen,
-  NativePiRuntimeScreen,
-} from "./features/pi-native/NativePiScreens";
 import { AddProjectDestinationRoute } from "./features/projects/AddProjectDestinationRoute";
 import { AddProjectLocalRoute } from "./features/projects/AddProjectLocalRoute";
 import { AddProjectRepositoryRoute } from "./features/projects/AddProjectRepositoryRoute";
@@ -390,21 +385,6 @@ export const RootStack = createNativeStackNavigator({
         headerBackVisible: false,
         title: "Threads",
       },
-    }),
-    NativePiList: createNativeStackScreen({
-      screen: NativePiListScreen,
-      linking: "pi/:environmentId",
-      options: { ...GLASS_HEADER_OPTIONS, title: "Native Pi" },
-    }),
-    NativePiDetail: createNativeStackScreen({
-      screen: NativePiDetailScreen,
-      linking: "pi/:environmentId/:sessionKey",
-      options: { ...GLASS_HEADER_OPTIONS, title: "Native Pi session" },
-    }),
-    NativePiRuntime: createNativeStackScreen({
-      screen: NativePiRuntimeScreen,
-      linking: "pi/:environmentId/runtime/:runtimeId",
-      options: { ...GLASS_HEADER_OPTIONS, title: "Native Pi runtime" },
     }),
     Thread: createNativeStackScreen({
       screen: ThreadRouteScreen,

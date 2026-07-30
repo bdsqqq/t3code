@@ -14,6 +14,7 @@ import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   branchMismatchKey,
   buildExpiredTerminalContextToastCopy,
+  buildScopedSendFingerprint,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
@@ -22,6 +23,7 @@ import {
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
   reconcileMountedTerminalThreadIds,
+  retainOptimisticMessageAfterDispatch,
   reconcileRetainedMountedThreadIds,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
@@ -34,6 +36,23 @@ const environmentId = EnvironmentId.make("environment-local");
 const projectId = ProjectId.make("project-1");
 const threadId = ThreadId.make("thread-1");
 const now = "2026-03-29T00:00:00.000Z";
+
+describe("send retry identity", () => {
+  it("changes across thread and environment targets", () => {
+    const payload = { text: "same" };
+    expect(buildScopedSendFingerprint(environmentId, threadId, payload)).not.toBe(
+      buildScopedSendFingerprint(environmentId, ThreadId.make("thread-2"), payload),
+    );
+    expect(buildScopedSendFingerprint(environmentId, threadId, payload)).not.toBe(
+      buildScopedSendFingerprint(EnvironmentId.make("environment-remote"), threadId, payload),
+    );
+  });
+
+  it("releases client ids after external dispatch because Pi owns message identity", () => {
+    expect(retainOptimisticMessageAfterDispatch(true)).toBe(false);
+    expect(retainOptimisticMessageAfterDispatch(false)).toBe(true);
+  });
+});
 
 function makeThread(overrides: Partial<Thread> = {}): Thread {
   return {

@@ -20,6 +20,11 @@ import {
   resolveQueuedThreadSettings,
   shouldRetryThreadOutboxDelivery,
   threadOutboxRetryDelayMs,
+  waitsForQueuedThreadVisibility,
+  newTaskTargetRequiresProvider,
+  queuedMessageBlockedByCapabilities,
+  threadComposerAllowsSend,
+  threadComposerQueueCount,
   type QueuedThreadMessage,
 } from "./thread-outbox-model";
 import { createThreadOutboxManager, ThreadOutboxManagerError } from "./thread-outbox-manager";
@@ -43,6 +48,94 @@ function queuedMessage(input: {
 }
 
 describe("thread outbox", () => {
+  it("includes omitted remote intents in the detail queue count", () => {
+    expect(
+      threadComposerQueueCount({
+        localCount: 1,
+        hasDetail: true,
+        detailIntentCount: 2,
+        detailOmittedCount: 3,
+        shellIntentCount: 99,
+      }),
+    ).toBe(6);
+  });
+
+  it("retains a native first prompt until its new thread shell is visible", () => {
+    expect(waitsForQueuedThreadVisibility({ awaitThreadVisibility: true }, false)).toBe(true);
+    expect(waitsForQueuedThreadVisibility({ awaitThreadVisibility: true }, true)).toBe(false);
+  });
+
+  it("does not require an internal provider for the native Pi target", () => {
+    expect(newTaskTargetRequiresProvider("pi")).toBe(false);
+    expect(newTaskTargetRequiresProvider("t3")).toBe(true);
+  });
+
+  it("rejects editor submission for read-only external sessions", () => {
+    const thread = {
+      backing: {
+        kind: "external",
+        source: "pi",
+        sourceKey: "opaque",
+        control: "readOnly",
+        capabilities: {
+          send: false,
+          attachments: false,
+          streamingBehaviors: [],
+          interrupt: false,
+          stop: false,
+          rename: false,
+          archive: false,
+          delete: false,
+          changeModel: false,
+          changeRuntimeMode: false,
+          changeInteractionMode: false,
+          checkpoints: false,
+        },
+      },
+    } as never;
+    expect(threadComposerAllowsSend(thread, true)).toBe(false);
+    expect(queuedMessageBlockedByCapabilities({ attachments: [] }, thread)).toBe(true);
+  });
+
+  it("sends a queued streaming action normally after the thread settles", () => {
+    const thread = {
+      session: { status: "idle" },
+      backing: {
+        kind: "external",
+        source: "pi",
+        sourceKey: "opaque",
+        control: "supervisor",
+        capabilities: {
+          send: true,
+          attachments: false,
+          streamingBehaviors: [],
+          interrupt: false,
+          stop: true,
+          rename: false,
+          archive: false,
+          delete: false,
+          changeModel: false,
+          changeRuntimeMode: false,
+          changeInteractionMode: false,
+          checkpoints: false,
+        },
+      },
+    };
+
+    expect(
+      queuedMessageBlockedByCapabilities(
+        { attachments: [], streamingBehavior: "followUp" },
+        thread as never,
+      ),
+    ).toBe(false);
+    expect(
+      queuedMessageBlockedByCapabilities({ attachments: [], streamingBehavior: "followUp" }, {
+        ...thread,
+        session: { status: "running" },
+      } as never),
+    ).toBe(true);
+  });
+
   it("groups messages by scoped thread and preserves creation order", () => {
     const later = queuedMessage({
       messageId: "message-2",
@@ -92,6 +185,8 @@ describe("thread outbox", () => {
       },
       runtimeMode: "approval-required",
       interactionMode: "plan",
+      streamingBehavior: "followUp",
+      deliveryStatus: "indeterminate",
     } satisfies QueuedThreadMessage;
 
     expect(decodeQueuedThreadMessage(encodeQueuedThreadMessage(selectedMessage))).toEqual(
@@ -130,6 +225,30 @@ describe("thread outbox", () => {
     expect([1, 2, 3, 4, 5, 6].map(threadOutboxRetryDelayMs)).toEqual([
       1_000, 2_000, 4_000, 8_000, 16_000, 16_000,
     ]);
+  });
+
+  it("retains prompts rejected by temporary external runtime state", () => {
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "start-turn",
+        error: { code: "runtime_starting" },
+        interrupted: false,
+      }),
+    ).toBe("retry");
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "start-turn",
+        error: { code: "streaming_behavior_required" },
+        interrupted: false,
+      }),
+    ).toBe("retry");
+    expect(
+      resolveThreadOutboxFailureAction({
+        stage: "start-turn",
+        error: { code: "supervisor" },
+        interrupted: false,
+      }),
+    ).toBe("retry");
   });
 
   it("serializes mutations even when an earlier mutation is slower", async () => {

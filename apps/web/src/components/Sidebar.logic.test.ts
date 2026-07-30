@@ -152,14 +152,40 @@ describe("archiveSelectedThreadEntries", () => {
 describe("buildMultiSelectThreadContextMenuItems", () => {
   it("offers bulk archive with the selected count", () => {
     expect(
-      buildMultiSelectThreadContextMenuItems({ count: 3, hasRunningThread: false }),
+      buildMultiSelectThreadContextMenuItems({
+        count: 3,
+        hasRunningThread: false,
+        canArchiveSelection: true,
+        canDeleteSelection: true,
+      }),
     ).toContainEqual({ id: "archive", label: "Archive (3)", disabled: false });
   });
 
   it("disables bulk archive when a selected thread is running", () => {
     expect(
-      buildMultiSelectThreadContextMenuItems({ count: 2, hasRunningThread: true }),
+      buildMultiSelectThreadContextMenuItems({
+        count: 2,
+        hasRunningThread: true,
+        canArchiveSelection: true,
+        canDeleteSelection: true,
+      }),
     ).toContainEqual({ id: "archive", label: "Archive (2)", disabled: true });
+  });
+
+  it("disables unsupported bulk mutations for external selections", () => {
+    const items = buildMultiSelectThreadContextMenuItems({
+      count: 2,
+      hasRunningThread: false,
+      canArchiveSelection: false,
+      canDeleteSelection: false,
+    });
+    expect(items).toContainEqual({ id: "archive", label: "Archive (2)", disabled: true });
+    expect(items).toContainEqual({
+      id: "delete",
+      label: "Delete (2)",
+      destructive: true,
+      disabled: true,
+    });
   });
 });
 

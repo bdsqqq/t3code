@@ -9,7 +9,9 @@ import {
   type ComposerDraft,
   getComposerDraftSnapshot,
   mergeComposerDraftContentState,
+  nativePiStartPayloadFingerprint,
   removeComposerDraftsForEnvironment,
+  reusableNativePiStartIdentity,
   restoreComposerDraftSnapshotState,
 } from "./use-composer-drafts";
 
@@ -89,6 +91,61 @@ describe("mobile composer drafts", () => {
         },
       }),
     ).toThrow();
+  });
+
+  it("persists native Pi command identity and clears it with sent content", () => {
+    const draftKey = "new-task:environment-1:project-1";
+    const nativePiStartIdentity = {
+      createCommandId: "pi-create:message-1",
+      commandId: "command-1",
+      messageId: "message-1",
+      createdAt: "2026-07-30T00:00:00.000Z",
+    };
+    const decoded = decodePersistedComposerDrafts({
+      schemaVersion: 1,
+      drafts: {
+        [draftKey]: { ...DRAFT, nativePiStartIdentity },
+      },
+    });
+
+    expect(decoded[draftKey]?.nativePiStartIdentity).toEqual(nativePiStartIdentity);
+    expect(clearComposerDraftContentState(decoded, draftKey)).toEqual({});
+  });
+
+  it("reuses native Pi command identity only for the same payload", () => {
+    const payload = {
+      environmentId: EnvironmentId.make("environment-1"),
+      cwd: "/workspace",
+      text: "original prompt",
+      modelSelection: null,
+      runtimeMode: "full-access" as const,
+      interactionMode: "default" as const,
+    };
+    const payloadFingerprint = nativePiStartPayloadFingerprint(payload);
+    const identity = {
+      createCommandId: "pi-create:message-1",
+      commandId: "command-1",
+      messageId: "message-1",
+      createdAt: "2026-07-30T00:00:00.000Z",
+      payloadFingerprint,
+    };
+
+    expect(reusableNativePiStartIdentity(identity, payloadFingerprint)).toBe(identity);
+    expect(
+      reusableNativePiStartIdentity(
+        identity,
+        nativePiStartPayloadFingerprint({ ...payload, text: "edited prompt" }),
+      ),
+    ).toBeUndefined();
+    expect(
+      reusableNativePiStartIdentity(
+        identity,
+        nativePiStartPayloadFingerprint({
+          ...payload,
+          environmentId: EnvironmentId.make("environment-2"),
+        }),
+      ),
+    ).toBeUndefined();
   });
 
   it("clears sent content without clearing the selected model or workspace", () => {

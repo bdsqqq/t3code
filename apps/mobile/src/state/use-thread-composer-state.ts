@@ -11,6 +11,7 @@ import {
   type ThreadId,
 } from "@t3tools/contracts";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
 
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
@@ -38,8 +39,10 @@ import {
 import { setPendingConnectionError } from "../state/use-remote-environment-registry";
 import { useSelectedThreadDetail } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
-import { enqueueThreadOutboxMessage } from "./thread-outbox";
+import { enqueueThreadOutboxMessage, removeThreadOutboxMessage } from "./thread-outbox";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
+import { threadComposerQueueCount } from "./thread-outbox-model";
+import { environmentThreadShells } from "./threads";
 
 export function appendReviewCommentToDraft(input: {
   readonly environmentId: EnvironmentId;
@@ -48,10 +51,21 @@ export function appendReviewCommentToDraft(input: {
   readonly attachments?: ReadonlyArray<DraftComposerImageAttachment>;
 }): void {
   const threadKey = scopedThreadKey(input.environmentId, input.threadId);
+  const thread = appAtomRegistry.get(
+    environmentThreadShells.threadShellAtom({
+      environmentId: input.environmentId,
+      threadId: input.threadId,
+    }),
+  );
   const existing = appAtomRegistry.get(composerDraftsAtom)[threadKey]?.text ?? "";
   const separator = existing.trim().length > 0 && !existing.endsWith("\n") ? "\n\n" : "";
   setComposerDraftText(threadKey, `${existing}${separator}${input.text}`);
-  if (input.attachments && input.attachments.length > 0) {
+  if (
+    thread &&
+    threadAllows(thread, "attachments") &&
+    input.attachments &&
+    input.attachments.length > 0
+  ) {
     appendComposerDraftAttachments(threadKey, input.attachments);
   }
 }
@@ -97,8 +111,18 @@ export function useThreadComposerState() {
   const selectedDraft = selectedThreadKey ? composerDrafts[selectedThreadKey] : null;
   const draftMessage = selectedDraft?.text ?? "";
   const draftAttachments = selectedDraft?.attachments ?? [];
-  const selectedThreadQueueCount = selectedThreadQueuedMessages.length;
   const selectedThread = selectedThreadDetail ?? selectedThreadShell;
+  const allowsAttachments = selectedThread !== null && threadAllows(selectedThread, "attachments");
+  const selectedThreadQueueCount = threadComposerQueueCount({
+    localCount: selectedThreadQueuedMessages.length,
+    hasDetail: selectedThreadDetail !== null,
+    detailIntentCount: selectedThreadDetail?.pendingComposerIntents?.length,
+    detailOmittedCount: selectedThreadDetail?.pendingComposerIntentOmittedCount,
+    shellIntentCount: selectedThreadShell?.pendingComposerIntentCount,
+  });
+  const selectedThreadIndeterminateQueueCount = selectedThreadQueuedMessages.filter(
+    (message) => message.deliveryStatus === "indeterminate",
+  ).length;
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
   const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;
   const interactionMode = selectedDraft?.interactionMode ?? selectedThread?.interactionMode ?? null;
@@ -132,44 +156,61 @@ export function useThreadComposerState() {
     !!selectedThread &&
     (selectedThread.session?.status === "running" || selectedThread.session?.status === "starting");
 
-  const onSendMessage = useCallback(async () => {
-    if (!selectedThreadShell) {
-      return null;
-    }
+  const onSendMessage = useCallback(
+    async (requestedBehavior?: "steer" | "followUp") => {
+      if (!selectedThreadShell) {
+        return null;
+      }
 
-    const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
-    const draft = getComposerDraftSnapshot(threadKey);
-    const thread = selectedThreadDetail ?? selectedThreadShell;
-    const text = draft.text.trim();
-    const attachments = draft.attachments;
-    if (text.length === 0 && attachments.length === 0) {
-      return null;
-    }
+      const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+      const draft = getComposerDraftSnapshot(threadKey);
+      const thread = selectedThreadDetail ?? selectedThreadShell;
+      if (!threadAllows(thread, "send")) {
+        return null;
+      }
+      const text = draft.text.trim();
+      const attachments = draft.attachments;
+      if (text.length === 0 && attachments.length === 0) {
+        return null;
+      }
+      if (attachments.length > 0 && !threadAllows(thread, "attachments")) {
+        return null;
+      }
 
-    const metadata = makeQueuedMessageMetadata();
-    const messageId = MessageId.make(metadata.messageId);
-    try {
-      await enqueueThreadOutboxMessage({
-        environmentId: selectedThreadShell.environmentId,
-        threadId: selectedThreadShell.id,
-        messageId,
-        commandId: CommandId.make(metadata.commandId),
-        text,
-        attachments,
-        modelSelection: draft.modelSelection ?? thread.modelSelection,
-        runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-        interactionMode: draft.interactionMode ?? thread.interactionMode,
-        createdAt: metadata.createdAt,
-      });
-      clearComposerDraftContent(threadKey);
-      return messageId;
-    } catch (error) {
-      setPendingConnectionError(
-        error instanceof Error ? error.message : "Failed to save the queued message.",
-      );
-      return null;
-    }
-  }, [selectedThreadDetail, selectedThreadShell]);
+      const metadata = makeQueuedMessageMetadata();
+      const messageId = MessageId.make(metadata.messageId);
+      const streamingBehavior =
+        thread.backing?.kind === "external" && thread.session?.status === "running"
+          ? (requestedBehavior ?? "steer")
+          : undefined;
+      if (streamingBehavior !== undefined && !threadAllows(thread, streamingBehavior)) {
+        return null;
+      }
+      try {
+        await enqueueThreadOutboxMessage({
+          environmentId: selectedThreadShell.environmentId,
+          threadId: selectedThreadShell.id,
+          messageId,
+          commandId: CommandId.make(metadata.commandId),
+          text,
+          attachments,
+          modelSelection: draft.modelSelection ?? thread.modelSelection,
+          runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
+          interactionMode: draft.interactionMode ?? thread.interactionMode,
+          ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
+          createdAt: metadata.createdAt,
+        });
+        clearComposerDraftContent(threadKey);
+        return messageId;
+      } catch (error) {
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Failed to save the queued message.",
+        );
+        return null;
+      }
+    },
+    [selectedThreadDetail, selectedThreadShell],
+  );
 
   const onChangeDraftMessage = useCallback(
     (value: string) => {
@@ -184,7 +225,7 @@ export function useThreadComposerState() {
   );
 
   const onPickDraftImages = useCallback(async () => {
-    if (!selectedThreadShell) {
+    if (!selectedThreadShell || !allowsAttachments) {
       return;
     }
 
@@ -198,7 +239,7 @@ export function useThreadComposerState() {
     if (result.error) {
       setPendingConnectionError(result.error);
     }
-  }, [composerDrafts, selectedThreadShell]);
+  }, [allowsAttachments, composerDrafts, selectedThreadShell]);
 
   const onPasteIntoDraft = useCallback(async () => {
     if (!selectedThreadShell) {
@@ -209,7 +250,7 @@ export function useThreadComposerState() {
     const result = await pasteComposerClipboard({
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
     });
-    if (result.images.length > 0) {
+    if (allowsAttachments && result.images.length > 0) {
       appendComposerDraftAttachments(threadKey, result.images);
     }
     if (result.text) {
@@ -218,11 +259,11 @@ export function useThreadComposerState() {
     if (result.error) {
       setPendingConnectionError(result.error);
     }
-  }, [composerDrafts, selectedThreadShell]);
+  }, [allowsAttachments, composerDrafts, selectedThreadShell]);
 
   const onNativePasteImages = useCallback(
     async (uris: ReadonlyArray<string>) => {
-      if (!selectedThreadShell || uris.length === 0) {
+      if (!selectedThreadShell || !allowsAttachments || uris.length === 0) {
         return;
       }
 
@@ -244,7 +285,7 @@ export function useThreadComposerState() {
         });
       }
     },
-    [composerDrafts, selectedThreadShell],
+    [allowsAttachments, composerDrafts, selectedThreadShell],
   );
 
   const onRemoveDraftImage = useCallback(
@@ -258,6 +299,13 @@ export function useThreadComposerState() {
     },
     [selectedThreadShell],
   );
+  const onDiscardIndeterminateMessages = useCallback(async () => {
+    await Promise.all(
+      selectedThreadQueuedMessages
+        .filter((message) => message.deliveryStatus === "indeterminate")
+        .map((message) => removeThreadOutboxMessage(message)),
+    );
+  }, [selectedThreadQueuedMessages]);
 
   const onUpdateModelSelection = useCallback(
     (value: ModelSelection) => {
@@ -290,8 +338,10 @@ export function useThreadComposerState() {
   );
 
   return {
+    selectedThread,
     selectedThreadFeed,
     selectedThreadQueueCount,
+    selectedThreadIndeterminateQueueCount,
     activeWorkStartedAt,
     draftMessage,
     draftAttachments,
@@ -304,6 +354,7 @@ export function useThreadComposerState() {
     onPasteIntoDraft,
     onNativePasteImages,
     onRemoveDraftImage,
+    onDiscardIndeterminateMessages,
     onSendMessage,
     onUpdateModelSelection,
     onUpdateRuntimeMode,

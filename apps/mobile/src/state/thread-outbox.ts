@@ -25,6 +25,23 @@ export function updateThreadOutboxMessage(message: QueuedThreadMessage): Promise
   return threadOutboxManager.update(message);
 }
 
+export function markThreadOutboxMessageIndeterminateInMemory(message: QueuedThreadMessage): void {
+  const queues = appAtomRegistry.get(threadOutboxManager.queuedMessagesByThreadKeyAtom);
+  appAtomRegistry.set(
+    threadOutboxManager.queuedMessagesByThreadKeyAtom,
+    Object.fromEntries(
+      Object.entries(queues).map(([key, entries]) => [
+        key,
+        entries.map((entry) =>
+          entry.messageId === message.messageId
+            ? { ...entry, deliveryStatus: "indeterminate" as const }
+            : entry,
+        ),
+      ]),
+    ),
+  );
+}
+
 export function removeThreadOutboxMessage(message: QueuedThreadMessage): Promise<void> {
   return threadOutboxManager.remove(message);
 }

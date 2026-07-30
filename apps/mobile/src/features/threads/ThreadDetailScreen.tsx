@@ -7,6 +7,7 @@ import type {
   EnvironmentId,
   MessageId,
   ModelSelection,
+  OrchestrationThread,
   OrchestrationThreadShell,
   ProviderApprovalDecision,
   ProviderInteractionMode,
@@ -43,7 +44,7 @@ import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
 
 export interface ThreadDetailScreenProps {
-  readonly selectedThread: OrchestrationThreadShell;
+  readonly selectedThread: OrchestrationThread | OrchestrationThreadShell;
   readonly contentPresentation: ThreadContentPresentation;
   readonly screenTone: StatusTone;
   readonly connectionError: string | null;
@@ -66,6 +67,7 @@ export interface ThreadDetailScreenProps {
   readonly projectWorkspaceRoot: string | null;
   readonly threadCwd: string | null;
   readonly selectedThreadQueueCount: number;
+  readonly selectedThreadIndeterminateQueueCount: number;
   readonly serverConfig: T3ServerConfig | null;
   readonly layoutVariant?: LayoutVariant;
   readonly usesAutomaticContentInsets?: boolean;
@@ -76,7 +78,9 @@ export interface ThreadDetailScreenProps {
   readonly onNativePasteImages: (uris: ReadonlyArray<string>) => Promise<void>;
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
-  readonly onSendMessage: () => Promise<MessageId | null>;
+  readonly onStopSession: () => void;
+  readonly onDiscardIndeterminateMessages: () => Promise<void>;
+  readonly onSendMessage: (behavior?: "steer" | "followUp") => Promise<MessageId | null>;
   readonly onReconnectEnvironment: () => void;
   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateThreadRuntimeMode: (runtimeMode: RuntimeMode) => void;
@@ -294,17 +298,20 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     selectedThreadKey,
   ]);
 
-  const handleSendMessage = useCallback(async () => {
-    const targetThreadKey = selectedThreadKey;
-    const messageId = await props.onSendMessage();
-    if (messageId === null || selectedThreadKeyRef.current !== targetThreadKey) {
-      return messageId;
-    }
+  const handleSendMessage = useCallback(
+    async (behavior?: "steer" | "followUp") => {
+      const targetThreadKey = selectedThreadKey;
+      const messageId = await props.onSendMessage(behavior);
+      if (messageId === null || selectedThreadKeyRef.current !== targetThreadKey) {
+        return messageId;
+      }
 
-    setAnchorMessageId(messageId);
-    composerEditorRef.current?.blur();
-    return messageId;
-  }, [props.onSendMessage, selectedThreadKey]);
+      setAnchorMessageId(messageId);
+      composerEditorRef.current?.blur();
+      return messageId;
+    },
+    [props.onSendMessage, selectedThreadKey],
+  );
 
   const collapseComposer = useCallback(() => {
     composerEditorRef.current?.blur();
@@ -429,6 +436,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               selectedThread={props.selectedThread}
               serverConfig={props.serverConfig}
               queueCount={props.selectedThreadQueueCount}
+              indeterminateQueueCount={props.selectedThreadIndeterminateQueueCount}
               activeThreadBusy={props.activeThreadBusy}
               environmentId={props.environmentId}
               projectCwd={props.projectWorkspaceRoot}
@@ -438,6 +446,8 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
               onNativePasteImages={props.onNativePasteImages}
               onRemoveDraftImage={props.onRemoveDraftImage}
               onStopThread={props.onStopThread}
+              onStopSession={props.onStopSession}
+              onDiscardIndeterminateMessages={props.onDiscardIndeterminateMessages}
               onSendMessage={handleSendMessage}
               onReconnectEnvironment={props.onReconnectEnvironment}
               onUpdateModelSelection={props.onUpdateThreadModelSelection}

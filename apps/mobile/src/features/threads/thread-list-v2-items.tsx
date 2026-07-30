@@ -544,41 +544,45 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       {props.showSettledDivider ? (
         <ThreadListV2SectionDivider label="Settled" pane={props.pane} />
       ) : null}
-      <ThreadSwipeable
-        backgroundColor={sidebarPane ? drawerColor : screenColor}
-        compactActions={variant === "slim"}
-        containerStyle={
-          sidebarPane ? { borderRadius: SIDEBAR_V2_ROW_RADIUS, overflow: "hidden" } : undefined
-        }
-        enableTrackpadSwipe
-        // Full swipe commits the advertised lifecycle action (Settle /
-        // Un-settle), never the destructive delete.
-        fullSwipeAction="primary"
-        fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
-        onDelete={handleDelete}
-        onSwipeableClose={props.onSwipeableClose}
-        onSwipeableWillOpen={props.onSwipeableWillOpen}
-        primaryAction={primaryAction}
-        resetKey={`${thread.environmentId}:${thread.id}`}
-        simultaneousWithExternalGesture={props.simultaneousSwipeGesture}
-        threadTitle={thread.title}
-      >
-        {(close) => (
-          <ControlPillMenu
-            actions={
-              !props.settlementSupported
-                ? LEGACY_MENU_ACTIONS
-                : canUnsettle
-                  ? SLIM_MENU_ACTIONS
-                  : CARD_MENU_ACTIONS
-            }
-            onPressAction={handleMenuAction}
-            shouldOpenOnLongPress
-          >
-            {rowContent(close)}
-          </ControlPillMenu>
-        )}
-      </ThreadSwipeable>
+      {thread.backing?.kind === "external" ? (
+        rowContent(() => undefined)
+      ) : (
+        <ThreadSwipeable
+          backgroundColor={sidebarPane ? drawerColor : screenColor}
+          compactActions={variant === "slim"}
+          containerStyle={
+            sidebarPane ? { borderRadius: SIDEBAR_V2_ROW_RADIUS, overflow: "hidden" } : undefined
+          }
+          enableTrackpadSwipe
+          // Full swipe commits the advertised lifecycle action (Settle /
+          // Un-settle), never the destructive delete.
+          fullSwipeAction="primary"
+          fullSwipeWidth={props.fullSwipeWidth ?? windowWidth - 32}
+          onDelete={handleDelete}
+          onSwipeableClose={props.onSwipeableClose}
+          onSwipeableWillOpen={props.onSwipeableWillOpen}
+          primaryAction={primaryAction}
+          resetKey={`${thread.environmentId}:${thread.id}`}
+          simultaneousWithExternalGesture={props.simultaneousSwipeGesture}
+          threadTitle={thread.title}
+        >
+          {(close) => (
+            <ControlPillMenu
+              actions={
+                !props.settlementSupported
+                  ? LEGACY_MENU_ACTIONS
+                  : canUnsettle
+                    ? SLIM_MENU_ACTIONS
+                    : CARD_MENU_ACTIONS
+              }
+              onPressAction={handleMenuAction}
+              shouldOpenOnLongPress
+            >
+              {rowContent(close)}
+            </ControlPillMenu>
+          )}
+        </ThreadSwipeable>
+      )}
     </>
   );
 });

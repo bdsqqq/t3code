@@ -2,7 +2,6 @@ import * as Arr from "effect/Array";
 import * as Order from "effect/Order";
 import { useNavigation } from "@react-navigation/native";
 import { useEffect, useMemo, useState } from "react";
-import { Alert } from "react-native";
 
 import { NativeHeaderToolbar, NativeStackScreenOptions } from "../../native/StackHeader";
 import { useProjects, useThreadShells } from "../../state/entities";
@@ -59,24 +58,6 @@ export function HomeRouteScreen() {
     setThreadSortOrder,
   } = useHomeListOptions(availableEnvironmentIds);
   const selectedEnvironmentId = listOptions.selectedEnvironmentId;
-  const openNativePi = () => {
-    if (selectedEnvironmentId) {
-      navigation.navigate("NativePiList", { environmentId: selectedEnvironmentId });
-      return;
-    }
-    if (environments.length === 1 && environments[0]) {
-      navigation.navigate("NativePiList", { environmentId: environments[0].environmentId });
-      return;
-    }
-    Alert.alert("Choose environment", "Native Pi sessions belong to one environment.", [
-      ...environments.map((environment) => ({
-        text: environment.label,
-        onPress: () =>
-          navigation.navigate("NativePiList", { environmentId: environment.environmentId }),
-      })),
-      { text: "Cancel", style: "cancel" as const },
-    ]);
-  };
   const [selectedProjectKey, setSelectedProjectKey] = useState<string | null>(null);
   const projectFilterOptions = useMemo(
     () =>
@@ -139,7 +120,6 @@ export function HomeRouteScreen() {
           onEnvironmentChange={setSelectedEnvironmentId}
           onProjectChange={setSelectedProjectKey}
           onOpenSettings={() => navigation.navigate("SettingsSheet", { screen: "Settings" })}
-          onOpenNativePi={openNativePi}
           onProjectSortOrderChange={setProjectSortOrder}
           onSearchQueryChange={setSearchQuery}
           onStartNewTask={() => navigation.navigate("NewTaskSheet", { screen: "NewTask" })}

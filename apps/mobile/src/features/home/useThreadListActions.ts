@@ -1,5 +1,6 @@
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import { canSettle } from "@t3tools/client-runtime/state/thread-settled";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import * as Cause from "effect/Cause";
 import * as Haptics from "expo-haptics";
 import { useCallback, useRef } from "react";
@@ -65,6 +66,13 @@ function useThreadActionExecutor(
 
   const executeAction = useCallback(
     async (action: ThreadListAction, thread: EnvironmentThreadShell) => {
+      const capability =
+        action === "archive" || action === "unarchive"
+          ? "archive"
+          : action === "delete"
+            ? "delete"
+            : "lifecycle";
+      if (!threadAllows(thread, capability)) return false;
       const key = scopedThreadKey(thread.environmentId, thread.id);
       if (inFlightThreadKeys.current.has(key)) {
         return false;
