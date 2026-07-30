@@ -5,6 +5,9 @@ import { OrchestrationEventStoreLive } from "../persistence/Layers/Orchestration
 import { OrchestrationEngineLive } from "./Layers/OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./Layers/ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSnapshotQuery.ts";
+import { PiExternalThreadSource } from "../piNative/PiExternalThreadSource.ts";
+import { SessionCatalog } from "../piNative/SessionCatalog.ts";
+import { SupervisorClient } from "../piNative/SupervisorClient.ts";
 
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
   OrchestrationEventStoreLive,
@@ -21,7 +24,14 @@ export const OrchestrationInfrastructureLayerLive = Layer.mergeAll(
   OrchestrationProjectionPipelineLayerLive,
 );
 
+const PiExternalThreadSourceLive = PiExternalThreadSource.layer.pipe(
+  Layer.provide(SessionCatalog.layer()),
+  Layer.provide(SupervisorClient.layer),
+  Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+);
+
 export const OrchestrationLayerLive = Layer.mergeAll(
   OrchestrationInfrastructureLayerLive,
   OrchestrationEngineLive.pipe(Layer.provide(OrchestrationInfrastructureLayerLive)),
+  PiExternalThreadSourceLive,
 );

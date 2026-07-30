@@ -14,6 +14,7 @@ import { sharedServerCommandFlags } from "./cli/config.ts";
 import { projectCommand } from "./cli/project.ts";
 import { runServerCommand, serveCommand, startCommand } from "./cli/server.ts";
 import { serviceCommand } from "./cli/service.ts";
+import { runSupervisorDaemon } from "./piNative/SupervisorDaemon.ts";
 
 const CliRuntimeLayer = Layer.mergeAll(NodeServices.layer, NetService.layer);
 
@@ -41,6 +42,11 @@ const connectUnavailableCommand = Command.make("connect", {
   ),
 );
 
+export const piSupervisorCommand = Command.make("pi-supervisor").pipe(
+  Command.withHidden,
+  Command.withHandler(() => Effect.promise(runSupervisorDaemon)),
+);
+
 export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
   Command.make("t3", { ...sharedServerCommandFlags }).pipe(
     Command.withDescription("Run the T3 Code server."),
@@ -51,6 +57,7 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
       authCommand,
       projectCommand,
       serviceCommand,
+      piSupervisorCommand,
       cloudEnabled ? connectCommand : connectUnavailableCommand,
     ]),
   );

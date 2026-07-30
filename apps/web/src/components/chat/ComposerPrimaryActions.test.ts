@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { formatPendingPrimaryActionLabel } from "./ComposerPrimaryActions";
+import {
+  formatPendingPrimaryActionLabel,
+  streamingMenuTriggerDisabled,
+} from "./ComposerPrimaryActions";
 
 describe("formatPendingPrimaryActionLabel", () => {
   it("returns 'Submitting...' while responding", () => {
@@ -89,5 +92,20 @@ describe("formatPendingPrimaryActionLabel", () => {
         questionIndex: 5,
       }),
     ).toBe("Submit answers");
+  });
+});
+
+describe("streaming action menu", () => {
+  it("keeps supervisor stop available without draft text", () => {
+    expect(
+      streamingMenuTriggerDisabled({
+        canStop: true,
+        canSend: true,
+        hasSendableContent: false,
+        isSendBusy: false,
+        isConnecting: false,
+        isEnvironmentUnavailable: false,
+      }),
+    ).toBe(false);
   });
 });

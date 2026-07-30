@@ -628,7 +628,9 @@ export const ThreadListRow = memo(function ThreadListRow(props: {
       </Pressable>
     );
 
-  return (
+  return thread.backing?.kind === "external" ? (
+    rowContent(() => undefined)
+  ) : (
     <ThreadSwipeable
       backgroundColor={backgroundColor}
       containerStyle={

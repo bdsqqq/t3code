@@ -155,6 +155,13 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  PiExternalCatalogStreamItem,
+  PiExternalCatalogSubscribeInput,
+  PiExternalCreateSessionInput,
+  PiExternalCreateSessionResult,
+  PiNativeError,
+} from "./piNative.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -241,6 +248,10 @@ export const WS_METHODS = {
   sourceControlLookupRepository: "sourceControl.lookupRepository",
   sourceControlCloneRepository: "sourceControl.cloneRepository",
   sourceControlPublishRepository: "sourceControl.publishRepository",
+
+  // External-backed pi threads
+  piExternalSubscribeCatalog: "piExternal.subscribeCatalog",
+  piExternalCreateSession: "piExternal.createSession",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -739,6 +750,18 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
   stream: true,
 });
 
+export const WsPiExternalCreateSessionRpc = Rpc.make(WS_METHODS.piExternalCreateSession, {
+  payload: PiExternalCreateSessionInput,
+  success: PiExternalCreateSessionResult,
+  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
+});
+export const WsPiExternalSubscribeCatalogRpc = Rpc.make(WS_METHODS.piExternalSubscribeCatalog, {
+  payload: PiExternalCatalogSubscribeInput,
+  success: PiExternalCatalogStreamItem,
+  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
 export const WsSubscribeBackgroundPolicyRpc = Rpc.make(WS_METHODS.subscribeBackgroundPolicy, {
   payload: Schema.Struct({}),
   success: BackgroundPolicySnapshot,
@@ -754,6 +777,8 @@ export const WsSubscribeResourceTelemetryRpc = Rpc.make(WS_METHODS.subscribeReso
 });
 
 export const WsRpcGroup = RpcGroup.make(
+  WsPiExternalCreateSessionRpc,
+  WsPiExternalSubscribeCatalogRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

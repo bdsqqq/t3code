@@ -206,6 +206,31 @@ it.effect("rejects command fields that become empty after trim", () =>
   }),
 );
 
+it.effect("reserves external Pi thread ids from internal thread creation", () =>
+  Effect.gen(function* () {
+    const result = yield* Effect.exit(
+      decodeOrchestrationCommand({
+        type: "thread.create",
+        commandId: "cmd-1",
+        threadId: "external:pi:collision",
+        projectId: "project-1",
+        title: "Collision",
+        modelSelection: {
+          instanceId: "codex",
+          model: "gpt-5.4",
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdAt: "2026-07-30T00:00:00.000Z",
+      }),
+    );
+
+    assert.strictEqual(result._tag, "Failure");
+  }),
+);
+
 it.effect("decodes thread.turn.start defaults for provider and runtime mode", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeThreadTurnStartCommand({

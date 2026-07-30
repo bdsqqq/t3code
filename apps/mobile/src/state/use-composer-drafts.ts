@@ -45,6 +45,41 @@ export interface ComposerDraft {
   readonly runtimeMode?: RuntimeMode;
   readonly interactionMode?: ProviderInteractionMode;
   readonly workspaceSelection?: ComposerDraftWorkspaceSelection;
+  readonly nativePiStartIdentity?: NativePiStartIdentity;
+}
+
+export interface NativePiStartIdentity {
+  readonly createCommandId: string;
+  readonly commandId: string;
+  readonly messageId: string;
+  readonly createdAt: string;
+  readonly payloadFingerprint?: string;
+}
+
+export function nativePiStartPayloadFingerprint(input: {
+  readonly environmentId: EnvironmentId;
+  readonly cwd: string;
+  readonly text: string;
+  readonly modelSelection: ModelSelection | null;
+  readonly runtimeMode: RuntimeMode;
+  readonly interactionMode: ProviderInteractionMode;
+}): string {
+  return JSON.stringify({
+    target: "pi",
+    environmentId: input.environmentId,
+    cwd: input.cwd,
+    text: input.text,
+    modelSelection: input.modelSelection,
+    runtimeMode: input.runtimeMode,
+    interactionMode: input.interactionMode,
+  });
+}
+
+export function reusableNativePiStartIdentity(
+  identity: NativePiStartIdentity | undefined,
+  payloadFingerprint: string,
+): NativePiStartIdentity | undefined {
+  return identity?.payloadFingerprint === payloadFingerprint ? identity : undefined;
 }
 
 export interface ComposerDraftContent {
@@ -80,6 +115,15 @@ const ComposerDraftSchema = Schema.Struct({
   runtimeMode: Schema.optional(RuntimeModeSchema),
   interactionMode: Schema.optional(ProviderInteractionModeSchema),
   workspaceSelection: Schema.optional(ComposerDraftWorkspaceSelectionSchema),
+  nativePiStartIdentity: Schema.optional(
+    Schema.Struct({
+      createCommandId: Schema.String,
+      commandId: Schema.String,
+      messageId: Schema.String,
+      createdAt: Schema.String,
+      payloadFingerprint: Schema.optional(Schema.String),
+    }),
+  ),
 });
 
 const PersistedComposerDraftsSchema = Schema.Struct({
@@ -102,6 +146,7 @@ export const composerDraftsAtom = Atom.make<Record<string, ComposerDraft>>({}).p
 );
 
 let loadPromise: Promise<void> | null = null;
+let loadFailure: ComposerDraftPersistenceError | null = null;
 let persistTimer: ReturnType<typeof setTimeout> | null = null;
 const persistenceQueue = new SerializedAsyncQueue();
 
@@ -131,7 +176,8 @@ function isEmptyDraft(draft: ComposerDraft): boolean {
     draft.modelSelection === undefined &&
     draft.runtimeMode === undefined &&
     draft.interactionMode === undefined &&
-    draft.workspaceSelection === undefined
+    draft.workspaceSelection === undefined &&
+    draft.nativePiStartIdentity === undefined
   );
 }
 
@@ -151,6 +197,7 @@ async function getComposerDraftsFile() {
 
 async function loadPersistedComposerDrafts(): Promise<Record<string, ComposerDraft>> {
   let operation: ComposerDraftPersistenceError["operation"] = "open";
+  loadFailure = null;
   try {
     const file = await getComposerDraftsFile();
     if (!file.exists) {
@@ -161,15 +208,13 @@ async function loadPersistedComposerDrafts(): Promise<Record<string, ComposerDra
     operation = "decode";
     return decodePersistedComposerDrafts(JSON.parse(raw) as unknown);
   } catch (cause) {
-    console.warn(
-      "[composer-drafts] ignored persisted draft failure",
-      new ComposerDraftPersistenceError({
-        operation,
-        directory: COMPOSER_DRAFTS_DIRECTORY,
-        fileName: COMPOSER_DRAFTS_FILE,
-        cause,
-      }),
-    );
+    loadFailure = new ComposerDraftPersistenceError({
+      operation,
+      directory: COMPOSER_DRAFTS_DIRECTORY,
+      fileName: COMPOSER_DRAFTS_FILE,
+      cause,
+    });
+    console.warn("[composer-drafts] ignored persisted draft failure", loadFailure);
     return {};
   }
 }
@@ -231,10 +276,17 @@ export function ensureComposerDraftsLoaded(): void {
         return;
       }
       const current = appAtomRegistry.get(composerDraftsAtom);
-      appAtomRegistry.set(composerDraftsAtom, {
-        ...persistedDrafts,
-        ...current,
-      });
+      const merged = { ...persistedDrafts };
+      for (const [draftKey, currentDraft] of Object.entries(current)) {
+        const persistedDraft = persistedDrafts[draftKey];
+        merged[draftKey] = {
+          ...persistedDraft,
+          ...currentDraft,
+          nativePiStartIdentity:
+            currentDraft.nativePiStartIdentity ?? persistedDraft?.nativePiStartIdentity,
+        };
+      }
+      appAtomRegistry.set(composerDraftsAtom, merged);
     })
     .catch((cause) => {
       console.warn(
@@ -369,6 +421,35 @@ export function updateComposerDraftSettings(
   });
 }
 
+export async function persistComposerDraftNativePiStartIdentity(
+  draftKey: string,
+  identity: NativePiStartIdentity,
+): Promise<void> {
+  ensureComposerDraftsLoaded();
+  await loadPromise;
+  if (loadFailure !== null) {
+    const failure = loadFailure;
+    loadPromise = null;
+    ensureComposerDraftsLoaded();
+    await loadPromise;
+    if (loadFailure !== null) throw failure;
+  }
+  const current = appAtomRegistry.get(composerDraftsAtom);
+  const next = {
+    ...current,
+    [draftKey]: {
+      ...normalizeDraft(current[draftKey]),
+      nativePiStartIdentity: identity,
+    },
+  };
+  appAtomRegistry.set(composerDraftsAtom, next);
+  if (persistTimer !== null) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  await persistenceQueue.run(() => writePersistedComposerDrafts(next));
+}
+
 export function clearComposerDraftContentState(
   current: Record<string, ComposerDraft>,
   draftKey: string,
@@ -377,7 +458,11 @@ export function clearComposerDraftContentState(
   if (!existing) {
     return current;
   }
-  const { importedShareIds: _importedShareIds, ...retained } = existing;
+  const {
+    importedShareIds: _importedShareIds,
+    nativePiStartIdentity: _nativePiStartIdentity,
+    ...retained
+  } = existing;
   const draft = {
     ...retained,
     text: "",

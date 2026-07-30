@@ -6,6 +6,7 @@ import {
   effectiveSnoozed,
   threadWokeAt,
 } from "@t3tools/client-runtime/state/thread-settled";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/models";
 import {
   scopeProjectRef,
@@ -600,6 +601,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   );
   const handleDoubleClick = useCallback(
     (event: ReactMouseEvent) => {
+      if (!threadAllows(thread, "rename")) return;
       if (isRenaming || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
         return;
       }
@@ -607,7 +609,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
       event.preventDefault();
       onStartRename(threadRef, thread.title);
     },
-    [isRenaming, onStartRename, thread.title, threadRef],
+    [isRenaming, onStartRename, thread, threadRef],
   );
   const renameCommittedRef = useRef(false);
   useEffect(() => {
@@ -666,10 +668,13 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   // While the snooze popover is open the pointer leaves the row, which
   // would fade the hover actions out from under the open menu; pin them.
   const [snoozeMenuOpenRaw, setSnoozeMenuOpen] = useState(false);
+  const allowsLifecycle = threadAllows(thread, "lifecycle");
   // Snooze is offered only where it can succeed: capability-gated and never
   // on blocked-on-you work or queued turns (the server rejects both).
   const showSnoozeButton =
-    props.snoozeSupported && canSnooze(thread, { now: new Date().toISOString() });
+    allowsLifecycle &&
+    props.snoozeSupported &&
+    canSnooze(thread, { now: new Date().toISOString() });
   // If the thread becomes blocked while the popover is open, the button
   // unmounts without firing onOpenChange(false). Deriving the flag keeps a
   // stale true from permanently hiding the status label / pinning the
@@ -858,7 +863,8 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                     <AlarmClockOffIcon className="size-3" />
                   </button>
                 )
-              ) : !props.settlementSupported ? null : variantAction === "unsettle" ? (
+              ) : !props.settlementSupported || !allowsLifecycle ? null : variantAction ===
+                "unsettle" ? (
                 <button
                   type="button"
                   aria-label="Un-settle thread"
@@ -969,7 +975,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                     threadTimeLabel(thread)
                   )}
                 </span>
-                {props.settlementSupported || showSnoozeButton ? (
+                {(props.settlementSupported && allowsLifecycle) || showSnoozeButton ? (
                   <span
                     className={cn(
                       "absolute inset-y-0 right-0 flex items-stretch opacity-0 transition-opacity focus-within:static focus-within:opacity-100 group-hover/v2-row:static group-hover/v2-row:opacity-100",
@@ -983,7 +989,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                         onSnooze={handleSnoozePreset}
                       />
                     ) : null}
-                    {props.settlementSupported ? (
+                    {props.settlementSupported && allowsLifecycle ? (
                       <button
                         type="button"
                         aria-label="Settle thread"
@@ -1688,6 +1694,8 @@ export default function SidebarV2() {
       void (async () => {
         const trimmed = title.trim();
         setRenamingThreadKey(null);
+        const thread = threadByKeyRef.current.get(scopedThreadKey(threadRef));
+        if (!thread || !threadAllows(thread, "rename")) return;
         if (trimmed.length === 0) {
           toastManager.add({ type: "warning", title: "Thread title cannot be empty" });
           return;
@@ -1917,8 +1925,13 @@ export default function SidebarV2() {
         const thread = threadByKeyRef.current.get(threadKey);
         return thread ? [thread] : [];
       });
+      const canSettleSelection = snoozableThreads.every((thread) =>
+        threadAllows(thread, "lifecycle"),
+      );
+      const canDeleteSelection = snoozableThreads.every((thread) => threadAllows(thread, "delete"));
       const canSnoozeSelection = snoozableThreads.every(
         (thread) =>
+          threadAllows(thread, "lifecycle") &&
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
           canSnooze(thread, { now: selectionNow }),
       );
@@ -1926,7 +1939,7 @@ export default function SidebarV2() {
       const clicked = await settlePromise(() =>
         api.contextMenu.show(
           [
-            { id: "settle", label: `Settle (${count})` },
+            ...(canSettleSelection ? [{ id: "settle", label: `Settle (${count})` }] : []),
             ...(canSnoozeSelection
               ? [
                   {
@@ -1940,7 +1953,9 @@ export default function SidebarV2() {
                 ]
               : []),
             { id: "mark-unread", label: `Mark unread (${count})` },
-            { id: "delete", label: `Delete (${count})`, destructive: true },
+            ...(canDeleteSelection
+              ? [{ id: "delete", label: `Delete (${count})`, destructive: true }]
+              : []),
           ],
           position,
         ),
@@ -2060,9 +2075,10 @@ export default function SidebarV2() {
         // the settlement capability get no lifecycle items at all.
         const supportsSettlement =
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
-          true;
+            true && threadAllows(thread, "lifecycle");
         const supportsSnooze =
-          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true;
+          serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
+          threadAllows(thread, "lifecycle");
         const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
         // Presets resolve at menu-open time (same as the popover).
@@ -2100,11 +2116,13 @@ export default function SidebarV2() {
                         },
                   ]
                 : []),
-              { id: "rename", label: "Rename thread" },
+              ...(threadAllows(thread, "rename") ? [{ id: "rename", label: "Rename thread" }] : []),
               { id: "mark-unread", label: "Mark unread" },
               { id: "copy-path", label: "Copy path", icon: "copy" },
               ...(thread.branch ? [{ id: "copy-branch", label: "Copy branch", icon: "copy" }] : []),
-              { id: "delete", label: "Delete", destructive: true, icon: "trash" },
+              ...(threadAllows(thread, "delete")
+                ? [{ id: "delete", label: "Delete", destructive: true, icon: "trash" }]
+                : []),
             ],
             position,
           ),

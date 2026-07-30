@@ -234,9 +234,6 @@ function AndroidHomeHeader(props: HomeHeaderProps) {
                 />
               </Pressable>
             </ControlPillMenu>
-            {/* Built identically to the filter button so the two circles
-                match exactly (ControlPill sizes via Tailwind classes and
-                resolves to a different box). */}
             <Pressable
               accessibilityLabel="Open settings"
               accessibilityRole="button"

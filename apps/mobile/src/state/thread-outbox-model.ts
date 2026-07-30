@@ -1,5 +1,6 @@
 import { isTransportConnectionErrorMessage } from "@t3tools/client-runtime/errors";
 import type { EnvironmentShellStatus } from "@t3tools/client-runtime/state/shell";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import {
   CommandId,
   EnvironmentId,
@@ -14,6 +15,8 @@ import {
   type ProjectId as ProjectIdType,
   type ProviderInteractionMode as ProviderInteractionModeType,
   type RuntimeMode as RuntimeModeType,
+  type OrchestrationThread,
+  type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import * as Schema from "effect/Schema";
 
@@ -21,7 +24,7 @@ import { DraftComposerImageAttachmentSchema } from "../lib/composer-image-schema
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
 
-const THREAD_OUTBOX_SCHEMA_VERSION = 3;
+const THREAD_OUTBOX_SCHEMA_VERSION = 6;
 const THREAD_OUTBOX_MAX_RETRY_DELAY_MS = 16_000;
 
 const QueuedThreadCreationSchema = Schema.Struct({
@@ -37,7 +40,7 @@ const QueuedThreadCreationSchema = Schema.Struct({
 });
 
 export const QueuedThreadMessageSchema = Schema.Struct({
-  schemaVersion: Schema.Literals([1, 2, THREAD_OUTBOX_SCHEMA_VERSION]),
+  schemaVersion: Schema.Literals([1, 2, 3, 4, 5, THREAD_OUTBOX_SCHEMA_VERSION]),
   environmentId: EnvironmentId,
   threadId: ThreadId,
   messageId: MessageId,
@@ -47,6 +50,9 @@ export const QueuedThreadMessageSchema = Schema.Struct({
   modelSelection: Schema.optional(ModelSelection),
   runtimeMode: Schema.optional(RuntimeMode),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  streamingBehavior: Schema.optional(Schema.Literals(["steer", "followUp"])),
+  deliveryStatus: Schema.optional(Schema.Literal("indeterminate")),
+  awaitThreadVisibility: Schema.optional(Schema.Boolean),
   // Present when the queued item creates a brand-new thread (pending task)
   // instead of appending a turn to an existing one.
   creation: Schema.optional(QueuedThreadCreationSchema),
@@ -76,6 +82,9 @@ export interface QueuedThreadMessage {
   readonly modelSelection?: ModelSelectionType;
   readonly runtimeMode?: RuntimeModeType;
   readonly interactionMode?: ProviderInteractionModeType;
+  readonly streamingBehavior?: "steer" | "followUp";
+  readonly deliveryStatus?: "indeterminate";
+  readonly awaitThreadVisibility?: boolean;
   readonly creation?: QueuedThreadCreation;
   readonly createdAt: string;
 }
@@ -84,6 +93,50 @@ export interface ThreadSettingsSnapshot {
   readonly modelSelection: ModelSelectionType;
   readonly runtimeMode: RuntimeModeType;
   readonly interactionMode: ProviderInteractionModeType;
+}
+export function threadComposerQueueCount(input: {
+  readonly localCount: number;
+  readonly detailIntentCount?: number;
+  readonly detailOmittedCount?: number;
+  readonly shellIntentCount?: number;
+  readonly hasDetail: boolean;
+}): number {
+  return (
+    input.localCount +
+    (input.hasDetail
+      ? (input.detailIntentCount ?? 0) + (input.detailOmittedCount ?? 0)
+      : (input.shellIntentCount ?? 0))
+  );
+}
+export function waitsForQueuedThreadVisibility(
+  message: Pick<QueuedThreadMessage, "awaitThreadVisibility">,
+  threadExists: boolean,
+): boolean {
+  return message.awaitThreadVisibility === true && !threadExists;
+}
+export const newTaskTargetRequiresProvider = (target: "t3" | "pi"): boolean => target === "t3";
+export function threadComposerAllowsSend(
+  thread: OrchestrationThread | OrchestrationThreadShell,
+  hasContent: boolean,
+  behavior?: "steer" | "followUp",
+): boolean {
+  return (
+    hasContent &&
+    threadAllows(thread, "send") &&
+    (behavior === undefined || threadAllows(thread, behavior))
+  );
+}
+export function queuedMessageBlockedByCapabilities(
+  message: Pick<QueuedThreadMessage, "attachments" | "streamingBehavior">,
+  thread: OrchestrationThread | OrchestrationThreadShell,
+): boolean {
+  return (
+    !threadAllows(thread, "send") ||
+    (message.attachments.length > 0 && !threadAllows(thread, "attachments")) ||
+    (thread.session?.status === "running" &&
+      message.streamingBehavior !== undefined &&
+      !threadAllows(thread, message.streamingBehavior))
+  );
 }
 
 export function resolveQueuedThreadSettings(
@@ -216,9 +269,20 @@ export function resolveThreadOutboxFailureAction(input: {
   readonly error: unknown;
   readonly interrupted: boolean;
 }): ThreadOutboxFailureAction {
+  const code =
+    typeof input.error === "object" &&
+    input.error !== null &&
+    "code" in input.error &&
+    typeof input.error.code === "string"
+      ? input.error.code
+      : undefined;
   if (
     input.stage === "settings-sync" ||
     input.interrupted ||
+    code === "runtime_starting" ||
+    code === "streaming_behavior_required" ||
+    code === "read_only" ||
+    code === "supervisor" ||
     shouldRetryThreadOutboxDelivery(input.error)
   ) {
     return "retry";

@@ -9,6 +9,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } fro
 import * as Option from "effect/Option";
 import { EnvironmentId, ThreadId, type ProjectScript } from "@t3tools/contracts";
 import { projectScriptCwd, projectScriptRuntimeEnv } from "@t3tools/shared/projectScripts";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import { Platform, ScrollView, View } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useWorkspaceState } from "../../state/workspace";
@@ -196,6 +197,7 @@ function ThreadRouteContent(
   const gitActions = useSelectedThreadGitActions();
   const requests = useSelectedThreadRequests();
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, "thread interrupt");
+  const stopThreadSession = useAtomCommand(threadEnvironment.stopSession, "thread stop");
   const navigation = useNavigation();
   const params = props.route.params;
   const environmentIdRaw = firstRouteParam(params.environmentId);
@@ -265,18 +267,23 @@ function ThreadRouteContent(
   const routeConnectionState =
     routeEnvironmentRuntime?.connectionState ?? (environmentId ? "available" : connectionState);
   const routeConnectionError = routeEnvironmentRuntime?.connectionError ?? null;
-  const selectedThreadWithDraftSettings = useMemo(
-    () =>
-      selectedThread
-        ? {
-            ...selectedThread,
-            modelSelection: composer.modelSelection ?? selectedThread.modelSelection,
-            runtimeMode: composer.runtimeMode ?? selectedThread.runtimeMode,
-            interactionMode: composer.interactionMode ?? selectedThread.interactionMode,
-          }
-        : null,
-    [composer.interactionMode, composer.modelSelection, composer.runtimeMode, selectedThread],
-  );
+  const selectedThreadWithDraftSettings = useMemo(() => {
+    const authoritativeThread = composer.selectedThread ?? selectedThread;
+    return authoritativeThread
+      ? {
+          ...authoritativeThread,
+          modelSelection: composer.modelSelection ?? authoritativeThread.modelSelection,
+          runtimeMode: composer.runtimeMode ?? authoritativeThread.runtimeMode,
+          interactionMode: composer.interactionMode ?? authoritativeThread.interactionMode,
+        }
+      : null;
+  }, [
+    composer.interactionMode,
+    composer.modelSelection,
+    composer.runtimeMode,
+    composer.selectedThread,
+    selectedThread,
+  ]);
 
   /* ─── Native header theming ──────────────────────────────────────── */
   const usesNativeHeaderGlass = NATIVE_LIQUID_GLASS_SUPPORTED;
@@ -463,6 +470,7 @@ function ThreadRouteContent(
   const handleStopThread = useCallback(() => {
     if (
       !selectedThread ||
+      !threadAllows(selectedThread, "interrupt") ||
       (selectedThread.session?.status !== "running" &&
         selectedThread.session?.status !== "starting")
     ) {
@@ -478,6 +486,13 @@ function ThreadRouteContent(
       },
     });
   }, [interruptThreadTurn, selectedThread]);
+  const handleStopSession = useCallback(() => {
+    if (!selectedThread || !threadAllows(selectedThread, "stop")) return;
+    return stopThreadSession({
+      environmentId: selectedThread.environmentId,
+      input: { threadId: selectedThread.id },
+    });
+  }, [selectedThread, stopThreadSession]);
 
   const handleOpenTerminal = useCallback(
     (nextTerminalId?: string | null) => {
@@ -771,6 +786,7 @@ function ThreadRouteContent(
           projectWorkspaceRoot={selectedThreadProject?.workspaceRoot ?? null}
           threadCwd={selectedThreadCwd}
           selectedThreadQueueCount={composer.selectedThreadQueueCount}
+          selectedThreadIndeterminateQueueCount={composer.selectedThreadIndeterminateQueueCount}
           layoutVariant={layout.variant}
           usesAutomaticContentInsets={usesNativeHeaderGlass}
           onOpenConnectionEditor={handleOpenConnectionEditor}
@@ -780,6 +796,8 @@ function ThreadRouteContent(
           onRemoveDraftImage={composer.onRemoveDraftImage}
           serverConfig={serverConfig}
           onStopThread={handleStopThread}
+          onStopSession={handleStopSession}
+          onDiscardIndeterminateMessages={composer.onDiscardIndeterminateMessages}
           onSendMessage={composer.onSendMessage}
           onReconnectEnvironment={handleReconnectEnvironment}
           onUpdateThreadModelSelection={composer.onUpdateModelSelection}

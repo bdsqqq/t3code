@@ -3,6 +3,7 @@ import type {
   EnvironmentId,
   MessageId,
   ModelSelection,
+  OrchestrationThread,
   OrchestrationThreadShell,
   ProviderInteractionMode,
   RuntimeMode,
@@ -15,6 +16,8 @@ import {
   type ComposerTrigger,
 } from "@t3tools/shared/composerTrigger";
 import type { ReactNode } from "react";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
+import { threadComposerAllowsSend } from "../../state/thread-outbox-model";
 import { memo, useCallback, useEffect, useMemo, useRef, useState, type RefObject } from "react";
 import {
   ActivityIndicator,
@@ -81,7 +84,6 @@ export const COMPOSER_COLLAPSED_CHROME = 60;
  * Used by the parent to compute the larger feed bottom inset when the composer is focused.
  */
 export const COMPOSER_EXPANDED_CHROME = 174;
-
 export interface ThreadComposerProps {
   readonly draftMessage: string;
   readonly draftAttachments: ReadonlyArray<DraftComposerImageAttachment>;
@@ -97,9 +99,10 @@ export interface ThreadComposerProps {
    * are on screen while they reconcile with the server.
    */
   readonly threadSyncPhase?: "loading" | "syncing" | null;
-  readonly selectedThread: OrchestrationThreadShell;
+  readonly selectedThread: OrchestrationThread | OrchestrationThreadShell;
   readonly serverConfig: T3ServerConfig | null;
   readonly queueCount: number;
+  readonly indeterminateQueueCount: number;
   readonly activeThreadBusy: boolean;
   readonly environmentId: EnvironmentId;
   readonly projectCwd: string | null;
@@ -109,7 +112,9 @@ export interface ThreadComposerProps {
   readonly onNativePasteImages: (uris: ReadonlyArray<string>) => Promise<void>;
   readonly onRemoveDraftImage: (imageId: string) => void;
   readonly onStopThread: () => void;
-  readonly onSendMessage: () => Promise<MessageId | null>;
+  readonly onStopSession: () => void;
+  readonly onDiscardIndeterminateMessages: () => Promise<void>;
+  readonly onSendMessage: (behavior?: "steer" | "followUp") => Promise<MessageId | null>;
   readonly onUpdateModelSelection: (modelSelection: ModelSelection) => void;
   readonly onUpdateRuntimeMode: (runtimeMode: RuntimeMode) => void;
   readonly onUpdateInteractionMode: (interactionMode: ProviderInteractionMode) => void;
@@ -279,7 +284,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   const [previewImageUri, setPreviewImageUri] = useState<string | null>(null);
   const hasContent = props.draftMessage.trim().length > 0 || props.draftAttachments.length > 0;
   const isExpanded = isFocused;
-  const canSend = hasContent;
+  const canSend = threadComposerAllowsSend(props.selectedThread, hasContent);
 
   const onPressImage = useCallback(
     (uri: string) => {
@@ -306,8 +311,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     onExpandedChange?.(false);
   }, [onExpandedChange]);
   const showStopAction =
-    props.selectedThread.session?.status === "running" ||
-    props.selectedThread.session?.status === "starting";
+    (props.selectedThread.session?.status === "running" ||
+      props.selectedThread.session?.status === "starting") &&
+    threadAllows(props.selectedThread, "interrupt");
 
   const sendLabel =
     props.connectionState !== "connected" || props.activeThreadBusy || props.queueCount > 0
@@ -372,27 +378,35 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     if (composerTrigger.kind === "slash-command") {
       const q = composerTrigger.query.toLowerCase();
       const allBuiltIn = [
-        {
-          id: "cmd:model",
-          type: "slash-command" as const,
-          command: "model",
-          label: "/model",
-          description: "Switch model",
-        },
-        {
-          id: "cmd:plan",
-          type: "slash-command" as const,
-          command: "plan",
-          label: "/plan",
-          description: "Switch to plan mode",
-        },
-        {
-          id: "cmd:default",
-          type: "slash-command" as const,
-          command: "default",
-          label: "/default",
-          description: "Switch to default mode",
-        },
+        ...(threadAllows(props.selectedThread, "changeModel")
+          ? [
+              {
+                id: "cmd:model",
+                type: "slash-command" as const,
+                command: "model",
+                label: "/model",
+                description: "Switch model",
+              },
+            ]
+          : []),
+        ...(threadAllows(props.selectedThread, "changeInteractionMode")
+          ? [
+              {
+                id: "cmd:plan",
+                type: "slash-command" as const,
+                command: "plan",
+                label: "/plan",
+                description: "Switch to plan mode",
+              },
+              {
+                id: "cmd:default",
+                type: "slash-command" as const,
+                command: "default",
+                label: "/default",
+                description: "Switch to default mode",
+              },
+            ]
+          : []),
       ];
       const builtIn = allBuiltIn.filter((item) => item.command.includes(q));
 
@@ -509,33 +523,31 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
     }
 
     return [];
-  }, [composerTrigger, pathSearch.entries, selectedProviderStatus]);
+  }, [composerTrigger, pathSearch.entries, props.selectedThread, selectedProviderStatus]);
 
   // ── Handle command selection ──────────────────────────────
   const { onChangeDraftMessage, onUpdateInteractionMode, draftMessage, onSendMessage } = props;
 
-  const handleSend = useCallback(async () => {
-    const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
-    if (inFlightThreadIdsRef.current.has(threadKey)) return;
-    inFlightThreadIdsRef.current.add(threadKey);
-    // Sending a prompt starts agent work: arm the lock-screen card now, while
-    // the app is foregrounded and the activity token can be registered.
-    armAgentAwarenessLiveActivityForLocalWork({
-      threadTitle: props.selectedThread.title,
-      projectTitle: props.environmentLabel ?? "T3 Code",
-    });
-    try {
-      await onSendMessage();
-    } finally {
-      inFlightThreadIdsRef.current.delete(threadKey);
-    }
-  }, [
-    onSendMessage,
-    props.environmentId,
-    props.environmentLabel,
-    props.selectedThread.id,
-    props.selectedThread.title,
-  ]);
+  const handleSend = useCallback(
+    async (behavior?: "steer" | "followUp") => {
+      if (!threadComposerAllowsSend(props.selectedThread, hasContent, behavior)) return;
+      const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
+      if (inFlightThreadIdsRef.current.has(threadKey)) return;
+      inFlightThreadIdsRef.current.add(threadKey);
+      // Sending a prompt starts agent work: arm the lock-screen card now, while
+      // the app is foregrounded and the activity token can be registered.
+      armAgentAwarenessLiveActivityForLocalWork({
+        threadTitle: props.selectedThread.title,
+        projectTitle: props.environmentLabel ?? "T3 Code",
+      });
+      try {
+        await onSendMessage(behavior);
+      } finally {
+        inFlightThreadIdsRef.current.delete(threadKey);
+      }
+    },
+    [onSendMessage, hasContent, props.environmentId, props.environmentLabel, props.selectedThread],
+  );
   const handleCommandSelect = useCallback(
     (item: ComposerCommandItem) => {
       if (!composerTrigger) return;
@@ -544,6 +556,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         item.type === "slash-command" &&
         (item.command === "plan" || item.command === "default")
       ) {
+        if (!threadAllows(props.selectedThread, "changeInteractionMode")) return;
         const result = replaceTextRange(
           draftMessage,
           composerTrigger.rangeStart,
@@ -629,54 +642,81 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   // ── Options menu ─────────────────────────────────────────
   const optionsMenuActions = useMemo(
     () => [
-      ...buildProviderOptionMenuActions(providerOptionDescriptors),
-      {
-        id: "options-runtime",
-        title: "Runtime",
-        subtitle:
-          currentRuntimeMode === "approval-required"
-            ? "Approve actions"
-            : currentRuntimeMode === "auto-accept-edits"
-              ? "Auto-accept edits"
-              : currentRuntimeMode === "auto"
-                ? "Auto"
-                : "Full access",
-        subactions: [
-          { id: "options:runtime:approval-required", title: "Approve actions" },
-          { id: "options:runtime:auto-accept-edits", title: "Auto-accept edits" },
-          { id: "options:runtime:auto", title: "Auto" },
-          { id: "options:runtime:full-access", title: "Full access" },
-        ].map((option) => {
-          const value = option.id.replace("options:runtime:", "");
-          return {
-            id: option.id,
-            title: option.title,
-            state: currentRuntimeMode === value ? ("on" as const) : undefined,
-          };
-        }),
-      },
-      {
-        id: "options-interaction",
-        title: "Interaction",
-        subtitle: currentInteractionMode === "plan" ? "Plan" : "Default",
-        subactions: [
-          { id: "options:interaction:default", title: "Default" },
-          { id: "options:interaction:plan", title: "Plan" },
-        ].map((option) => {
-          const value = option.id.replace("options:interaction:", "");
-          return {
-            id: option.id,
-            title: option.title,
-            state: currentInteractionMode === value ? ("on" as const) : undefined,
-          };
-        }),
-      },
+      ...(threadAllows(props.selectedThread, "changeModel")
+        ? buildProviderOptionMenuActions(providerOptionDescriptors)
+        : []),
+      ...(threadAllows(props.selectedThread, "changeRuntimeMode")
+        ? [
+            {
+              id: "options-runtime",
+              title: "Runtime",
+              subtitle:
+                currentRuntimeMode === "approval-required"
+                  ? "Approve actions"
+                  : currentRuntimeMode === "auto-accept-edits"
+                    ? "Auto-accept edits"
+                    : currentRuntimeMode === "auto"
+                      ? "Auto"
+                      : "Full access",
+              subactions: [
+                { id: "options:runtime:approval-required", title: "Approve actions" },
+                { id: "options:runtime:auto-accept-edits", title: "Auto-accept edits" },
+                { id: "options:runtime:auto", title: "Auto" },
+                { id: "options:runtime:full-access", title: "Full access" },
+              ].map((option) => {
+                const value = option.id.replace("options:runtime:", "");
+                return {
+                  id: option.id,
+                  title: option.title,
+                  state: currentRuntimeMode === value ? ("on" as const) : undefined,
+                };
+              }),
+            },
+          ]
+        : []),
+      ...(threadAllows(props.selectedThread, "changeInteractionMode")
+        ? [
+            {
+              id: "options-interaction",
+              title: "Interaction",
+              subtitle: currentInteractionMode === "plan" ? "Plan" : "Default",
+              subactions: [
+                { id: "options:interaction:default", title: "Default" },
+                { id: "options:interaction:plan", title: "Plan" },
+              ].map((option) => {
+                const value = option.id.replace("options:interaction:", "");
+                return {
+                  id: option.id,
+                  title: option.title,
+                  state: currentInteractionMode === value ? ("on" as const) : undefined,
+                };
+              }),
+            },
+          ]
+        : []),
+      ...(props.selectedThread.session?.status === "running" &&
+      threadAllows(props.selectedThread, "followUp")
+        ? [{ id: "options:queue:followUp", title: "Send draft as follow-up" }]
+        : []),
+      ...(threadAllows(props.selectedThread, "stop")
+        ? [{ id: "options:session:stop", title: "Stop native Pi runtime" }]
+        : []),
+      ...(props.indeterminateQueueCount > 0
+        ? [{ id: "options:queue:discard-indeterminate", title: "Discard uncertain message" }]
+        : []),
     ],
-    [currentInteractionMode, currentRuntimeMode, providerOptionDescriptors],
+    [
+      currentInteractionMode,
+      currentRuntimeMode,
+      providerOptionDescriptors,
+      props.indeterminateQueueCount,
+      props.selectedThread,
+    ],
   );
 
   // ── Menu handlers ────────────────────────────────────────
   function handleModelMenuAction(event: string) {
+    if (!threadAllows(props.selectedThread, "changeModel")) return;
     if (!event.startsWith("model:")) {
       return;
     }
@@ -688,20 +728,38 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
   }
 
   function handleOptionsMenuAction(event: string) {
+    if (event === "options:queue:followUp") {
+      void handleSend("followUp");
+      return;
+    }
+    if (event === "options:session:stop") {
+      props.onStopSession();
+      return;
+    }
+    if (event === "options:queue:discard-indeterminate") {
+      void props.onDiscardIndeterminateMessages();
+      return;
+    }
     const providerOptions = applyProviderOptionMenuEvent(providerOptionDescriptors, event);
-    if (providerOptions) {
+    if (providerOptions && threadAllows(props.selectedThread, "changeModel")) {
       props.onUpdateModelSelection({
         ...currentModelSelection,
         options: providerOptions,
       });
       return;
     }
-    if (event.startsWith("options:runtime:")) {
+    if (
+      event.startsWith("options:runtime:") &&
+      threadAllows(props.selectedThread, "changeRuntimeMode")
+    ) {
       const runtimeMode = event.slice("options:runtime:".length) as RuntimeMode;
       props.onUpdateRuntimeMode(runtimeMode);
       return;
     }
-    if (event.startsWith("options:interaction:")) {
+    if (
+      event.startsWith("options:interaction:") &&
+      threadAllows(props.selectedThread, "changeInteractionMode")
+    ) {
       const interactionMode = event.slice("options:interaction:".length) as ProviderInteractionMode;
       props.onUpdateInteractionMode(interactionMode);
     }
@@ -791,7 +849,7 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
               placeholder={props.placeholder}
               onFocus={handleFocus}
               onBlur={handleBlur}
-              onSubmit={handleSend}
+              onSubmit={() => void handleSend()}
               scrollEnabled={isExpanded}
               // Android: collapsed single line centers natively (gravity) in
               // a pill-height box matching the send button; iOS keeps insets.
@@ -859,34 +917,40 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
                 fadeOpaque={toolbarFadeOpaque}
                 fadeTransparent={toolbarFadeTransparent}
               >
-                <ComposerToolbarButton
-                  accessibilityLabel="Add attachment"
-                  icon="plus"
-                  onPress={() => void props.onPickDraftImages()}
-                  showChevron={false}
-                />
-                <ControlPillMenu
-                  actions={modelMenuActions}
-                  onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
-                >
-                  <ComposerToolbarTrigger
-                    accessibilityLabel="Model"
-                    iconNode={
-                      <ProviderIcon provider={currentModelOption?.providerDriver} size={16} />
-                    }
-                    label={currentModelOption?.label ?? currentModelSelection.model}
+                {threadAllows(props.selectedThread, "attachments") ? (
+                  <ComposerToolbarButton
+                    accessibilityLabel="Add attachment"
+                    icon="plus"
+                    onPress={() => void props.onPickDraftImages()}
+                    showChevron={false}
                   />
-                </ControlPillMenu>
-                <ControlPillMenu
-                  actions={optionsMenuActions}
-                  onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
-                >
-                  <ComposerToolbarTrigger
-                    accessibilityLabel="Configuration"
-                    icon="slider.horizontal.3"
-                    label={configurationLabel}
-                  />
-                </ControlPillMenu>
+                ) : null}
+                {threadAllows(props.selectedThread, "changeModel") ? (
+                  <ControlPillMenu
+                    actions={modelMenuActions}
+                    onPressAction={({ nativeEvent }) => handleModelMenuAction(nativeEvent.event)}
+                  >
+                    <ComposerToolbarTrigger
+                      accessibilityLabel="Model"
+                      iconNode={
+                        <ProviderIcon provider={currentModelOption?.providerDriver} size={16} />
+                      }
+                      label={currentModelOption?.label ?? currentModelSelection.model}
+                    />
+                  </ControlPillMenu>
+                ) : null}
+                {optionsMenuActions.length > 0 ? (
+                  <ControlPillMenu
+                    actions={optionsMenuActions}
+                    onPressAction={({ nativeEvent }) => handleOptionsMenuAction(nativeEvent.event)}
+                  >
+                    <ComposerToolbarTrigger
+                      accessibilityLabel="Configuration"
+                      icon="slider.horizontal.3"
+                      label={configurationLabel}
+                    />
+                  </ControlPillMenu>
+                ) : null}
                 {showStopAction ? (
                   <ComposerToolbarButton
                     accessibilityLabel="Stop"
@@ -913,8 +977,9 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
         {props.queueCount > 0 ? (
           <Animated.View entering={FadeIn.duration(180)} exiting={FadeOut.duration(120)}>
             <Text className="pt-2 text-xs text-foreground-muted">
-              {props.queueCount} queued message{props.queueCount === 1 ? "" : "s"} will send
-              automatically.
+              {props.indeterminateQueueCount > 0
+                ? `${props.indeterminateQueueCount} message${props.indeterminateQueueCount === 1 ? "" : "s"} may not have been delivered. Use the configuration menu to discard ${props.indeterminateQueueCount === 1 ? "it" : "them"}.`
+                : `${props.queueCount} queued message${props.queueCount === 1 ? "" : "s"} will send automatically.`}
             </Text>
           </Animated.View>
         ) : null}

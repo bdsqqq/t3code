@@ -30,6 +30,7 @@ import {
   OrchestrationGetSnapshotError,
   OrchestrationGetTurnDiffError,
   ORCHESTRATION_WS_METHODS,
+  PiNativeError,
   type ProjectId,
   type ProjectEntriesFailure,
   type ProjectFileFailure,
@@ -112,6 +113,11 @@ import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
 import * as VcsProjectConfig from "./vcs/VcsProjectConfig.ts";
 import * as VcsProcess from "./vcs/VcsProcess.ts";
+import { PiExternalThreadSource } from "./piNative/PiExternalThreadSource.ts";
+import {
+  getExternalThreadDispatch,
+  getExternalThreadSubscription,
+} from "./orchestration/Services/ClientThreadRouter.ts";
 import * as PairingGrantStore from "./auth/PairingGrantStore.ts";
 import * as SessionStore from "./auth/SessionStore.ts";
 import { failEnvironmentAuthInvalid, failEnvironmentInternal } from "./auth/http.ts";
@@ -341,8 +347,9 @@ const makeWsRpcLayer = (
   WsRpcGroup.toLayer(
     Effect.gen(function* () {
       const currentSessionId = currentSession.sessionId;
-      const crypto = yield* Crypto.Crypto;
+      const piExternalSource = yield* Effect.serviceOption(PiExternalThreadSource);
       const projectionSnapshotQuery = yield* ProjectionSnapshotQuery.ProjectionSnapshotQuery;
+      const crypto = yield* Crypto.Crypto;
       const orchestrationEngine = yield* OrchestrationEngine.OrchestrationEngineService;
       const checkpointDiffQuery = yield* CheckpointDiffQuery.CheckpointDiffQuery;
       const keybindings = yield* Keybindings.Keybindings;
@@ -1007,61 +1014,92 @@ const makeWsRpcLayer = (
           .pipe(Effect.ignoreCause({ log: true }), Effect.forkDetach, Effect.asVoid);
 
       return WsRpcGroup.of({
+        [WS_METHODS.piExternalCreateSession]: (input) =>
+          observeRpcEffect(
+            WS_METHODS.piExternalCreateSession,
+            Option.match(piExternalSource, {
+              onNone: () =>
+                Effect.fail(
+                  new PiNativeError({
+                    code: "unavailable",
+                    message: "External pi threads are unavailable",
+                  }),
+                ),
+              onSome: (source) => source.createSession(input),
+            }),
+          ),
+        [WS_METHODS.piExternalSubscribeCatalog]: (input) =>
+          observeRpcStream(
+            WS_METHODS.piExternalSubscribeCatalog,
+            Option.match(piExternalSource, {
+              onNone: () =>
+                Stream.fail(
+                  new PiNativeError({
+                    code: "unavailable",
+                    message: "External pi threads are unavailable",
+                  }),
+                ),
+              onSome: (source) => source.subscribeCatalog(input),
+            }),
+          ),
         [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command) =>
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
-            Effect.gen(function* () {
-              const normalizedCommand = yield* normalizeDispatchCommand(command);
-              const shouldStopSessionAfterArchive =
-                normalizedCommand.type === "thread.archive"
-                  ? yield* projectionSnapshotQuery
-                      .getThreadShellById(normalizedCommand.threadId)
-                      .pipe(
-                        Effect.map(
-                          Option.match({
-                            onNone: () => false,
-                            onSome: (thread) =>
-                              thread.session !== null && thread.session.status !== "stopped",
-                          }),
+            (
+              getExternalThreadDispatch(command, piExternalSource) ??
+              Effect.gen(function* () {
+                const normalizedCommand = yield* normalizeDispatchCommand(command);
+                const shouldStopSessionAfterArchive =
+                  normalizedCommand.type === "thread.archive"
+                    ? yield* projectionSnapshotQuery
+                        .getThreadShellById(normalizedCommand.threadId)
+                        .pipe(
+                          Effect.map(
+                            Option.match({
+                              onNone: () => false,
+                              onSome: (thread) =>
+                                thread.session !== null && thread.session.status !== "stopped",
+                            }),
+                          ),
+                          Effect.orElseSucceed(() => false),
+                        )
+                    : false;
+                const result = yield* dispatchNormalizedCommand(normalizedCommand);
+                if (normalizedCommand.type === "thread.archive") {
+                  if (shouldStopSessionAfterArchive) {
+                    yield* Effect.gen(function* () {
+                      const stopCommand = yield* normalizeDispatchCommand({
+                        type: "thread.session.stop",
+                        commandId: CommandId.make(
+                          `session-stop-for-archive:${normalizedCommand.commandId}`,
                         ),
-                        Effect.orElseSucceed(() => false),
-                      )
-                  : false;
-              const result = yield* dispatchNormalizedCommand(normalizedCommand);
-              if (normalizedCommand.type === "thread.archive") {
-                if (shouldStopSessionAfterArchive) {
-                  yield* Effect.gen(function* () {
-                    const stopCommand = yield* normalizeDispatchCommand({
-                      type: "thread.session.stop",
-                      commandId: CommandId.make(
-                        `session-stop-for-archive:${normalizedCommand.commandId}`,
-                      ),
-                      threadId: normalizedCommand.threadId,
-                      createdAt: yield* nowIso,
-                    });
-
-                    yield* dispatchNormalizedCommand(stopCommand);
-                  }).pipe(
-                    Effect.catchCause((cause) =>
-                      Effect.logWarning("failed to stop provider session during archive", {
                         threadId: normalizedCommand.threadId,
-                        cause,
+                        createdAt: yield* nowIso,
+                      });
+
+                      yield* dispatchNormalizedCommand(stopCommand);
+                    }).pipe(
+                      Effect.catchCause((cause) =>
+                        Effect.logWarning("failed to stop provider session during archive", {
+                          threadId: normalizedCommand.threadId,
+                          cause,
+                        }),
+                      ),
+                    );
+                  }
+
+                  yield* terminalManager.close({ threadId: normalizedCommand.threadId }).pipe(
+                    Effect.catch((error) =>
+                      Effect.logWarning("failed to close thread terminals after archive", {
+                        threadId: normalizedCommand.threadId,
+                        error: error.message,
                       }),
                     ),
                   );
                 }
-
-                yield* terminalManager.close({ threadId: normalizedCommand.threadId }).pipe(
-                  Effect.catch((error) =>
-                    Effect.logWarning("failed to close thread terminals after archive", {
-                      threadId: normalizedCommand.threadId,
-                      error: error.message,
-                    }),
-                  ),
-                );
-              }
-              return result;
-            }).pipe(
+                return result;
+              })
+            ).pipe(
               Effect.mapError((cause) =>
                 isOrchestrationDispatchCommandError(cause)
                   ? cause
@@ -1228,64 +1266,98 @@ const makeWsRpcLayer = (
         [ORCHESTRATION_WS_METHODS.subscribeThread]: (input) =>
           observeRpcStreamEffect(
             ORCHESTRATION_WS_METHODS.subscribeThread,
-            Effect.gen(function* () {
-              const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
-                event.aggregateKind === "thread" &&
-                event.aggregateId === input.threadId &&
-                isThreadDetailEvent(event);
+            (() => {
+              const external = getExternalThreadSubscription(input, piExternalSource);
+              if (external !== null) return Effect.succeed(external);
+              return Effect.gen(function* () {
+                const isThisThreadDetailEvent = (event: OrchestrationEvent) =>
+                  event.aggregateKind === "thread" &&
+                  event.aggregateId === input.threadId &&
+                  isThreadDetailEvent(event);
 
-              const liveStream = orchestrationEngine.streamDomainEvents.pipe(
-                Stream.filter(isThisThreadDetailEvent),
-                Stream.map((event) => ({
-                  kind: "event" as const,
-                  event: projectActivityEvent(event),
-                })),
-              );
+                const liveStream = orchestrationEngine.streamDomainEvents.pipe(
+                  Stream.filter(isThisThreadDetailEvent),
+                  Stream.map((event) => ({
+                    kind: "event" as const,
+                    event: projectActivityEvent(event),
+                  })),
+                );
 
-              // Attach live delivery before reading either replay or snapshot state.
-              // Otherwise an event published while the snapshot is loading is lost.
-              const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
-              yield* Effect.forkScoped(
-                liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
-              );
-              const bufferedLiveStream = Stream.fromQueue(liveBuffer);
+                // Attach live delivery before reading either replay or snapshot state.
+                // Otherwise an event published while the snapshot is loading is lost.
+                const liveBuffer = yield* Queue.unbounded<OrchestrationThreadStreamItem>();
+                yield* Effect.forkScoped(
+                  liveStream.pipe(Stream.runForEach((item) => Queue.offer(liveBuffer, item))),
+                );
+                const bufferedLiveStream = Stream.fromQueue(liveBuffer);
 
-              // When the client already loaded the snapshot over HTTP it passes
-              // that snapshot's sequence, and we resume the live subscription by
-              // replaying persisted events after it instead of re-sending the
-              // (potentially multi-KB) snapshot frame over the socket.
-              //
-              // The live PubSub subscription must be attached *before* draining
-              // the catch-up replay, otherwise events published during the replay
-              // window are dropped (they are past the persisted tail the replay
-              // read, but the live stream is not yet subscribed). So fork the
-              // live stream into a buffer bound to this stream's scope, then emit
-              // catch-up followed by the buffered/ongoing live events. Overlapping
-              // events are deduped by sequence on the client.
-              //
-              // Read the full range after the cursor (not the store's default
-              // page-bounded limit): the range is normally tiny (a fresh HTTP
-              // snapshot sequence) and the per-thread filter runs after reading,
-              // so a global cap could otherwise omit this thread's events.
-              if (input.afterSequence !== undefined) {
-                const afterSequence = input.afterSequence;
-                const catchUpStream = orchestrationEngine
-                  .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
+                // When the client already loaded the snapshot over HTTP it passes
+                // that snapshot's sequence, and we resume the live subscription by
+                // replaying persisted events after it instead of re-sending the
+                // (potentially multi-KB) snapshot frame over the socket.
+                //
+                // The live PubSub subscription must be attached *before* draining
+                // the catch-up replay, otherwise events published during the replay
+                // window are dropped (they are past the persisted tail the replay
+                // read, but the live stream is not yet subscribed). So fork the
+                // live stream into a buffer bound to this stream's scope, then emit
+                // catch-up followed by the buffered/ongoing live events. Overlapping
+                // events are deduped by sequence on the client.
+                //
+                // Read the full range after the cursor (not the store's default
+                // page-bounded limit): the range is normally tiny (a fresh HTTP
+                // snapshot sequence) and the per-thread filter runs after reading,
+                // so a global cap could otherwise omit this thread's events.
+                if (input.afterSequence !== undefined) {
+                  const afterSequence = input.afterSequence;
+                  const catchUpStream = orchestrationEngine
+                    .readEvents(afterSequence, Number.MAX_SAFE_INTEGER)
+                    .pipe(
+                      Stream.filter(isThisThreadDetailEvent),
+                      Stream.map((event) => ({
+                        kind: "event" as const,
+                        event: projectActivityEvent(event),
+                      })),
+                      Stream.mapError(
+                        (cause) =>
+                          new OrchestrationGetSnapshotError({
+                            message: `Failed to replay thread ${input.threadId} events`,
+                            cause,
+                          }),
+                      ),
+                    );
+                  const afterCatchUp =
+                    input.requestCompletionMarker === true
+                      ? Stream.concat(
+                          Stream.fromEffect(
+                            Queue.offer(liveBuffer, { kind: "synchronized" as const }),
+                          ).pipe(Stream.drain),
+                          bufferedLiveStream,
+                        )
+                      : bufferedLiveStream;
+                  return Stream.concat(catchUpStream, afterCatchUp);
+                }
+
+                const snapshot = yield* projectionSnapshotQuery
+                  .getThreadDetailSnapshot(input.threadId)
                   .pipe(
-                    Stream.filter(isThisThreadDetailEvent),
-                    Stream.map((event) => ({
-                      kind: "event" as const,
-                      event: projectActivityEvent(event),
-                    })),
-                    Stream.mapError(
+                    Effect.mapError(
                       (cause) =>
                         new OrchestrationGetSnapshotError({
-                          message: `Failed to replay thread ${input.threadId} events`,
+                          message: `Failed to load thread ${input.threadId}`,
                           cause,
                         }),
                     ),
                   );
-                const afterCatchUp =
+
+                if (Option.isNone(snapshot)) {
+                  return yield* new OrchestrationGetSnapshotError({
+                    message: `Thread ${input.threadId} was not found`,
+                    cause: input.threadId,
+                  });
+                }
+
+                const afterSnapshot =
                   input.requestCompletionMarker === true
                     ? Stream.concat(
                         Stream.fromEffect(
@@ -1294,45 +1366,15 @@ const makeWsRpcLayer = (
                         bufferedLiveStream,
                       )
                     : bufferedLiveStream;
-                return Stream.concat(catchUpStream, afterCatchUp);
-              }
-
-              const snapshot = yield* projectionSnapshotQuery
-                .getThreadDetailSnapshot(input.threadId)
-                .pipe(
-                  Effect.mapError(
-                    (cause) =>
-                      new OrchestrationGetSnapshotError({
-                        message: `Failed to load thread ${input.threadId}`,
-                        cause,
-                      }),
-                  ),
+                return Stream.concat(
+                  Stream.make({
+                    kind: "snapshot" as const,
+                    snapshot: projectThreadDetailSnapshot(snapshot.value),
+                  }),
+                  afterSnapshot,
                 );
-
-              if (Option.isNone(snapshot)) {
-                return yield* new OrchestrationGetSnapshotError({
-                  message: `Thread ${input.threadId} was not found`,
-                  cause: input.threadId,
-                });
-              }
-
-              const afterSnapshot =
-                input.requestCompletionMarker === true
-                  ? Stream.concat(
-                      Stream.fromEffect(
-                        Queue.offer(liveBuffer, { kind: "synchronized" as const }),
-                      ).pipe(Stream.drain),
-                      bufferedLiveStream,
-                    )
-                  : bufferedLiveStream;
-              return Stream.concat(
-                Stream.make({
-                  kind: "snapshot" as const,
-                  snapshot: projectThreadDetailSnapshot(snapshot.value),
-                }),
-                afterSnapshot,
-              );
-            }),
+              });
+            })(),
             { "rpc.aggregate": "orchestration" },
           ),
         [WS_METHODS.serverProbe]: (_input) =>

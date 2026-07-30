@@ -62,6 +62,7 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "@t3tools/client-runtime/state/runtime";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import { useLocation, useNavigate, useParams, useRouter } from "@tanstack/react-router";
 import {
   MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
@@ -487,6 +488,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const handleRowDoubleClick = useCallback(
     (event: React.MouseEvent) => {
+      if (!threadAllows(thread, "rename")) return;
       // Already renaming this row: a double-click on the row chrome (outside the
       // input) must not restart and discard the in-progress edit.
       if (renamingThreadKey === threadKey) return;
@@ -501,7 +503,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
       event.preventDefault();
       startThreadRename(threadKey, thread.title);
     },
-    [isMobile, renamingThreadKey, startThreadRename, threadKey, thread.title],
+    [isMobile, renamingThreadKey, startThreadRename, thread, threadKey],
   );
   const handleRowKeyDown = useCallback(
     (event: React.KeyboardEvent) => {
@@ -772,7 +774,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
               isRemoteThread ? "max-sm:min-w-24" : "max-sm:min-w-20"
             }`}
           >
-            {isConfirmingArchive ? (
+            {threadAllows(thread, "archive") && isConfirmingArchive ? (
               <button
                 ref={handleConfirmArchiveRef}
                 type="button"
@@ -785,7 +787,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
               >
                 Confirm
               </button>
-            ) : !isThreadRunning ? (
+            ) : threadAllows(thread, "archive") && !isThreadRunning ? (
               appSettingsConfirmThreadArchive ? (
                 <div className="pointer-events-none absolute top-1/2 right-0.5 -translate-y-1/2 opacity-0 transition-opacity duration-150 max-sm:pointer-events-auto max-sm:opacity-100 group-hover/menu-sub-item:pointer-events-auto group-hover/menu-sub-item:opacity-100 group-focus-within/menu-sub-item:pointer-events-auto group-focus-within/menu-sub-item:opacity-100">
                   <button
@@ -1770,9 +1772,20 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       const hasRunningThread = selectedThreadEntries.some(
         ({ thread }) => thread.session?.status === "running" && thread.session.activeTurnId != null,
       );
+      const canArchiveSelection =
+        selectedThreadEntries.length === count &&
+        selectedThreadEntries.every(({ thread }) => threadAllows(thread, "archive"));
+      const canDeleteSelection =
+        selectedThreadEntries.length === count &&
+        selectedThreadEntries.every(({ thread }) => threadAllows(thread, "delete"));
 
       const clicked = await api.contextMenu.show(
-        buildMultiSelectThreadContextMenuItems({ count, hasRunningThread }),
+        buildMultiSelectThreadContextMenuItems({
+          count,
+          hasRunningThread,
+          canArchiveSelection,
+          canDeleteSelection,
+        }),
         position,
       );
 
@@ -1785,6 +1798,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
 
       if (clicked === "archive") {
+        if (!canArchiveSelection) return;
         if (appSettingsConfirmThreadArchive) {
           const confirmed = await api.dialogs.confirm(
             `Archive ${count} thread${count === 1 ? "" : "s"}?`,
@@ -1825,7 +1839,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
 
-      if (clicked !== "delete") return;
+      if (clicked !== "delete" || !canDeleteSelection) return;
 
       if (appSettingsConfirmThreadDelete) {
         const confirmed = await api.dialogs.confirm(
@@ -1987,6 +2001,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           return null;
         });
       };
+      const thread = sidebarThreadByKeyRef.current.get(threadKey);
+      if (!thread || !threadAllows(thread, "rename")) {
+        finishRename();
+        return;
+      }
 
       const trimmed = newTitle.trim();
       if (trimmed.length === 0) {
@@ -2116,11 +2135,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           ...(thread.branch
             ? [{ id: "new-thread-on-branch", label: `New thread on ${thread.branch}` }]
             : []),
-          { id: "rename", label: "Rename thread" },
+          ...(threadAllows(thread, "rename") ? [{ id: "rename", label: "Rename thread" }] : []),
           { id: "mark-unread", label: "Mark unread" },
           { id: "copy-path", label: "Copy Path" },
           { id: "copy-thread-id", label: "Copy Thread ID" },
-          { id: "delete", label: "Delete", destructive: true, icon: "trash" },
+          ...(threadAllows(thread, "delete")
+            ? [{ id: "delete", label: "Delete", destructive: true, icon: "trash" }]
+            : []),
         ],
         position,
       );
