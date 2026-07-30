@@ -35,12 +35,12 @@ export function mergeEnvironmentThread(
   detail: EnvironmentThread | null,
   shell: EnvironmentThreadShell | null,
 ): EnvironmentThread | null {
-  if (detail === null || shell === null) {
-    return detail;
-  }
+  if (detail === null) return null;
+  if (shell === null) return detail.backing?.kind === "external" ? null : detail;
   if (detail.environmentId !== shell.environmentId || detail.id !== shell.id) {
     return detail;
   }
+  const externalDetail = detail.backing?.kind === "external";
 
   return {
     ...detail,
@@ -53,15 +53,15 @@ export function mergeEnvironmentThread(
     interactionMode: shell.interactionMode,
     branch: shell.branch,
     worktreePath: shell.worktreePath,
-    latestTurn: shell.latestTurn,
+    latestTurn: externalDetail ? detail.latestTurn : shell.latestTurn,
     createdAt: shell.createdAt,
-    updatedAt: shell.updatedAt,
+    updatedAt: externalDetail ? detail.updatedAt : shell.updatedAt,
     archivedAt: shell.archivedAt,
     settledOverride: shell.settledOverride,
-    settledAt: shell.settledAt,
+    settledAt: externalDetail ? detail.settledAt : shell.settledAt,
     snoozedUntil: shell.snoozedUntil,
     snoozedAt: shell.snoozedAt,
-    session: shell.session,
+    session: externalDetail ? detail.session : shell.session,
   };
 }
 

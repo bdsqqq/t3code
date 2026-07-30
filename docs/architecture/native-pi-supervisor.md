@@ -2,9 +2,8 @@
 
 ## status
 
-this document is the target specification. the standalone native pi screens in
-the current feature branch do not match the intended product and must be
-removed.
+implemented as an external-backed thread source. the rejected standalone native
+pi screens and routes have been removed.
 
 ## goal
 
@@ -81,6 +80,7 @@ interface ExternalThreadBacking {
   readonly control: "live" | "resumable" | "readOnly";
   readonly capabilities: {
     readonly send: boolean;
+    readonly attachments: boolean;
     readonly streamingBehaviors: readonly ("steer" | "followUp")[];
     readonly interrupt: boolean;
     readonly stop: boolean;
@@ -95,10 +95,11 @@ interface ExternalThreadBacking {
 }
 ```
 
-capabilities are authoritative. v1 supports send, steer, follow-up, interrupt,
-and supervisor stop when the writer is controlled. rename, archive, delete,
-model changes, runtime-mode changes, interaction-mode changes, and checkpoints
-remain disabled.
+capabilities are authoritative. v1 supports text send, steer, follow-up,
+interrupt, and supervisor stop when the writer is controlled. image attachments
+remain disabled until external jsonl images have an authenticated asset
+resolver. rename, archive, delete, model changes, runtime-mode changes,
+interaction-mode changes, and checkpoints remain disabled.
 
 `thread.turn.start` accepts an optional `streamingBehavior` of `steer` or
 `followUp`. internal threads reject it when unsupported. external routing maps
@@ -115,9 +116,9 @@ chat API. raw `sessionFile` values never cross it.
 
 ## identity
 
-prefer pi's session uuid for thread identity after catalog-wide uniqueness is
-verified. otherwise use an opaque hash of the canonical session path and
-document that moving a file changes identity.
+thread identity is an opaque sha-256 hash of the canonical session path. this
+keeps identity stable when a duplicate session uuid appears or disappears.
+moving a session file changes its thread identity.
 
 derived identities are deterministic:
 
@@ -186,7 +187,7 @@ add `PiExternalThreadSource` with these responsibilities:
 - subscribe to external catalog shells
 - resolve an external thread id
 - read and subscribe to common thread detail
-- create or resume a session
+- create a managed session; catalog-only sessions remain read-only
 - translate common thread commands into supervisor commands
 
 add `ClientThreadRouter` as the single source switch:
@@ -202,11 +203,14 @@ both websocket and http thread bootstrap paths use this router. source routing
 must not differ between initial load and live subscription.
 
 the external source reuses the supervisor's attach-buffer-snapshot sequence.
-subscriptions reconnect with the last applied cursor. a replay gap forces an
-authoritative snapshot.
+v1 external-thread subscriptions force an authoritative snapshot on attach
+because the common numeric cursor does not identify a supervisor runtime
+generation. runtime-local replay remains available inside the supervisor.
 
-resume plus first prompt is one supervisor command and one ledger entry. it
-must not be composed from independently retryable resume and send operations.
+new-session creation and its first prompt currently use separate stable command
+ids. mobile persists both identities before creation, so retry cannot create a
+second session. atomic resume-plus-prompt delivery remains pending before
+catalog-only sessions can become safely resumable.
 
 ## client shell merge
 
@@ -236,8 +240,8 @@ invisible.
 - while pi streams, the normal send action defaults to steer and exposes
   follow-up as an alternative
 - header, context menus, command palette, and keybindings consult capabilities
-- “new native pi session” is a project-plus or command-palette action that
-  navigates directly to the normal chat route
+- “new native pi session” is a command-palette action that navigates directly
+  to the normal chat route
 
 ### mobile
 
@@ -253,18 +257,21 @@ catalog, detail, and control remain authenticated environment rpc.
 
 ## runtime and control mapping
 
-| pi state | common thread state | control |
-| --- | --- | --- |
-| jsonl only | settled, no active session | resume on first send |
-| rpc starting | starting | temporarily disabled |
-| rpc idle | ready | send |
-| rpc streaming | running with active turn | steer, follow-up, interrupt |
-| bridge reconnecting | starting | temporarily disabled |
-| exited | settled/resumable | resume |
-| unbridged tui | read-only | no safe control |
+| pi state            | common thread state        | control                     |
+| ------------------- | -------------------------- | --------------------------- |
+| jsonl only          | settled, no active session | read-only                   |
+| rpc starting        | starting                   | temporarily disabled        |
+| rpc idle            | ready                      | send                        |
+| rpc streaming       | running with active turn   | steer, follow-up, interrupt |
+| bridge reconnecting | starting                   | temporarily disabled        |
+| exited              | settled                    | read-only                   |
+| unbridged tui       | read-only                  | no safe control             |
 
 an unbridged tui cannot provide authoritative liveness or a writer lease.
 reading remains safe; resuming while that process writes does not.
+catalog-only sessions therefore remain read-only in v1. managed sessions stay
+controllable across t3 restarts because the surviving supervisor retains their
+writer lease.
 
 ## idempotency and durability
 
@@ -320,7 +327,7 @@ history.
 
 ### phase 2: managed control
 
-- route create, resume, send, steer, follow-up, interrupt, and stop through
+- route create, send, steer, follow-up, interrupt, and stop through
   common thread commands
 - preserve command ids through web retry and mobile outbox
 - expose capabilities across chat, menus, palette, and keybindings

@@ -1,6 +1,7 @@
 import * as Schema from "effect/Schema";
 
-import { CommandId, NonNegativeInt } from "./baseSchemas.ts";
+import { CommandId, NonNegativeInt, ThreadId } from "./baseSchemas.ts";
+import { OrchestrationProjectShell, OrchestrationThreadShell } from "./orchestration.ts";
 
 export const PiNativeSessionKey = Schema.String.pipe(Schema.brand("PiNativeSessionKey"));
 export type PiNativeSessionKey = typeof PiNativeSessionKey.Type;
@@ -26,7 +27,6 @@ export type PiNativeRuntimeOverlay = typeof PiNativeRuntimeOverlay.Type;
 export const PiNativeRuntimeState = Schema.Struct({
   runtimeId: PiNativeRuntimeId,
   sessionKey: Schema.optional(PiNativeSessionKey),
-  sessionFile: Schema.optional(Schema.String),
   cwd: Schema.optional(Schema.String),
   writerKind: PiNativeWriterKind,
   status: Schema.Literals(["starting", "idle", "streaming", "exited"]),
@@ -38,7 +38,6 @@ export type PiNativeRuntimeState = typeof PiNativeRuntimeState.Type;
 
 export const PiNativeSession = Schema.Struct({
   sessionKey: PiNativeSessionKey,
-  sessionFile: Schema.String,
   sessionId: Schema.String,
   cwd: Schema.String,
   title: Schema.String,
@@ -126,6 +125,41 @@ export const PiNativeStreamItem = Schema.Union([
   }),
 ]);
 export type PiNativeStreamItem = typeof PiNativeStreamItem.Type;
+
+export const PiExternalCatalogSnapshot = Schema.Struct({
+  snapshotSequence: NonNegativeInt,
+  projects: Schema.Array(OrchestrationProjectShell),
+  threads: Schema.Array(OrchestrationThreadShell),
+  omittedProjectCount: NonNegativeInt,
+  omittedThreadCount: NonNegativeInt,
+  updatedAt: Schema.String,
+});
+export type PiExternalCatalogSnapshot = typeof PiExternalCatalogSnapshot.Type;
+
+export const PiExternalCatalogSubscribeInput = Schema.Struct({
+  afterSequence: Schema.optional(NonNegativeInt),
+  requestCompletionMarker: Schema.optional(Schema.Boolean),
+});
+export type PiExternalCatalogSubscribeInput = typeof PiExternalCatalogSubscribeInput.Type;
+export const PiExternalCatalogStreamItem = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("snapshot"),
+    snapshot: PiExternalCatalogSnapshot,
+  }),
+  Schema.Struct({ kind: Schema.Literal("synchronized") }),
+]);
+export type PiExternalCatalogStreamItem = typeof PiExternalCatalogStreamItem.Type;
+
+export const PiExternalCreateSessionInput = Schema.Struct({
+  commandId: CommandId,
+  cwd: Schema.String,
+});
+export type PiExternalCreateSessionInput = typeof PiExternalCreateSessionInput.Type;
+export const PiExternalCreateSessionResult = Schema.Struct({
+  threadId: ThreadId,
+});
+export type PiExternalCreateSessionResult = typeof PiExternalCreateSessionResult.Type;
+
 export class PiNativeError extends Schema.TaggedErrorClass<PiNativeError>()("PiNativeError", {
   code: Schema.String,
   message: Schema.String,

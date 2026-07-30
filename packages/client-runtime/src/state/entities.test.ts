@@ -229,6 +229,65 @@ describe("environment entity projections", () => {
     expect(merged?.messages).toBe(messages);
   });
 
+  it("keeps external detail runtime state authoritative over a stale catalog shell", () => {
+    const detail = {
+      ...THREAD_SHELL,
+      environmentId: ENVIRONMENT_ID,
+      deletedAt: null,
+      messages: [],
+      proposedPlans: [],
+      activities: [],
+      checkpoints: [],
+      session: {
+        threadId: THREAD_ID,
+        status: "running" as const,
+        providerName: "pi",
+        providerInstanceId: ProviderInstanceId.make("pi"),
+        runtimeMode: "full-access" as const,
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: THREAD_SHELL.updatedAt,
+      },
+      backing: {
+        kind: "external" as const,
+        source: "pi" as const,
+        sourceKey: "opaque",
+        control: "live" as const,
+        capabilities: {
+          send: true,
+          attachments: true,
+          streamingBehaviors: ["steer", "followUp"] as const,
+          interrupt: true,
+          stop: true,
+          rename: false,
+          archive: false,
+          delete: false,
+          changeModel: false,
+          changeRuntimeMode: false,
+          changeInteractionMode: false,
+          checkpoints: false,
+        },
+      },
+    } satisfies OrchestrationThread & { readonly environmentId: EnvironmentId };
+    const shell = {
+      ...THREAD_SHELL,
+      environmentId: ENVIRONMENT_ID,
+      session: {
+        threadId: THREAD_ID,
+        status: "ready" as const,
+        providerName: "pi",
+        providerInstanceId: ProviderInstanceId.make("pi"),
+        runtimeMode: "full-access" as const,
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: THREAD_SHELL.updatedAt,
+      },
+    };
+
+    expect(mergeEnvironmentThread(detail, shell)?.session?.status).toBe("running");
+    expect(mergeEnvironmentThread(detail, null)).toBeNull();
+  });
+
   it("preserves untouched project and thread identities across unrelated shell updates", () => {
     const harness = makeHarness();
     const projectRefsAtom = harness.projects.environmentProjectRefsAtom(ENVIRONMENT_ID);

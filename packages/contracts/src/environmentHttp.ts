@@ -298,6 +298,7 @@ const EnvironmentOrchestrationThreadSnapshotErrors = [
 const EnvironmentOrchestrationDispatchErrors = [
   EnvironmentRequestInvalidError,
   EnvironmentScopeRequiredError,
+  EnvironmentResourceNotFoundError,
   EnvironmentInternalError,
 ] as const;
 

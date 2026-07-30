@@ -341,6 +341,43 @@ export const OrchestrationLatestTurn = Schema.Struct({
 });
 export type OrchestrationLatestTurn = typeof OrchestrationLatestTurn.Type;
 
+export const ExternalThreadCapabilities = Schema.Struct({
+  send: Schema.Boolean,
+  attachments: Schema.Boolean,
+  streamingBehaviors: Schema.Array(Schema.Literals(["steer", "followUp"])),
+  interrupt: Schema.Boolean,
+  stop: Schema.Boolean,
+  rename: Schema.Boolean,
+  archive: Schema.Boolean,
+  delete: Schema.Boolean,
+  changeModel: Schema.Boolean,
+  changeRuntimeMode: Schema.Boolean,
+  changeInteractionMode: Schema.Boolean,
+  checkpoints: Schema.Boolean,
+});
+export type ExternalThreadCapabilities = typeof ExternalThreadCapabilities.Type;
+
+export const ExternalThreadBacking = Schema.Struct({
+  kind: Schema.Literal("external"),
+  source: Schema.Literal("pi"),
+  sourceKey: TrimmedNonEmptyString,
+  control: Schema.Literals(["live", "resumable", "readOnly"]),
+  capabilities: ExternalThreadCapabilities,
+});
+export type ExternalThreadBacking = typeof ExternalThreadBacking.Type;
+
+export const ExternalThreadHistoryTruncation = Schema.Struct({
+  truncated: Schema.Boolean,
+  omittedEntryCount: Schema.optional(NonNegativeInt),
+  missingParentId: Schema.optional(TrimmedNonEmptyString),
+});
+export type ExternalThreadHistoryTruncation = typeof ExternalThreadHistoryTruncation.Type;
+export const ExternalThreadPendingComposerIntent = Schema.Struct({
+  behavior: Schema.Literals(["steer", "followUp"]),
+  text: Schema.String,
+});
+export type ExternalThreadPendingComposerIntent = typeof ExternalThreadPendingComposerIntent.Type;
+
 export const OrchestrationThread = Schema.Struct({
   id: ThreadId,
   projectId: ProjectId,
@@ -374,6 +411,10 @@ export const OrchestrationThread = Schema.Struct({
   activities: Schema.Array(OrchestrationThreadActivity),
   checkpoints: Schema.Array(OrchestrationCheckpointSummary),
   session: Schema.NullOr(OrchestrationSession),
+  backing: Schema.optional(ExternalThreadBacking),
+  historyTruncation: Schema.optional(ExternalThreadHistoryTruncation),
+  pendingComposerIntents: Schema.optional(Schema.Array(ExternalThreadPendingComposerIntent)),
+  pendingComposerIntentOmittedCount: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationThread = typeof OrchestrationThread.Type;
 
@@ -423,6 +464,8 @@ export const OrchestrationThreadShell = Schema.Struct({
   hasPendingApprovals: Schema.Boolean,
   hasPendingUserInput: Schema.Boolean,
   hasActionableProposedPlan: Schema.Boolean,
+  backing: Schema.optional(ExternalThreadBacking),
+  pendingComposerIntentCount: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 
@@ -430,6 +473,8 @@ export const OrchestrationShellSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   projects: Schema.Array(OrchestrationProjectShell),
   threads: Schema.Array(OrchestrationThreadShell),
+  externalOmittedProjectCount: Schema.optional(NonNegativeInt),
+  externalOmittedThreadCount: Schema.optional(NonNegativeInt),
   updatedAt: IsoDateTime,
 });
 export type OrchestrationShellSnapshot = typeof OrchestrationShellSnapshot.Type;
@@ -540,10 +585,14 @@ const ProjectDeleteCommand = Schema.Struct({
   force: Schema.optional(Schema.Boolean),
 });
 
+const InternalThreadId = ThreadId.pipe(
+  Schema.refine((threadId): threadId is ThreadId => !threadId.startsWith("external:pi:")),
+);
+
 const ThreadCreateCommand = Schema.Struct({
   type: Schema.Literal("thread.create"),
   commandId: CommandId,
-  threadId: ThreadId,
+  threadId: InternalThreadId,
   projectId: ProjectId,
   title: TrimmedNonEmptyString,
   modelSelection: ModelSelection,
@@ -682,6 +731,7 @@ export const ThreadTurnStartCommand = Schema.Struct({
   ),
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  streamingBehavior: Schema.optional(Schema.Literals(["steer", "followUp"])),
   createdAt: IsoDateTime,
 });
 
@@ -701,6 +751,7 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   interactionMode: ProviderInteractionMode,
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
+  streamingBehavior: Schema.optional(Schema.Literals(["steer", "followUp"])),
   createdAt: IsoDateTime,
 });
 
@@ -1337,6 +1388,7 @@ export type ProjectionPendingApprovalDecision = typeof ProjectionPendingApproval
 
 export const DispatchResult = Schema.Struct({
   sequence: NonNegativeInt,
+  deliveryStatus: Schema.optional(Schema.Literals(["completed", "indeterminate"])),
 });
 export type DispatchResult = typeof DispatchResult.Type;
 
@@ -1393,6 +1445,7 @@ export class OrchestrationGetSnapshotError extends Schema.TaggedErrorClass<Orche
   "OrchestrationGetSnapshotError",
   {
     message: TrimmedNonEmptyString,
+    code: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}
@@ -1401,6 +1454,7 @@ export class OrchestrationDispatchCommandError extends Schema.TaggedErrorClass<O
   "OrchestrationDispatchCommandError",
   {
     message: TrimmedNonEmptyString,
+    code: Schema.optional(Schema.String),
     cause: Schema.optional(Schema.Defect()),
   },
 ) {}

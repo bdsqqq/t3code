@@ -5,9 +5,9 @@ import {
   JsonLineDecoder,
   messageText,
   parseBridgeCommand,
-} from "./t3-control-v1.ts";
+} from "./t3-control-v2.ts";
 
-describe("t3-control-v1 extension protocol", () => {
+describe("t3-control-v2 extension protocol", () => {
   it("extracts exact delivered user text for queue reconciliation", () => {
     expect(
       messageText({

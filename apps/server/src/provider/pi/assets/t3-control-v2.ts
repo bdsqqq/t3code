@@ -4,7 +4,7 @@ import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
-const PROTOCOL = "t3-control-v1";
+const PROTOCOL = "t3-control-v2";
 const SOCKET_PATH = NodePath.join(NodeOS.homedir(), ".pi", "agent", PROTOCOL, "supervisor.sock");
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
 

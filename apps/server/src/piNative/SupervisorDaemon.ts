@@ -8,13 +8,14 @@ import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import type {
-  PiNativeCommandReceipt,
-  PiNativeRuntimeState,
-  PiNativeStreamEvent,
-  PiNativeStreamItem,
-} from "@t3tools/contracts";
+  SupervisorCommandReceipt,
+  SupervisorRuntimeState,
+  SupervisorStreamEvent,
+  SupervisorStreamItem,
+} from "./SupervisorProtocol.ts";
 import {
   JsonLineDecoder,
+  SUPERVISOR_MAX_STREAM_ITEM_BYTES,
   SUPERVISOR_PROTOCOL,
   encodeLine,
   isRecord,
@@ -28,17 +29,24 @@ const { homedir } = NodeOS;
 const path = NodePath;
 type ChildProcessWithoutNullStreams = NodeChildProcess.ChildProcessWithoutNullStreams;
 type Socket = NodeNet.Socket;
+export function decodeRuntimeChunk(decoder: JsonLineDecoder, chunk: string) {
+  try {
+    return { frames: decoder.push(chunk), error: undefined };
+  } catch (error) {
+    return { frames: [] as unknown[], error };
+  }
+}
 const ROOT =
-  process.env.T3_PI_SUPERVISOR_ROOT ?? path.join(homedir(), ".pi", "agent", "t3-control-v1");
+  process.env.T3_PI_SUPERVISOR_ROOT ?? path.join(homedir(), ".pi", "agent", SUPERVISOR_PROTOCOL);
 export const supervisorSocketPath = path.join(ROOT, "supervisor.sock");
 const LEDGER = path.join(ROOT, "commands.json");
 const RING_SIZE = 1_000;
 const EXITED_RETENTION_MS = 60_000;
 const MAX_SOCKET_QUEUE_BYTES = 16 * 1024 * 1024;
-const MAX_STREAM_ITEM_BYTES = 32 * 1024 * 1024;
 const MAX_OVERLAY_BYTES = 8 * 1024 * 1024;
 const MAX_RING_BYTES = 16 * 1024 * 1024;
 const MAX_PENDING_QUEUE_BYTES = 4 * 1024 * 1024;
+const PENDING_QUEUE_ENVELOPE_RESERVE_BYTES = 1_024;
 const SNAPSHOT_ENTRY_LIMIT = 1_000;
 const SNAPSHOT_HEAD_BYTES = 256 * 1024;
 const SNAPSHOT_TAIL_BYTES = 16 * 1024 * 1024;
@@ -48,25 +56,26 @@ type LedgerEntry = {
   hash: string;
   command?: Record<string, unknown>;
   phase?: "queued" | "delivering";
-  receipt: PiNativeCommandReceipt;
+  receipt: SupervisorCommandReceipt;
 };
 type Runtime = {
-  state: PiNativeRuntimeState;
+  state: SupervisorRuntimeState;
   child?: ChildProcessWithoutNullStreams;
   bridge?: Socket;
   bridgeExpiry?: NodeJS.Timeout;
-  ring: PiNativeStreamItem[];
+  ring: SupervisorStreamItem[];
   ringBytes: number;
   ringEvictedThrough: number;
-  overlayEvents: PiNativeStreamEvent[];
+  overlayEvents: SupervisorStreamEvent[];
   overlayBytes: number;
-  pendingQueueEvent?: PiNativeStreamEvent;
+  overlayOmittedCount: number;
+  pendingQueueEvent?: SupervisorStreamEvent;
   sessionReadOffset: number;
   subscribers: Set<{
     socket: Socket;
     requestId: string;
     ready: boolean;
-    buffer: PiNativeStreamItem[];
+    buffer: SupervisorStreamItem[];
     bufferBytes: number;
   }>;
   nextRpcId: number;
@@ -78,7 +87,8 @@ type Runtime = {
 };
 const runtimes = new Map<string, Runtime>();
 const writers = new Map<string, string>();
-const liveCommands = new Map<string, { hash: string; work: Promise<PiNativeCommandReceipt> }>();
+const bridgeRegistrations = new Set<string>();
+const liveCommands = new Map<string, { hash: string; work: Promise<SupervisorCommandReceipt> }>();
 let ledger: Record<string, LedgerEntry> = {};
 let ledgerWrite = Promise.resolve();
 const socketWrites = new WeakMap<
@@ -94,6 +104,32 @@ const canonicalJson = (value: unknown): string => {
       .join(",")}}`;
   return JSON.stringify(value);
 };
+
+export function piRpcSpawnArgs(input: {
+  readonly sessionsRoot: string;
+  readonly sessionFile?: string;
+}): string[] {
+  return [
+    "--mode",
+    "rpc",
+    "--session-dir",
+    input.sessionsRoot,
+    ...(input.sessionFile ? ["--session", input.sessionFile] : []),
+  ];
+}
+export function shouldRestartPersistedSession(
+  command: Record<string, unknown>,
+  receipt: SupervisorCommandReceipt,
+  runtime: SupervisorRuntimeState | undefined,
+): boolean {
+  return (
+    command.type === "start" &&
+    typeof command.sessionFile === "string" &&
+    receipt.status === "completed" &&
+    receipt.runtimeId !== undefined &&
+    (runtime === undefined || runtime.status === "exited")
+  );
+}
 const hashCommand = (command: unknown) =>
   createHash("sha256").update(canonicalJson(command)).digest("hex");
 const atomicLedger = async () => {
@@ -114,7 +150,7 @@ const atomicLedger = async () => {
 const writeBounded = (socket: Socket, value: unknown): boolean => {
   if (socket.destroyed) return false;
   const line = encodeLine(value);
-  if (Buffer.byteLength(line) > MAX_STREAM_ITEM_BYTES) {
+  if (Buffer.byteLength(line) > SUPERVISOR_MAX_STREAM_ITEM_BYTES) {
     socket.destroy(new Error("supervisor stream item exceeds byte limit"));
     return false;
   }
@@ -148,7 +184,7 @@ const writeBounded = (socket: Socket, value: unknown): boolean => {
   }
   return true;
 };
-export const projectReplayItem = (item: PiNativeStreamItem): PiNativeStreamItem => {
+export const projectReplayItem = (item: SupervisorStreamItem): SupervisorStreamItem => {
   if (item.type !== "event" || !isRecord(item.event)) return item;
   const eventType = overlayEventType(item.event);
   if (eventType === "message_update") {
@@ -175,7 +211,7 @@ export const projectReplayItem = (item: PiNativeStreamItem): PiNativeStreamItem 
   }
   return item;
 };
-const emit = (runtime: Runtime, item: PiNativeStreamItem) => {
+const emit = (runtime: Runtime, item: SupervisorStreamItem) => {
   const replayItem = projectReplayItem(item);
   const replayBytes = Buffer.byteLength(JSON.stringify(replayItem));
   runtime.ring.push(replayItem);
@@ -199,8 +235,12 @@ const emit = (runtime: Runtime, item: PiNativeStreamItem) => {
       runtime.subscribers.delete(subscriber);
   }
 };
-const streamItemSequence = (item: PiNativeStreamItem): number =>
+const streamItemSequence = (item: SupervisorStreamItem): number =>
   item.type === "snapshot" ? item.runtime.sequence : item.sequence;
+export const projectListedRuntime = (runtime: SupervisorRuntimeState): SupervisorRuntimeState => {
+  const { state: _state, ...listed } = runtime;
+  return listed;
+};
 export const shouldUseSnapshot = (
   cursor: number | undefined,
   ringEvictedThrough: number,
@@ -215,47 +255,44 @@ const overlayEventType = (payload: unknown): string | undefined => {
   return typeof payload.type === "string" ? payload.type : undefined;
 };
 const encodedBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
-const boundedQueue = (
-  queue: unknown,
-): {
-  values: string[];
-  omitted: number;
-  bytes: number;
-} => {
-  if (!Array.isArray(queue)) return { values: [], omitted: 0, bytes: 0 };
-  const strings = queue.filter((value): value is string => typeof value === "string");
-  const values: string[] = [];
-  let bytes = 0;
-  for (const value of strings) {
-    const next = encodedBytes(value);
-    if (bytes + next > MAX_PENDING_QUEUE_BYTES) break;
-    values.push(value);
-    bytes += next;
-  }
-  return { values, omitted: strings.length - values.length, bytes };
+export const projectQueueValues = (
+  queue: { readonly steering?: unknown; readonly followUp?: unknown },
+  maxBytes = MAX_PENDING_QUEUE_BYTES - PENDING_QUEUE_ENVELOPE_RESERVE_BYTES,
+) => {
+  const allSteering = Array.isArray(queue.steering)
+    ? queue.steering.filter((value): value is string => typeof value === "string")
+    : [];
+  const allFollowUp = Array.isArray(queue.followUp)
+    ? queue.followUp.filter((value): value is string => typeof value === "string")
+    : [];
+  const steering: string[] = [];
+  const followUp: string[] = [];
+  let bytes = encodedBytes({
+    steering,
+    followUp,
+    omittedSteering: allSteering.length,
+    omittedFollowUp: allFollowUp.length,
+  });
+  const append = (target: string[], value: string) => {
+    const addedBytes = encodedBytes(value) + (target.length > 0 ? 1 : 0);
+    if (bytes + addedBytes > maxBytes) return false;
+    target.push(value);
+    bytes += addedBytes;
+    return true;
+  };
+  for (const value of allSteering) if (!append(steering, value)) break;
+  for (const value of allFollowUp) if (!append(followUp, value)) break;
+  return {
+    steering,
+    followUp,
+    omittedSteering: allSteering.length - steering.length,
+    omittedFollowUp: allFollowUp.length - followUp.length,
+  };
 };
 export const projectQueuePayload = (payload: unknown): unknown => {
   if (!isRecord(payload) || overlayEventType(payload) !== "queue_update") return payload;
   const queue = payload.type === "event" && isRecord(payload.data) ? payload.data : payload;
-  const steering = boundedQueue(queue.steering);
-  const followUpBudget = MAX_PENDING_QUEUE_BYTES - steering.bytes;
-  const followUpValues = Array.isArray(queue.followUp)
-    ? queue.followUp.filter((value): value is string => typeof value === "string")
-    : [];
-  const followUp: string[] = [];
-  let followUpBytes = 0;
-  for (const value of followUpValues) {
-    const next = encodedBytes(value);
-    if (followUpBytes + next > followUpBudget) break;
-    followUp.push(value);
-    followUpBytes += next;
-  }
-  const projected = {
-    steering: steering.values,
-    followUp,
-    omittedSteering: steering.omitted,
-    omittedFollowUp: followUpValues.length - followUp.length,
-  };
+  const projected = projectQueueValues(queue);
   return payload.type === "event" ? { ...payload, data: projected } : { ...payload, ...projected };
 };
 export const queuePayloadHasPending = (payload: unknown): boolean =>
@@ -264,6 +301,14 @@ export const queuePayloadHasPending = (payload: unknown): boolean =>
     (Array.isArray(payload.followUp) && payload.followUp.length > 0) ||
     (typeof payload.omittedSteering === "number" && payload.omittedSteering > 0) ||
     (typeof payload.omittedFollowUp === "number" && payload.omittedFollowUp > 0));
+export function reserveBridgeRegistration(sessionFile: string): boolean {
+  if (bridgeRegistrations.has(sessionFile)) return false;
+  bridgeRegistrations.add(sessionFile);
+  return true;
+}
+export function releaseBridgeRegistration(sessionFile: string): void {
+  bridgeRegistrations.delete(sessionFile);
+}
 export const projectOverlayPayload = (payload: unknown, eventType: string | undefined): unknown => {
   if (!isRecord(payload) || eventType !== "message_update") return payload;
   if (payload.type === "event" && isRecord(payload.data) && isRecord(payload.data.update)) {
@@ -273,8 +318,14 @@ export const projectOverlayPayload = (payload: unknown, eventType: string | unde
       data: { ...payload.data, update: partial === undefined ? update : { partial } },
     };
   }
-  const { assistantMessageEvent: _assistantMessageEvent, ...projected } = payload;
-  return projected;
+  if (!isRecord(payload.assistantMessageEvent)) return payload;
+  const partial = payload.assistantMessageEvent.partial;
+  if (partial === undefined) return payload;
+  const { message: _message, ...withoutMessage } = payload;
+  return {
+    ...withoutMessage,
+    assistantMessageEvent: { partial },
+  };
 };
 const eventToolCallId = (payload: unknown): string | undefined => {
   if (!isRecord(payload)) return;
@@ -285,7 +336,7 @@ const eventToolCallId = (payload: unknown): string | undefined => {
 };
 const retainOverlayEvent = (
   runtime: Runtime,
-  item: PiNativeStreamEvent,
+  item: SupervisorStreamEvent,
   eventType: string | undefined,
 ) => {
   if (eventType === "queue_update") {
@@ -300,7 +351,7 @@ const retainOverlayEvent = (
   }
   const projected = { ...item, event: projectOverlayPayload(item.event, eventType) };
   const toolCallId = eventToolCallId(item.event);
-  const replace = (candidate: PiNativeStreamEvent) => {
+  const replace = (candidate: SupervisorStreamEvent) => {
     const candidateType = overlayEventType(candidate.event);
     if (eventType === "message_update") return candidateType === eventType;
     if (eventType === "tool_execution_update" && toolCallId)
@@ -322,18 +373,20 @@ const retainOverlayEvent = (
     const removed = runtime.overlayEvents.shift();
     if (!removed) break;
     runtime.overlayBytes -= Buffer.byteLength(JSON.stringify(removed));
+    runtime.overlayOmittedCount += 1;
   }
 };
 const clearOverlay = (runtime: Runtime, clearPendingQueue = false) => {
   runtime.overlayEvents.length = 0;
   runtime.overlayBytes = 0;
+  runtime.overlayOmittedCount = 0;
   if (clearPendingQueue) delete runtime.pendingQueueEvent;
 };
 const event = (runtime: Runtime, payload: unknown) => {
   payload = projectQueuePayload(payload);
   const sequence = runtime.state.sequence + 1;
   runtime.state = { ...runtime.state, sequence };
-  const item: PiNativeStreamEvent = {
+  const item: SupervisorStreamEvent = {
     type: "event",
     runtimeId: runtime.state.runtimeId,
     sequence,
@@ -343,21 +396,41 @@ const event = (runtime: Runtime, payload: unknown) => {
   retainOverlayEvent(runtime, item, overlayEventType(payload));
   emit(runtime, item);
 };
+export async function publishSettlementInOrder<T>(input: {
+  readonly read: () => Promise<T>;
+  readonly isCurrent: () => boolean;
+  readonly publishReplacement: (value: T) => void;
+  readonly clearOverlay: () => void;
+  readonly publishSynchronized: () => void;
+}): Promise<boolean> {
+  const value = await input.read();
+  if (!input.isCurrent()) return false;
+  input.publishReplacement(value);
+  input.clearOverlay();
+  input.publishSynchronized();
+  return true;
+}
 const publishSettledSnapshot = async (runtime: Runtime, settledSequence: number) => {
-  const appended = await readAppendedEntries(runtime.state.sessionFile, runtime.sessionReadOffset);
-  if (runtime.state.sequence !== settledSequence || runtime.state.status !== "idle") return;
-  runtime.sessionReadOffset = appended.offset;
-  runtime.state = { ...runtime.state, sequence: settledSequence + 1 };
-  emit(runtime, {
-    type: "entries",
-    runtimeId: runtime.state.runtimeId,
-    sequence: runtime.state.sequence,
-    entries: appended.entries,
-  });
-  emit(runtime, {
-    type: "synchronized",
-    runtimeId: runtime.state.runtimeId,
-    sequence: runtime.state.sequence,
+  await publishSettlementInOrder({
+    read: () => readAppendedEntries(runtime.state.sessionFile, runtime.sessionReadOffset),
+    isCurrent: () => runtime.state.sequence === settledSequence && runtime.state.status === "idle",
+    publishReplacement: (appended) => {
+      runtime.sessionReadOffset = appended.offset;
+      runtime.state = { ...runtime.state, sequence: settledSequence + 1 };
+      emit(runtime, {
+        type: "entries",
+        runtimeId: runtime.state.runtimeId,
+        sequence: runtime.state.sequence,
+        entries: appended.entries,
+      });
+    },
+    clearOverlay: () => clearOverlay(runtime, true),
+    publishSynchronized: () =>
+      emit(runtime, {
+        type: "synchronized",
+        runtimeId: runtime.state.runtimeId,
+        sequence: runtime.state.sequence,
+      }),
   });
 };
 const setExited = (runtime: Runtime, exitCode?: number) => {
@@ -418,7 +491,18 @@ const attachRpc = (runtime: Runtime) => {
   runtime.child!.stdin.on("error", rejectPending);
   runtime.child!.stdout.setEncoding("utf8");
   runtime.child!.stdout.on("data", (chunk: string) => {
-    for (const value of decoder.push(chunk)) {
+    const decoded = decodeRuntimeChunk(decoder, chunk);
+    if (decoded.error !== undefined) {
+      rejectPending(
+        decoded.error instanceof Error
+          ? decoded.error
+          : new Error("pi rpc frame exceeded its byte ceiling"),
+      );
+      runtime.child?.kill("SIGTERM");
+      setExited(runtime);
+      return;
+    }
+    for (const value of decoded.frames) {
       if (isRecord(value) && value.type === "response" && typeof value.id === "string") {
         const pending = runtime.pending.get(value.id);
         runtime.pending.delete(value.id);
@@ -461,10 +545,10 @@ const attachRpc = (runtime: Runtime) => {
             ...(eventType ? { lastEventType: eventType } : {}),
           },
         };
-        event(runtime, value);
         if (eventType === "agent_settled") {
-          clearOverlay(runtime, true);
           void publishSettledSnapshot(runtime, runtime.state.sequence);
+        } else {
+          event(runtime, value);
         }
       }
     }
@@ -485,7 +569,12 @@ async function spawnRuntime(command: Record<string, unknown>): Promise<Runtime> 
     typeof command.sessionFile === "string" ? await fs.realpath(command.sessionFile) : undefined;
   if (sessionFile && writers.has(sessionFile)) throw new Error("session already has a writer");
   if (sessionFile) writers.set(sessionFile, runtimeId);
-  const args = ["--mode", "rpc", ...(sessionFile ? ["--session", sessionFile] : [])];
+  const args = piRpcSpawnArgs({
+    sessionsRoot: path.resolve(
+      process.env.T3_PI_SESSIONS_ROOT ?? path.join(homedir(), ".pi", "agent", "sessions"),
+    ),
+    ...(sessionFile ? { sessionFile } : {}),
+  });
   const child = spawn(process.env.T3_PI_EXECUTABLE ?? "pi", args, {
     cwd,
     stdio: ["pipe", "pipe", "pipe"],
@@ -513,6 +602,7 @@ async function spawnRuntime(command: Record<string, unknown>): Promise<Runtime> 
     ringEvictedThrough: -1,
     overlayEvents: [],
     overlayBytes: 0,
+    overlayOmittedCount: 0,
     sessionReadOffset: 0,
     subscribers: new Set(),
     nextRpcId: 0,
@@ -571,10 +661,30 @@ async function stopChild(runtime: Runtime): Promise<void> {
   });
 }
 
-async function execute(command: Record<string, unknown>): Promise<PiNativeCommandReceipt> {
+async function execute(command: Record<string, unknown>): Promise<SupervisorCommandReceipt> {
   const commandId = String(command.commandId);
-  if (command.type === "start" || command.type === "resume") {
+  if (command.type === "start") {
     const runtime = await spawnRuntime(command);
+    return {
+      commandId: commandId as never,
+      status: "completed",
+      runtimeId: runtime.state.runtimeId,
+      result: runtime.state.sessionFile ? { sessionFile: runtime.state.sessionFile } : undefined,
+    };
+  }
+  if (command.type === "resumeAndSend") {
+    const runtime = await spawnRuntime(command);
+    try {
+      await rpc(runtime, "prompt", {
+        message: String(command.message),
+        ...(Array.isArray(command.images) ? { images: command.images } : {}),
+      });
+    } catch (cause) {
+      if (cause instanceof RpcCommandRejectedError) throw cause;
+      throw new IndeterminateCommandError(
+        cause instanceof Error ? cause.message : "pi command outcome is unknown",
+      );
+    }
     return {
       commandId: commandId as never,
       status: "completed",
@@ -641,6 +751,7 @@ async function execute(command: Record<string, unknown>): Promise<PiNativeComman
       typeof command.message === "string"
         ? {
             message: command.message,
+            ...(Array.isArray(command.images) ? { images: command.images } : {}),
             ...(command.type === "send" ? {} : { streamingBehavior: command.type }),
           }
         : {},
@@ -675,7 +786,7 @@ async function execute(command: Record<string, unknown>): Promise<PiNativeComman
   };
   return { commandId: commandId as never, status: "completed", runtimeId: runtime.state.runtimeId };
 }
-async function dispatch(command: Record<string, unknown>): Promise<PiNativeCommandReceipt> {
+async function dispatch(command: Record<string, unknown>): Promise<SupervisorCommandReceipt> {
   const id = String(command.commandId);
   const hash = hashCommand(command);
   const active = liveCommands.get(id);
@@ -683,10 +794,27 @@ async function dispatch(command: Record<string, unknown>): Promise<PiNativeComma
     if (active.hash !== hash) throw new Error("commandId payload conflict");
     return active.work;
   }
-  const prior = ledger[id];
+  let prior = ledger[id];
   if (prior) {
     if (prior.hash !== hash) throw new Error("commandId payload conflict");
-    if (prior.receipt.status !== "started") return prior.receipt;
+    if (prior.receipt.status !== "started") {
+      if (
+        !shouldRestartPersistedSession(
+          command,
+          prior.receipt,
+          prior.receipt.runtimeId === undefined
+            ? undefined
+            : runtimes.get(prior.receipt.runtimeId)?.state,
+        )
+      ) {
+        return prior.receipt;
+      }
+      delete ledger[id];
+      await atomicLedger();
+      prior = undefined;
+    }
+  }
+  if (prior) {
     if (prior.phase !== "queued" || !prior.command)
       return { ...prior.receipt, status: "indeterminate" };
     command = prior.command;
@@ -756,113 +884,123 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
     );
     return;
   }
-  const firstLine = await readSessionHeaderLine(sessionFile);
-  let header: unknown;
+  if (!reserveBridgeRegistration(sessionFile)) {
+    socket.end(encodeLine({ type: "error", error: "session registration is already in progress" }));
+    return;
+  }
   try {
-    header = JSON.parse(firstLine ?? "");
-  } catch {
-    header = undefined;
-  }
-  if (
-    !isRecord(header) ||
-    header.type !== "session" ||
-    header.id !== sessionId ||
-    typeof header.cwd !== "string" ||
-    header.cwd !== frame.cwd
-  ) {
-    socket.end(
-      encodeLine({ type: "error", error: "bridge session header does not match registration" }),
-    );
-    return;
-  }
-  if (socket.destroyed) return;
-  const writerId = writers.get(sessionFile);
-  const existing = writerId ? runtimes.get(writerId) : undefined;
-  if (
-    writerId &&
-    (!existing ||
-      existing.state.writerKind !== "tuiBridge" ||
-      existing.bridge !== undefined ||
-      !isRecord(existing.state.state) ||
-      existing.state.state.sessionId !== sessionId)
-  ) {
-    socket.end(encodeLine({ type: "error", error: "session already has a writer" }));
-    return;
-  }
-  const runtime: Runtime =
-    existing ??
-    ({
-      state: {
-        runtimeId: randomUUID() as never,
-        sessionFile,
-        cwd: String(frame.cwd),
-        writerKind: "tuiBridge",
-        status: "idle",
-        sequence: 0,
-        overlay: { isStreaming: false, pendingMessageCount: 0 },
-        state: { sessionId, cwd: frame.cwd, pid: frame.pid },
+    const firstLine = await readSessionHeaderLine(sessionFile);
+    let header: unknown;
+    try {
+      header = JSON.parse(firstLine ?? "");
+    } catch {
+      header = undefined;
+    }
+    if (
+      !isRecord(header) ||
+      header.type !== "session" ||
+      header.id !== sessionId ||
+      typeof header.cwd !== "string" ||
+      header.cwd !== frame.cwd
+    ) {
+      socket.end(
+        encodeLine({ type: "error", error: "bridge session header does not match registration" }),
+      );
+      return;
+    }
+    if (socket.destroyed) return;
+    const writerId = writers.get(sessionFile);
+    const existing = writerId ? runtimes.get(writerId) : undefined;
+    if (
+      writerId &&
+      (!existing ||
+        existing.state.writerKind !== "tuiBridge" ||
+        existing.bridge !== undefined ||
+        !isRecord(existing.state.state) ||
+        existing.state.state.sessionId !== sessionId)
+    ) {
+      socket.end(encodeLine({ type: "error", error: "session already has a writer" }));
+      return;
+    }
+    const runtime: Runtime =
+      existing ??
+      ({
+        state: {
+          runtimeId: randomUUID() as never,
+          sessionFile,
+          cwd: String(frame.cwd),
+          writerKind: "tuiBridge",
+          status: "idle",
+          sequence: 0,
+          overlay: { isStreaming: false, pendingMessageCount: 0 },
+          state: { sessionId, cwd: frame.cwd, pid: frame.pid },
+        },
+        ring: [],
+        ringBytes: 0,
+        ringEvictedThrough: -1,
+        overlayEvents: [],
+        overlayBytes: 0,
+        overlayOmittedCount: 0,
+        sessionReadOffset: (await readSessionFile(sessionFile)).offset,
+        subscribers: new Set(),
+        nextRpcId: 0,
+        pending: new Map(),
+        bridgePending: new Map(),
+      } satisfies Runtime);
+    if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
+    delete runtime.bridgeExpiry;
+    runtime.bridge = socket;
+    const bridgeIsStreaming =
+      typeof frame.isStreaming === "boolean"
+        ? frame.isStreaming
+        : runtime.state.overlay?.isStreaming === true;
+    const steering = Array.isArray(frame.steering)
+      ? frame.steering.filter((value): value is string => typeof value === "string")
+      : [];
+    const followUp = Array.isArray(frame.followUp)
+      ? frame.followUp.filter((value): value is string => typeof value === "string")
+      : [];
+    runtime.state = {
+      ...runtime.state,
+      status: bridgeIsStreaming ? "streaming" : "idle",
+      overlay: {
+        ...(runtime.state.overlay ?? { pendingMessageCount: 0 }),
+        isStreaming: bridgeIsStreaming,
+        pendingMessageCount: steering.length + followUp.length,
+        lastEventType: existing ? "bridge_reconnected" : "bridge_registered",
       },
-      ring: [],
-      ringBytes: 0,
-      ringEvictedThrough: -1,
-      overlayEvents: [],
-      overlayBytes: 0,
-      sessionReadOffset: (await readSessionFile(sessionFile)).offset,
-      subscribers: new Set(),
-      nextRpcId: 0,
-      pending: new Map(),
-      bridgePending: new Map(),
-    } satisfies Runtime);
-  if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
-  delete runtime.bridgeExpiry;
-  runtime.bridge = socket;
-  const bridgeIsStreaming =
-    typeof frame.isStreaming === "boolean"
-      ? frame.isStreaming
-      : runtime.state.overlay?.isStreaming === true;
-  const steering = Array.isArray(frame.steering)
-    ? frame.steering.filter((value): value is string => typeof value === "string")
-    : [];
-  const followUp = Array.isArray(frame.followUp)
-    ? frame.followUp.filter((value): value is string => typeof value === "string")
-    : [];
-  runtime.state = {
-    ...runtime.state,
-    status: bridgeIsStreaming ? "streaming" : "idle",
-    overlay: {
-      ...(runtime.state.overlay ?? { pendingMessageCount: 0 }),
-      isStreaming: bridgeIsStreaming,
-      pendingMessageCount: steering.length + followUp.length,
-      lastEventType: existing ? "bridge_reconnected" : "bridge_registered",
-    },
-    state: { sessionId, cwd: frame.cwd, pid: frame.pid },
-    cwd: String(frame.cwd),
-  };
-  runtimes.set(runtime.state.runtimeId, runtime);
-  writers.set(sessionFile, runtime.state.runtimeId);
-  event(runtime, {
-    type: "event",
-    event: "queue_update",
-    data: { steering, followUp },
-  });
-  if (existing) event(runtime, { type: "bridge_reconnected", isStreaming: bridgeIsStreaming });
-  if (existing && !bridgeIsStreaming) void publishSettledSnapshot(runtime, runtime.state.sequence);
-  const cleanup = () => {
-    if (runtime.state.status === "exited" || runtime.bridge !== socket) return;
-    delete runtime.bridge;
-    for (const pending of runtime.bridgePending.values())
-      pending({ status: "indeterminate", error: "bridge disconnected" });
-    runtime.bridgePending.clear();
-    runtime.state = { ...runtime.state, status: "starting" };
-    event(runtime, { type: "bridge_disconnected" });
-    runtime.bridgeExpiry = setTimeout(() => {
-      delete runtime.bridgeExpiry;
-      if (!runtime.bridge) setExited(runtime);
-    }, 30_000);
-    runtime.bridgeExpiry.unref();
-  };
-  socket.once("close", cleanup);
-  socket.once("error", cleanup);
+      state: { sessionId, cwd: frame.cwd, pid: frame.pid },
+      cwd: String(frame.cwd),
+    };
+    runtimes.set(runtime.state.runtimeId, runtime);
+    writers.set(sessionFile, runtime.state.runtimeId);
+    event(runtime, {
+      type: "event",
+      event: "queue_update",
+      data: { steering, followUp },
+    });
+    if (existing) event(runtime, { type: "bridge_reconnected", isStreaming: bridgeIsStreaming });
+    if (existing && !bridgeIsStreaming)
+      void publishSettledSnapshot(runtime, runtime.state.sequence);
+    const cleanup = () => {
+      if (runtime.state.status === "exited" || runtime.bridge !== socket) return;
+      delete runtime.bridge;
+      for (const pending of runtime.bridgePending.values())
+        pending({ status: "indeterminate", error: "bridge disconnected" });
+      runtime.bridgePending.clear();
+      runtime.state = { ...runtime.state, status: "starting" };
+      event(runtime, { type: "bridge_disconnected" });
+      runtime.bridgeExpiry = setTimeout(() => {
+        delete runtime.bridgeExpiry;
+        if (!runtime.bridge) setExited(runtime);
+      }, 30_000);
+      runtime.bridgeExpiry.unref();
+    };
+    socket.once("close", cleanup);
+    socket.once("error", cleanup);
+  } finally {
+    releaseBridgeRegistration(sessionFile);
+  }
 }
 function parseSessionEntries(text: string): ReadonlyArray<Record<string, unknown>> {
   return text
@@ -942,21 +1080,33 @@ async function readAppendedEntries(sessionFile: string | undefined, offset: numb
     await handle?.close();
   }
 }
+export async function createSupervisorLockFile(lockPath: string, pid: number): Promise<boolean> {
+  const candidate = `${lockPath}.candidate-${pid}-${randomUUID()}`;
+  const handle = await fs.open(candidate, "wx", 0o600);
+  try {
+    await handle.writeFile(String(pid));
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  try {
+    await fs.link(candidate, lockPath);
+    return true;
+  } catch (cause) {
+    if (cause instanceof Error && "code" in cause && cause.code === "EEXIST") return false;
+    throw cause;
+  } finally {
+    await fs.rm(candidate, { force: true });
+  }
+}
 
 export async function runSupervisorDaemon(): Promise<never> {
   await fs.mkdir(ROOT, { recursive: true, mode: 0o700 });
   await fs.chmod(ROOT, 0o700);
-  try {
-    ledger = JSON.parse(await fs.readFile(LEDGER, "utf8")) as typeof ledger;
-  } catch {
-    ledger = {};
-  }
   const lockPath = path.join(ROOT, "supervisor.lock");
-  let lock: NodeFS.promises.FileHandle;
-  try {
-    lock = await fs.open(lockPath, "wx", 0o600);
-  } catch {
-    const ownerPid = Number.parseInt(await fs.readFile(lockPath, "utf8").catch(() => ""), 10);
+  while (!(await createSupervisorLockFile(lockPath, process.pid))) {
+    const ownerText = await fs.readFile(lockPath, "utf8").catch(() => "");
+    const ownerPid = Number.parseInt(ownerText, 10);
     if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
       try {
         process.kill(ownerPid, 0);
@@ -978,12 +1128,40 @@ export async function runSupervisorDaemon(): Promise<never> {
       if (!live) await new Promise((resolve) => setTimeout(resolve, 50));
     }
     if (live) throw new Error("pi supervisor already running");
-    await fs.rm(lockPath, { force: true });
-    await fs.rm(supervisorSocketPath, { force: true });
-    lock = await fs.open(lockPath, "wx", 0o600);
+    const staleClaim = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+    try {
+      await fs.rename(lockPath, staleClaim);
+    } catch (cause) {
+      if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") continue;
+      throw cause;
+    }
+    const claimedOwner = await fs.readFile(staleClaim, "utf8").catch(() => "");
+    if (claimedOwner !== ownerText) {
+      await fs.link(staleClaim, lockPath).catch(() => undefined);
+      await fs.rm(staleClaim, { force: true });
+      throw new Error("pi supervisor already running");
+    }
+    await fs.rm(staleClaim, { force: true });
   }
-  await lock.writeFile(String(process.pid));
-  await lock.sync();
+  try {
+    ledger = JSON.parse(await fs.readFile(LEDGER, "utf8")) as typeof ledger;
+  } catch {
+    ledger = {};
+  }
+  let recoveredIndeterminate = false;
+  for (const [commandId, entry] of Object.entries(ledger)) {
+    if (entry.receipt.status !== "started" || entry.phase !== "delivering") continue;
+    ledger[commandId] = {
+      hash: entry.hash,
+      receipt: {
+        commandId: commandId as never,
+        status: "indeterminate",
+        error: "supervisor restarted after command delivery began",
+      },
+    };
+    recoveredIndeterminate = true;
+  }
+  if (recoveredIndeterminate) await atomicLedger();
   await fs.rm(supervisorSocketPath, { force: true });
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
@@ -997,26 +1175,29 @@ export async function runSupervisorDaemon(): Promise<never> {
           if (subscriber.socket === socket) runtime.subscribers.delete(subscriber);
     });
     socket.on("data", (chunk: string) => {
-      for (const value of decoder.push(chunk))
-        handling = handling.then(
-          () =>
-            handleFrame(socket, value).catch((cause) => {
-              writeBounded(socket, {
-                type: "error",
-                error: cause instanceof Error ? cause.message : String(cause),
-              });
-            }),
-          () => {
-            socket.destroy();
-          },
-        );
+      try {
+        for (const value of decoder.push(chunk))
+          handling = handling.then(
+            () =>
+              handleFrame(socket, value).catch((cause) => {
+                writeBounded(socket, {
+                  type: "error",
+                  error: cause instanceof Error ? cause.message : String(cause),
+                });
+              }),
+            () => {
+              socket.destroy();
+            },
+          );
+      } catch {
+        socket.destroy();
+      }
     });
   });
   await new Promise<void>((resolve, reject) =>
     server.listen(supervisorSocketPath, resolve).once("error", reject),
   );
   await fs.chmod(supervisorSocketPath, 0o600);
-  void lock;
   return await new Promise<never>(() => {});
 }
 
@@ -1064,10 +1245,10 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
               ? "idle"
               : bridged.state.status,
       };
-      event(bridged, value);
       if (value.event === "agent_settled") {
-        clearOverlay(bridged, true);
         void publishSettledSnapshot(bridged, bridged.state.sequence);
+      } else {
+        event(bridged, value);
       }
     }
     return;
@@ -1087,51 +1268,48 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
   }
   if (value.type !== "request" || typeof value.requestId !== "string") return;
   try {
-    if (value.method === "list")
-      socket.write(
-        encodeLine({
-          type: "response",
-          requestId: value.requestId,
-          ok: true,
-          result: [...runtimes.values()].map((runtime) => runtime.state),
-        }),
-      );
-    else if (value.method === "dispatch" && isRecord(value.command))
-      socket.write(
-        encodeLine({
-          type: "response",
-          requestId: value.requestId,
-          ok: true,
-          result: await dispatch(value.command),
-        }),
-      );
-    else if (value.method === "subscribe" && typeof value.runtimeId === "string") {
+    if (value.method === "list") {
+      writeBounded(socket, {
+        type: "response",
+        requestId: value.requestId,
+        ok: true,
+        result: [...runtimes.values()].map((runtime) => projectListedRuntime(runtime.state)),
+      });
+    } else if (value.method === "dispatch" && isRecord(value.command)) {
+      writeBounded(socket, {
+        type: "response",
+        requestId: value.requestId,
+        ok: true,
+        result: await dispatch(value.command),
+      });
+    } else if (value.method === "subscribe" && typeof value.runtimeId === "string") {
       const runtime = runtimes.get(value.runtimeId);
       if (!runtime) throw new Error("unknown runtime");
       const subscriber = {
         socket,
         requestId: value.requestId,
         ready: false,
-        buffer: [] as PiNativeStreamItem[],
+        buffer: [] as SupervisorStreamItem[],
         bufferBytes: 0,
       };
       runtime.subscribers.add(subscriber);
       const cursor = typeof value.cursor === "number" ? value.cursor : undefined;
       const oldest = runtime.ring[0];
-      const snapshotState = runtime.state;
-      const snapshotOverlayEvents = [
-        ...runtime.overlayEvents,
-        ...(runtime.pendingQueueEvent ? [runtime.pendingQueueEvent] : []),
-      ]
-        .filter((item) => item.sequence <= snapshotState.sequence)
-        .sort((a, b) => a.sequence - b.sequence);
       const needsSnapshot = shouldUseSnapshot(
         cursor,
         runtime.ringEvictedThrough,
         oldest ? streamItemSequence(oldest) : undefined,
       );
+      let snapshotState: SupervisorRuntimeState;
       if (needsSnapshot) {
-        const snapshot = await readSessionFile(snapshotState.sessionFile);
+        snapshotState = projectListedRuntime(runtime.state);
+        const snapshotOverlayEvents = [
+          ...runtime.overlayEvents,
+          ...(runtime.pendingQueueEvent ? [runtime.pendingQueueEvent] : []),
+        ]
+          .filter((item) => item.sequence <= snapshotState.sequence)
+          .sort((a, b) => a.sequence - b.sequence);
+        const snapshot = await readSessionFile(runtime.state.sessionFile);
         const entries = snapshot.entries;
         const boundedEntries =
           entries.length <= SNAPSHOT_ENTRY_LIMIT
@@ -1146,11 +1324,13 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
               runtime: snapshotState,
               entries: boundedEntries,
               events: snapshotOverlayEvents,
+              omittedOverlayEventCount: runtime.overlayOmittedCount,
             },
           })
         )
           return;
       } else {
+        snapshotState = runtime.state;
         const replayCursor = cursor ?? -1;
         for (const item of runtime.ring) {
           const itemSequence = streamItemSequence(item);
@@ -1184,8 +1364,11 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
       });
     }
   } catch (cause) {
-    socket.write(
-      encodeLine({ type: "response", requestId: value.requestId, ok: false, error: String(cause) }),
-    );
+    writeBounded(socket, {
+      type: "response",
+      requestId: value.requestId,
+      ok: false,
+      error: String(cause),
+    });
   }
 }

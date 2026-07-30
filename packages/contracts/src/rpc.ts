@@ -145,14 +145,11 @@ import {
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
 import {
-  PiNativeCommand,
-  PiNativeCommandReceipt,
+  PiExternalCatalogStreamItem,
+  PiExternalCatalogSubscribeInput,
+  PiExternalCreateSessionInput,
+  PiExternalCreateSessionResult,
   PiNativeError,
-  PiNativeListResult,
-  PiNativeReadInput,
-  PiNativeReadResult,
-  PiNativeSubscribeInput,
-  PiNativeStreamItem,
 } from "./piNative.ts";
 
 export const WS_METHODS = {
@@ -236,11 +233,9 @@ export const WS_METHODS = {
   sourceControlCloneRepository: "sourceControl.cloneRepository",
   sourceControlPublishRepository: "sourceControl.publishRepository",
 
-  // Native pi control
-  piNativeList: "piNative.list",
-  piNativeRead: "piNative.read",
-  piNativeDispatch: "piNative.dispatch",
-  piNativeSubscribe: "piNative.subscribe",
+  // External-backed pi threads
+  piExternalSubscribeCatalog: "piExternal.subscribeCatalog",
+  piExternalCreateSession: "piExternal.createSession",
 
   // Streaming subscriptions
   subscribeVcsStatus: "subscribeVcsStatus",
@@ -706,33 +701,21 @@ export const WsSubscribeAuthAccessRpc = Rpc.make(WS_METHODS.subscribeAuthAccess,
   stream: true,
 });
 
-export const WsPiNativeListRpc = Rpc.make(WS_METHODS.piNativeList, {
-  payload: Schema.Struct({}),
-  success: PiNativeListResult,
+export const WsPiExternalCreateSessionRpc = Rpc.make(WS_METHODS.piExternalCreateSession, {
+  payload: PiExternalCreateSessionInput,
+  success: PiExternalCreateSessionResult,
   error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
 });
-export const WsPiNativeReadRpc = Rpc.make(WS_METHODS.piNativeRead, {
-  payload: PiNativeReadInput,
-  success: PiNativeReadResult,
-  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
-});
-export const WsPiNativeDispatchRpc = Rpc.make(WS_METHODS.piNativeDispatch, {
-  payload: PiNativeCommand,
-  success: PiNativeCommandReceipt,
-  error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
-});
-export const WsPiNativeSubscribeRpc = Rpc.make(WS_METHODS.piNativeSubscribe, {
-  payload: PiNativeSubscribeInput,
-  success: PiNativeStreamItem,
+export const WsPiExternalSubscribeCatalogRpc = Rpc.make(WS_METHODS.piExternalSubscribeCatalog, {
+  payload: PiExternalCatalogSubscribeInput,
+  success: PiExternalCatalogStreamItem,
   error: Schema.Union([PiNativeError, EnvironmentAuthorizationError]),
   stream: true,
 });
 
 export const WsRpcGroup = RpcGroup.make(
-  WsPiNativeListRpc,
-  WsPiNativeReadRpc,
-  WsPiNativeDispatchRpc,
-  WsPiNativeSubscribeRpc,
+  WsPiExternalCreateSessionRpc,
+  WsPiExternalSubscribeCatalogRpc,
   WsServerProbeRpc,
   WsServerGetConfigRpc,
   WsServerRefreshProvidersRpc,

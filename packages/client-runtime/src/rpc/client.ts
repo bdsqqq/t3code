@@ -52,7 +52,7 @@ export type EnvironmentSubscriptionRpcTag =
   | typeof WS_METHODS.previewAutomationConnect
   | typeof WS_METHODS.subscribeVcsStatus
   | typeof WS_METHODS.terminalAttach
-  | typeof WS_METHODS.piNativeSubscribe;
+  | typeof WS_METHODS.piExternalSubscribeCatalog;
 
 export type EnvironmentStreamCommandRpcTag =
   | typeof WS_METHODS.cloudInstallRelayClient

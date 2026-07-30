@@ -37,7 +37,16 @@ describe("SessionCatalog", () => {
           const catalog = makeSessionCatalog({ root });
           const listed = yield* catalog.list();
           expect(listed[0]?.title).toBe("hello");
-          expect((yield* catalog.read(listed[0]!.sessionKey)).entries).toHaveLength(2);
+          expect((yield* catalog.read(listed[0]!.threadId)).entries).toHaveLength(2);
+          const originalThreadId = listed[0]!.threadId;
+          yield* Effect.tryPromise(() =>
+            NodeFS.promises.copyFile(file, NodePath.join(root, "nested", "copy.jsonl")),
+          );
+          const relisted = yield* catalog.list();
+          const canonicalFile = yield* Effect.tryPromise(() => NodeFS.promises.realpath(file));
+          expect(relisted.find((record) => record.canonicalFile === canonicalFile)?.threadId).toBe(
+            originalThreadId,
+          );
           const after = yield* Effect.tryPromise(async () => ({
             hash: await digest(file),
             stat: await NodeFS.promises.stat(file),
