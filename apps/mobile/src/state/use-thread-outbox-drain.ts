@@ -23,6 +23,7 @@ import { randomHex } from "../lib/uuid";
 import { appAtomRegistry } from "./atom-registry";
 import { useProjects, useThreadShells } from "./entities";
 import {
+  confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
   markThreadOutboxMessageIndeterminateInMemory,
   removeThreadOutboxMessage,
@@ -41,7 +42,7 @@ import {
   type QueuedThreadMessage,
   type ThreadOutboxCommandStage,
 } from "./thread-outbox-model";
-import { threadEnvironment } from "./threads";
+import { environmentThreadShells, threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
 import {
   editingQueuedMessageIdsAtom,
@@ -424,16 +425,50 @@ export function useThreadOutboxDrain(): void {
             return false;
           },
         );
+      const deliverPersistedMessage = () => {
+        if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[nextQueuedMessage.messageId]) {
+          return true;
+        }
+        const freshThread = findThread(
+          appAtomRegistry.get(environmentThreadShells.threadShellsAtom),
+          nextQueuedMessage,
+        );
+        const freshThreadBusy =
+          freshThread?.session?.status === "starting" ||
+          (freshThread?.session?.status === "running" &&
+            !(
+              nextQueuedMessage.streamingBehavior !== undefined &&
+              threadAllows(freshThread, nextQueuedMessage.streamingBehavior)
+            ));
+        const freshThreadBlocked =
+          freshThread !== undefined &&
+          queuedMessageBlockedByCapabilities(nextQueuedMessage, freshThread);
+        if (
+          deliveryAction === "send" &&
+          creation === undefined &&
+          (freshThreadBusy || freshThreadBlocked)
+        ) {
+          return true;
+        }
+        return deliveryAction === "remove"
+          ? removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")
+          : creation !== undefined
+            ? creationProjectCwd !== null
+              ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
+              : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
+            : freshThread !== undefined
+              ? sendQueuedMessage(nextQueuedMessage, freshThread)
+              : Promise.resolve(false);
+      };
       const delivery = indeterminatePersistenceRef.current.has(nextQueuedMessage.messageId)
         ? updateThreadOutboxMessage({
             ...nextQueuedMessage,
             deliveryStatus: "indeterminate",
           }).then(
             (updated) => {
-              if (updated) {
-                indeterminatePersistenceRef.current.delete(nextQueuedMessage.messageId);
-              }
-              return updated;
+              if (!updated) return false;
+              indeterminatePersistenceRef.current.delete(nextQueuedMessage.messageId);
+              return deliverPersistedMessage();
             },
             (error) => {
               console.warn("[thread-outbox] failed to retry indeterminate persistence", {
@@ -445,15 +480,9 @@ export function useThreadOutboxDrain(): void {
               return false;
             },
           )
-        : deliveryAction === "remove"
-          ? removeQueuedMessage("[thread-outbox] failed to remove message for a missing thread")
-          : creation !== undefined
-            ? creationProjectCwd !== null
-              ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
-              : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
-            : thread !== undefined
-              ? sendQueuedMessage(nextQueuedMessage, thread)
-              : Promise.resolve(false);
+        : confirmThreadOutboxMessageQueued(nextQueuedMessage).then((queued) =>
+            queued ? deliverPersistedMessage() : true,
+          );
       void delivery
         .then((sent) => {
           if (sent) {

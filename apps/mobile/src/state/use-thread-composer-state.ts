@@ -31,6 +31,7 @@ import {
   composerDraftsAtom,
   ensureComposerDraftsLoaded,
   getComposerDraftSnapshot,
+  mergeComposerDraftContent,
   removeComposerDraftAttachment,
   setComposerDraftText,
   updateComposerDraftSettings,
@@ -186,28 +187,28 @@ export function useThreadComposerState() {
       if (streamingBehavior !== undefined && !threadAllows(thread, streamingBehavior)) {
         return null;
       }
-      try {
-        await enqueueThreadOutboxMessage({
-          environmentId: selectedThreadShell.environmentId,
-          threadId: selectedThreadShell.id,
-          messageId,
-          commandId: CommandId.make(metadata.commandId),
-          text,
-          attachments,
-          modelSelection: draft.modelSelection ?? thread.modelSelection,
-          runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-          interactionMode: draft.interactionMode ?? thread.interactionMode,
-          ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
-          createdAt: metadata.createdAt,
-        });
-        clearComposerDraftContent(threadKey);
-        return messageId;
-      } catch (error) {
+      const enqueuePromise = enqueueThreadOutboxMessage({
+        environmentId: selectedThreadShell.environmentId,
+        threadId: selectedThreadShell.id,
+        messageId,
+        commandId: CommandId.make(metadata.commandId),
+        text,
+        attachments,
+        modelSelection: draft.modelSelection ?? thread.modelSelection,
+        runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
+        interactionMode: draft.interactionMode ?? thread.interactionMode,
+        ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
+        createdAt: metadata.createdAt,
+      });
+      clearComposerDraftContent(threadKey);
+      enqueuePromise.catch((error: unknown) => {
+        void mergeComposerDraftContent(threadKey, { text, attachments: [] });
+        appendComposerDraftAttachments(threadKey, attachments);
         setPendingConnectionError(
           error instanceof Error ? error.message : "Failed to save the queued message.",
         );
-        return null;
-      }
+      });
+      return messageId;
     },
     [selectedThreadDetail, selectedThreadShell],
   );
