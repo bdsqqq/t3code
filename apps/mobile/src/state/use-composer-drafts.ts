@@ -453,6 +453,7 @@ export async function persistComposerDraftNativePiStartIdentity(
 export function clearComposerDraftContentState(
   current: Record<string, ComposerDraft>,
   draftKey: string,
+  options?: { readonly clearWorkspaceSelection?: boolean },
 ): Record<string, ComposerDraft> {
   const existing = current[draftKey];
   if (!existing) {
@@ -461,10 +462,14 @@ export function clearComposerDraftContentState(
   const {
     importedShareIds: _importedShareIds,
     nativePiStartIdentity: _nativePiStartIdentity,
+    workspaceSelection,
     ...retained
   } = existing;
   const draft = {
     ...retained,
+    ...(options?.clearWorkspaceSelection || workspaceSelection === undefined
+      ? {}
+      : { workspaceSelection }),
     text: "",
     attachments: [],
   };
@@ -611,8 +616,11 @@ export async function restoreComposerDraftSnapshot(
   await persistenceQueue.run(() => writePersistedComposerDrafts(next));
 }
 
-export function clearComposerDraftContent(draftKey: string): void {
-  updateComposerDrafts((current) => clearComposerDraftContentState(current, draftKey));
+export function clearComposerDraftContent(
+  draftKey: string,
+  options?: { readonly clearWorkspaceSelection?: boolean },
+): void {
+  updateComposerDrafts((current) => clearComposerDraftContentState(current, draftKey, options));
 }
 
 export function clearComposerDraft(draftKey: string): void {

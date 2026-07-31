@@ -534,14 +534,14 @@ export const ThreadComposer = memo(function ThreadComposer(props: ThreadComposer
       const threadKey = scopedThreadKey(props.environmentId, props.selectedThread.id);
       if (inFlightThreadIdsRef.current.has(threadKey)) return;
       inFlightThreadIdsRef.current.add(threadKey);
-      // Sending a prompt starts agent work: arm the lock-screen card now, while
-      // the app is foregrounded and the activity token can be registered.
-      armAgentAwarenessLiveActivityForLocalWork({
-        threadTitle: props.selectedThread.title,
-        projectTitle: props.environmentLabel ?? "T3 Code",
-      });
       try {
         await onSendMessage(behavior);
+        // Arm after enqueue so preference I/O and native Activity startup do
+        // not contend with queued-message feedback on the tap frame.
+        armAgentAwarenessLiveActivityForLocalWork({
+          threadTitle: props.selectedThread.title,
+          projectTitle: props.environmentLabel ?? "T3 Code",
+        });
       } finally {
         inFlightThreadIdsRef.current.delete(threadKey);
       }
