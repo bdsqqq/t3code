@@ -394,6 +394,9 @@ function SnoozePopoverButton(props: {
 }
 
 const TREE_GUIDE_STEP_PX = 18;
+// Tree rows use `gap-1` (4px). Each guide owns exactly half that gap so
+// adjacent translucent segments meet without overlapping and darkening.
+const TREE_GUIDE_GAP_HALF_PX = 2;
 
 function SidebarTreeConnector(props: {
   readonly depth: number;
@@ -404,8 +407,12 @@ function SidebarTreeConnector(props: {
   return (
     <span
       aria-hidden
-      className="relative -my-1.5 h-[calc(100%+0.75rem)] shrink-0"
-      style={{ width: (props.depth + 1) * TREE_GUIDE_STEP_PX }}
+      className="relative shrink-0"
+      style={{
+        width: (props.depth + 1) * TREE_GUIDE_STEP_PX,
+        height: `calc(100% + ${TREE_GUIDE_GAP_HALF_PX * 2}px)`,
+        marginBlock: -TREE_GUIDE_GAP_HALF_PX,
+      }}
     >
       {[...props.ancestorMask].map((continues, index) =>
         continues === "1" ? (
@@ -428,13 +435,18 @@ function SidebarTreeConnector(props: {
   );
 }
 
-function SidebarTreeOutgoingStem(props: { readonly childDepth: number }) {
+function SidebarTreeOutgoingStem(props: {
+  readonly childDepth: number;
+  readonly surfaceBottomInset: number;
+}) {
   return (
     <span
       aria-hidden
-      className="pointer-events-none absolute -bottom-2 h-2 w-px bg-sidebar-border/75"
+      className="pointer-events-none absolute w-px bg-sidebar-border/75"
       style={{
         left: 10 + props.childDepth * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2,
+        bottom: -TREE_GUIDE_GAP_HALF_PX,
+        height: TREE_GUIDE_GAP_HALF_PX + props.surfaceBottomInset,
       }}
     />
   );
@@ -1059,7 +1071,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
           {detailsTooltip}
         </Tooltip>
         {props.treeChildCount > 0 && props.treeChildrenVisible ? (
-          <SidebarTreeOutgoingStem childDepth={(props.treeDepth ?? 0) + 1} />
+          <SidebarTreeOutgoingStem childDepth={(props.treeDepth ?? 0) + 1} surfaceBottomInset={0} />
         ) : null}
       </li>
     );
@@ -1237,7 +1249,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
         {detailsTooltip}
       </Tooltip>
       {props.treeChildCount > 0 && props.treeChildrenVisible ? (
-        <SidebarTreeOutgoingStem childDepth={(props.treeDepth ?? 0) + 1} />
+        <SidebarTreeOutgoingStem childDepth={(props.treeDepth ?? 0) + 1} surfaceBottomInset={2} />
       ) : null}
     </li>
   );
