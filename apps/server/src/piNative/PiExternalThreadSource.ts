@@ -36,11 +36,15 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schedule from "effect/Schedule";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import type { ProviderRuntimeBindingWithMetadata } from "../provider/Services/ProviderSessionDirectory.ts";
+import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
+import { PiSessionCursor } from "../provider/pi/PiSessionFile.ts";
 import {
   defaultPiSessionsRoot,
   type PiSessionCatalogRecord,
@@ -192,6 +196,54 @@ const canonical = (value: string) =>
 interface Association {
   readonly projectIdByThread: ReadonlyMap<ThreadId, ProjectId>;
   readonly externalProjects: ReadonlyArray<OrchestrationProjectShell>;
+}
+
+/**
+ * Delegated Pi sessions point at the managed parent session file, while the
+ * sidebar identifies that parent by its internal T3 thread id. The provider
+ * cursor is the durable bridge between those two identities.
+ */
+export async function resolveManagedPiParentThreadIds(
+  records: ReadonlyArray<PiSessionCatalogRecord>,
+  bindings: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
+): Promise<ReadonlyArray<PiSessionCatalogRecord>> {
+  const managedThreadIdBySessionFile = new Map<string, ThreadId>();
+  await Promise.all(
+    bindings.map(async (binding) => {
+      if (binding.provider !== "pi") return;
+      const cursor = Schema.decodeUnknownOption(PiSessionCursor)(binding.resumeCursor);
+      if (Option.isNone(cursor)) return;
+      managedThreadIdBySessionFile.set(await canonical(cursor.value.sessionFile), binding.threadId);
+    }),
+  );
+  if (managedThreadIdBySessionFile.size === 0) return records;
+  return records.map((record) => {
+    if (record.parentSessionFile === undefined) return record;
+    const managedParentThreadId = managedThreadIdBySessionFile.get(record.parentSessionFile);
+    return managedParentThreadId === undefined
+      ? record
+      : { ...record, parentThreadId: managedParentThreadId };
+  });
+}
+
+export function managedPiBindingSignature(
+  bindings: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
+): string {
+  return JSON.stringify(
+    bindings
+      .flatMap((binding) => {
+        if (binding.provider !== "pi") return [];
+        const cursor = Schema.decodeUnknownOption(PiSessionCursor)(binding.resumeCursor);
+        return Option.isNone(cursor)
+          ? []
+          : [{ sessionFile: cursor.value.sessionFile, threadId: binding.threadId }];
+      })
+      .toSorted(
+        (left, right) =>
+          left.sessionFile.localeCompare(right.sessionFile) ||
+          left.threadId.localeCompare(right.threadId),
+      ),
+  );
 }
 
 async function associate(
@@ -375,6 +427,7 @@ export class PiExternalThreadSource extends Context.Service<
       const catalog = yield* SessionCatalog;
       const supervisor = yield* SupervisorClient;
       const snapshots = yield* ProjectionSnapshotQuery;
+      const providerSessions = yield* ProviderSessionDirectory;
       const catalogBuildSemaphore = yield* Semaphore.make(1);
       let catalogSequence = 0;
       let catalogSignature = "";
@@ -384,6 +437,7 @@ export class PiExternalThreadSource extends Context.Service<
       let cachedAssociation: Association | undefined;
       let lastCatalogRuntimeSignature = "";
       let lastInternalAssociationSignature = "";
+      let lastManagedPiBindingSignature = "";
 
       const internalShell = snapshots
         .getShellSnapshot()
@@ -396,6 +450,7 @@ export class PiExternalThreadSource extends Context.Service<
       const buildCatalogUnlocked = Effect.fn("PiExternalThreadSource.catalogSnapshot")(function* (
         refreshCatalog = true,
         runtimeOverride?: ReadonlyArray<SupervisorRuntimeState>,
+        providerBindingsOverride?: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
       ) {
         const runtimes =
           runtimeOverride ?? (yield* supervisor.list().pipe(Effect.orElseSucceed(() => [])));
@@ -413,17 +468,24 @@ export class PiExternalThreadSource extends Context.Service<
         }
         const records = cachedRecords;
         const internal = cachedInternal;
+        const providerBindings =
+          providerBindingsOverride ??
+          (yield* providerSessions.listBindings().pipe(Effect.orElseSucceed(() => [])));
+        const resolvedRecords = yield* Effect.promise(() =>
+          resolveManagedPiParentThreadIds(records, providerBindings),
+        );
         lastInternalAssociationSignature = internalAssociationSignature(internal);
         lastCatalogRuntimeSignature = runtimeCatalogSignature(runtimes);
+        lastManagedPiBindingSignature = managedPiBindingSignature(providerBindings);
         if (cachedAssociation === undefined) {
           cachedAssociation = yield* Effect.tryPromise({
-            try: () => associate(records, internal),
+            try: () => associate(resolvedRecords, internal),
             catch: () =>
               privateSourceError("catalog_association", "Thread catalog association failed."),
           });
         }
         const association = cachedAssociation;
-        const projectedThreads = records.slice(0, CATALOG_MAX_THREADS).map((record) => {
+        const projectedThreads = resolvedRecords.slice(0, CATALOG_MAX_THREADS).map((record) => {
           const projectId = association.projectIdByThread.get(record.threadId)!;
           const detail = projectPiThread({
             record,
@@ -439,7 +501,7 @@ export class PiExternalThreadSource extends Context.Service<
           {
             projects: association.externalProjects,
             threads: projectedThreads,
-            totalThreadCount: records.length + cachedOmittedThreadCount,
+            totalThreadCount: resolvedRecords.length + cachedOmittedThreadCount,
           },
         );
         const signature = JSON.stringify({
@@ -471,15 +533,18 @@ export class PiExternalThreadSource extends Context.Service<
         function* () {
           return yield* catalogBuildSemaphore.withPermit(
             Effect.gen(function* () {
-              const [runtimes, internal] = yield* Effect.all([
+              const [runtimes, internal, providerBindings] = yield* Effect.all([
                 supervisor.list().pipe(Effect.orElseSucceed(() => [])),
                 internalShell,
+                providerSessions.listBindings().pipe(Effect.orElseSucceed(() => [])),
               ]);
               const runtimeSignature = runtimeCatalogSignature(runtimes);
               const internalSignature = internalAssociationSignature(internal);
+              const bindingSignature = managedPiBindingSignature(providerBindings);
               if (
                 runtimeSignature === lastCatalogRuntimeSignature &&
-                internalSignature === lastInternalAssociationSignature
+                internalSignature === lastInternalAssociationSignature &&
+                bindingSignature === lastManagedPiBindingSignature
               ) {
                 return undefined;
               }
@@ -487,7 +552,7 @@ export class PiExternalThreadSource extends Context.Service<
                 cachedInternal = internal;
                 cachedAssociation = undefined;
               }
-              return yield* buildCatalogUnlocked(false, runtimes);
+              return yield* buildCatalogUnlocked(false, runtimes, providerBindings);
             }),
           );
         },

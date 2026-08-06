@@ -114,6 +114,7 @@ import {
   hasUnseenCompletion,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  partitionSidebarThreadTrees,
   resolveAdjacentThreadId,
   resolveSettledTimestamp,
   resolveSidebarV2Status,
@@ -1496,10 +1497,11 @@ export default function SidebarV2() {
         (scopedProjectKeys === null ||
           scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
     );
-    const active: EnvironmentThreadShell[] = [];
-    const snoozed: EnvironmentThreadShell[] = [];
-    const settled: EnvironmentThreadShell[] = [];
-    for (const thread of visible) {
+    const {
+      active: activeThreads,
+      snoozed: snoozedThreads,
+      settled: settledThreads,
+    } = partitionSidebarThreadTrees(visible, (thread) => {
       // Threads on servers without the settlement capability (old server,
       // or descriptor not loaded yet) never classify as settled: the user
       // could neither un-settle nor pin them, so auto-settling them would
@@ -1514,25 +1516,25 @@ export default function SidebarV2() {
       // belongs to the shelf even if it would also auto-settle (the shelf's
       // wake time is a stronger statement about when it matters again).
       if (supportsSnooze && effectiveSnoozed(thread, { now: preciseNow })) {
-        snoozed.push(thread);
-      } else if (
+        return "snoozed";
+      }
+      if (
         supportsSettlement &&
         effectiveSettled(thread, { now, autoSettleAfterDays, changeRequestState })
       ) {
-        settled.push(thread);
-      } else {
-        active.push(thread);
+        return "settled";
       }
-    }
+      return "active";
+    });
     return {
-      activeThreads: sortThreadsForSidebarV2(active),
+      activeThreads: sortThreadsForSidebarV2(activeThreads),
       // Soonest wake first: "what comes back next" is the shelf's question.
-      snoozedThreads: snoozed.toSorted(
+      snoozedThreads: snoozedThreads.toSorted(
         (left, right) =>
           firstValidTimestampMs(left.snoozedUntil ?? null) -
           firstValidTimestampMs(right.snoozedUntil ?? null),
       ),
-      settledThreads: sortSettledThreadsForSidebarV2(settled),
+      settledThreads: sortSettledThreadsForSidebarV2(settledThreads),
       snoozeNow: preciseNow,
     };
   }, [

@@ -42,6 +42,7 @@ export interface PiSessionCatalogRecord {
   readonly threadId: ThreadId;
   readonly canonicalFile: string;
   readonly sessionId: string;
+  readonly parentSessionFile?: string;
   readonly parentThreadId?: ThreadId;
   readonly cwd: string;
   readonly title: string;
@@ -313,7 +314,12 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
           sourceKey: keyFor(canonical),
           canonicalFile: canonical,
           sessionId: header.id,
-          ...(parentSession === undefined ? {} : { parentThreadId: threadIdFor(parentSession) }),
+          ...(parentSession === undefined
+            ? {}
+            : {
+                parentSessionFile: parentSession,
+                parentThreadId: threadIdFor(parentSession),
+              }),
           cwd: await NodeFS.promises.realpath(headerCwd).catch(() => NodePath.resolve(headerCwd)),
           title: titleFrom(bounded.metadataEntries),
           createdAt: created,

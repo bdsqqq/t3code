@@ -8,6 +8,8 @@ import { OrchestrationProjectionSnapshotQueryLive } from "./Layers/ProjectionSna
 import { PiExternalThreadSource } from "../piNative/PiExternalThreadSource.ts";
 import { SessionCatalog } from "../piNative/SessionCatalog.ts";
 import { SupervisorClient } from "../piNative/SupervisorClient.ts";
+import * as ProviderSessionRuntime from "../persistence/ProviderSessionRuntime.ts";
+import { ProviderSessionDirectoryLive } from "../provider/Layers/ProviderSessionDirectory.ts";
 
 export const OrchestrationEventInfrastructureLayerLive = Layer.mergeAll(
   OrchestrationEventStoreLive,
@@ -28,6 +30,7 @@ const PiExternalThreadSourceLive = PiExternalThreadSource.layer.pipe(
   Layer.provide(SessionCatalog.layer()),
   Layer.provide(SupervisorClient.layer),
   Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+  Layer.provide(ProviderSessionDirectoryLive.pipe(Layer.provide(ProviderSessionRuntime.layer))),
 );
 
 export const OrchestrationLayerLive = Layer.mergeAll(

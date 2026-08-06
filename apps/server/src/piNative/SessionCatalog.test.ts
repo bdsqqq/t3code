@@ -115,6 +115,7 @@ describe("SessionCatalog", () => {
           const parent = listed.find((record) => record.sessionId === "parent");
           const child = listed.find((record) => record.sessionId === "child");
           expect(child?.parentThreadId).toBe(parent?.threadId);
+          expect(child?.parentSessionFile).toBe(parent?.canonicalFile);
         }),
       (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),

@@ -15,6 +15,7 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  partitionSidebarThreadTrees,
   resolveProjectStatusIndicator,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
@@ -783,6 +784,38 @@ describe("buildSidebarThreadTree", () => {
     expect(buildSidebarThreadTree([thread("orphan", "missing")])).toMatchObject([
       { thread: { id: "orphan" }, depth: 0 },
     ]);
+  });
+
+  it("moves external Pi children below an internal T3 parent", () => {
+    const parent = {
+      id: "internal-parent",
+      environmentId: "environment-1",
+      backing: undefined,
+    };
+    const entries = buildSidebarThreadTree([thread("child", parent.id), parent]);
+
+    expect(entries.map(({ thread, depth }) => ({ id: thread.id, depth }))).toEqual([
+      { id: "internal-parent", depth: 0 },
+      { id: "child", depth: 1 },
+    ]);
+  });
+
+  it("keeps a tree together when child activity crosses a lifecycle boundary", () => {
+    const parent = {
+      id: "internal-parent",
+      environmentId: "environment-1",
+      backing: undefined,
+    };
+    const child = thread("child", parent.id);
+    const partitioned = partitionSidebarThreadTrees([child, parent], (candidate) =>
+      candidate.id === child.id ? "active" : "settled",
+    );
+
+    expect(partitioned.active.map((candidate) => candidate.id)).toEqual([
+      "internal-parent",
+      "child",
+    ]);
+    expect(partitioned.settled).toEqual([]);
   });
 });
 

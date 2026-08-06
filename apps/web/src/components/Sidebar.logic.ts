@@ -566,6 +566,53 @@ export function buildSidebarThreadTree<
   return entries;
 }
 
+export type SidebarThreadSection = "active" | "snoozed" | "settled";
+
+/**
+ * A Pi session tree moves through lifecycle shelves as one unit. Otherwise a
+ * fresh child can sort above its settled parent and the hierarchy degrades
+ * back into unrelated rows. Active work wins, then snoozed, then settled.
+ */
+export function partitionSidebarThreadTrees<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+    readonly backing?:
+      | {
+          readonly parentThreadId?: string | undefined;
+        }
+      | undefined;
+  },
+>(
+  threads: readonly T[],
+  sectionFor: (thread: T) => SidebarThreadSection,
+): Record<SidebarThreadSection, T[]> {
+  const partitioned: Record<SidebarThreadSection, T[]> = {
+    active: [],
+    snoozed: [],
+    settled: [],
+  };
+  let subtree: T[] = [];
+  let subtreeSection: SidebarThreadSection = "settled";
+  const flush = () => {
+    if (subtree.length === 0) return;
+    partitioned[subtreeSection].push(...subtree);
+    subtree = [];
+    subtreeSection = "settled";
+  };
+
+  for (const entry of buildSidebarThreadTree(threads)) {
+    if (entry.depth === 0) flush();
+    subtree.push(entry.thread);
+    const section = sectionFor(entry.thread);
+    if (section === "active" || (section === "snoozed" && subtreeSection === "settled")) {
+      subtreeSection = section;
+    }
+  }
+  flush();
+  return partitioned;
+}
+
 type SettledTimestampInput = Pick<
   SidebarThreadSummary,
   "settledAt" | "latestUserMessageAt" | "latestTurn" | "updatedAt"
