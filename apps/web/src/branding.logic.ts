@@ -14,14 +14,12 @@ export function formatAppDisplayName(input: {
 /**
  * Whether the sidebar v2 beta is on by default for a build stage.
  *
- * Nightly and local dev opt in; Alpha and Latest stay on v1. This is resolved
- * from the client's own stage label rather than the connected server's version:
- * v2 only exists in the client, so a stable client on a nightly server has
- * nothing to turn on.
+ * The settled sidebar is now the default on every channel. Keep the stage
+ * argument in this resolver because explicit user choices still flow through
+ * the same settings contract and older clients call the stage-shaped API.
  */
-export function resolveSidebarV2Default(stageLabel: string): boolean {
-  const stage = stageLabel.trim().toLowerCase();
-  return stage === "nightly" || stage === "dev";
+export function resolveSidebarV2Default(_stageLabel: string): boolean {
+  return true;
 }
 
 /**

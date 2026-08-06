@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import {
   archiveSelectedThreadEntries,
+  buildSidebarThreadTree,
   buildBulkTitleRegenerationContextMenuItem,
   buildMultiSelectThreadContextMenuItems,
   createThreadJumpHintVisibilityController,
@@ -740,6 +741,48 @@ describe("sortThreadsForSidebarV2", () => {
     ]);
 
     expect(sorted.map((thread) => thread.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("buildSidebarThreadTree", () => {
+  const thread = (id: string, parentThreadId?: string) => ({
+    id,
+    environmentId: "environment-1",
+    backing: {
+      source: "pi" as const,
+      ...(parentThreadId === undefined ? {} : { parentThreadId }),
+    },
+  });
+
+  it("places descendants after their root with Pi tree metadata", () => {
+    const entries = buildSidebarThreadTree([
+      thread("new-root"),
+      thread("child-b", "root"),
+      thread("root"),
+      thread("grandchild", "child-a"),
+      thread("child-a", "root"),
+    ]);
+
+    expect(
+      entries.map(({ thread, depth, isLast, ancestorContinues }) => ({
+        id: thread.id,
+        depth,
+        isLast,
+        ancestorContinues,
+      })),
+    ).toEqual([
+      { id: "new-root", depth: 0, isLast: false, ancestorContinues: [] },
+      { id: "root", depth: 0, isLast: true, ancestorContinues: [] },
+      { id: "child-b", depth: 1, isLast: false, ancestorContinues: [false] },
+      { id: "child-a", depth: 1, isLast: true, ancestorContinues: [false] },
+      { id: "grandchild", depth: 2, isLast: true, ancestorContinues: [false, false] },
+    ]);
+  });
+
+  it("promotes a child whose parent is not in the visible list", () => {
+    expect(buildSidebarThreadTree([thread("orphan", "missing")])).toMatchObject([
+      { thread: { id: "orphan" }, depth: 0 },
+    ]);
   });
 });
 

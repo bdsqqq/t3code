@@ -107,6 +107,7 @@ import { formatRelativeTimeLabel, parseTimestampDate } from "../timestampFormat"
 import type { SidebarThreadSummary } from "../types";
 import { cn } from "~/lib/utils";
 import {
+  buildSidebarThreadTree,
   buildBulkTitleRegenerationContextMenuItem,
   formatWorkingDurationLabel,
   firstValidTimestampMs,
@@ -121,6 +122,7 @@ import {
   sortLogicalProjectsForSidebar,
   sortSettledThreadsForSidebarV2,
   sortThreadsForSidebarV2,
+  type SidebarThreadTreeEntry,
 } from "./Sidebar.logic";
 import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
 import {
@@ -421,6 +423,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   onSnooze: (threadRef: ScopedThreadRef, preset: SnoozePreset) => void;
   onUnsnooze: (threadRef: ScopedThreadRef) => void;
   onChangeRequestState: (threadKey: string, state: "open" | "closed" | "merged" | null) => void;
+  treePrefix: string | null;
 }) {
   const {
     isRenaming,
@@ -807,6 +810,14 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
               />
             }
           >
+            {props.treePrefix === null ? null : (
+              <span
+                aria-hidden
+                className="shrink-0 whitespace-pre font-mono text-xs text-muted-foreground/35"
+              >
+                {props.treePrefix}
+              </span>
+            )}
             {/* Settled history recedes: dimmed favicon at rest, restored on
               hover so the tail stays scannable when you're hunting. */}
             <span
@@ -825,6 +836,14 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
             </span>
             {title}
             {terminalStatusIcon}
+            {variantAction === "settle" && topStatus ? (
+              <span
+                role="status"
+                className={cn("shrink-0 text-xs font-medium", topStatus.className)}
+              >
+                {topStatus.label}
+              </span>
+            ) : null}
             {isRegeneratingTitle ? (
               <span role="status" className="sr-only">
                 Regenerating title
@@ -1544,6 +1563,16 @@ export default function SidebarV2() {
     return () => window.clearTimeout(id);
   }, [snoozedThreads]);
 
+  const activeThreadEntries = useMemo(() => buildSidebarThreadTree(activeThreads), [activeThreads]);
+  const snoozedThreadEntries = useMemo(
+    () => buildSidebarThreadTree(snoozedThreads),
+    [snoozedThreads],
+  );
+  const settledThreadEntries = useMemo(
+    () => buildSidebarThreadTree(settledThreads),
+    [settledThreads],
+  );
+
   // The settled tail renders in pages: history shouldn't dominate the
   // sidebar, and the common lookups are recent. Expansion resets when the
   // filter context changes so a scope/search flip never inherits a deep
@@ -1555,62 +1584,64 @@ export default function SidebarV2() {
     lastSettledResetKeyRef.current = settledResetKey;
     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
   }
-  const visibleSettledThreads = useMemo(() => {
-    if (settledThreads.length <= settledVisibleCount) return settledThreads;
-    const visible = settledThreads.slice(0, settledVisibleCount);
+  const visibleSettledThreadEntries = useMemo(() => {
+    if (settledThreadEntries.length <= settledVisibleCount) return settledThreadEntries;
+    const visible = settledThreadEntries.slice(0, settledVisibleCount);
     // The open thread must never hide under "Show more": navigating into a
     // deep settled thread (search, deep link) pulls its row into the visible
     // tail so the highlight and the un-settle affordance stay reachable.
     if (routeThreadKey !== null) {
-      const routeThread = settledThreads
+      const routeThread = settledThreadEntries
         .slice(settledVisibleCount)
         .find(
-          (thread) =>
+          ({ thread }) =>
             scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
         );
       if (routeThread !== undefined) visible.push(routeThread);
     }
     return visible;
-  }, [routeThreadKey, settledThreads, settledVisibleCount]);
-  const hiddenSettledCount = settledThreads.length - visibleSettledThreads.length;
+  }, [routeThreadKey, settledThreadEntries, settledVisibleCount]);
+  const hiddenSettledCount = settledThreadEntries.length - visibleSettledThreadEntries.length;
   const showMoreSettled = useCallback(
     () => setSettledVisibleCount((count) => count + SETTLED_TAIL_PAGE_COUNT),
     [],
   );
   const [settledShelfExpanded, setSettledShelfExpanded] = useState(true);
   const toggleSettledShelf = useCallback(() => setSettledShelfExpanded((value) => !value), []);
-  const renderedSettledThreads = useMemo(() => {
-    if (settledShelfExpanded) return visibleSettledThreads;
+  const renderedSettledThreadEntries = useMemo(() => {
+    if (settledShelfExpanded) return visibleSettledThreadEntries;
     if (routeThreadKey === null) return [];
-    const routeThread = visibleSettledThreads.find(
-      (thread) =>
+    const routeThread = visibleSettledThreadEntries.find(
+      ({ thread }) =>
         scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
     );
     return routeThread === undefined ? [] : [routeThread];
-  }, [routeThreadKey, settledShelfExpanded, visibleSettledThreads]);
+  }, [routeThreadKey, settledShelfExpanded, visibleSettledThreadEntries]);
 
   // The snoozed shelf is collapsed by default: out of the way, never gone.
   // Collapsed threads don't render (and so don't participate in jump
   // shortcuts or multi-select), matching the settled tail's paging model.
   const [snoozedShelfExpanded, setSnoozedShelfExpanded] = useState(false);
   const toggleSnoozedShelf = useCallback(() => setSnoozedShelfExpanded((value) => !value), []);
-  const visibleSnoozedThreads = useMemo(() => {
-    if (snoozedShelfExpanded) return snoozedThreads;
+  const visibleSnoozedThreadEntries = useMemo(() => {
+    if (snoozedShelfExpanded) return snoozedThreadEntries;
     // The open thread must never vanish behind the collapsed shelf: a
     // snoozed thread reached by route (deep link, open before snoozing
     // elsewhere) keeps its row — with highlight and wake affordance — same
     // exception the settled tail's "Show more" makes.
     if (routeThreadKey === null) return [];
-    const routeThread = snoozedThreads.find(
-      (thread) =>
+    const routeThread = snoozedThreadEntries.find(
+      ({ thread }) =>
         scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
     );
     return routeThread === undefined ? [] : [routeThread];
-  }, [routeThreadKey, snoozedShelfExpanded, snoozedThreads]);
-
+  }, [routeThreadKey, snoozedShelfExpanded, snoozedThreadEntries]);
   const orderedThreads = useMemo(
-    () => [...activeThreads, ...visibleSnoozedThreads, ...renderedSettledThreads],
-    [activeThreads, visibleSnoozedThreads, renderedSettledThreads],
+    () =>
+      [...activeThreadEntries, ...visibleSnoozedThreadEntries, ...renderedSettledThreadEntries].map(
+        (entry) => entry.thread,
+      ),
+    [activeThreadEntries, renderedSettledThreadEntries, visibleSnoozedThreadEntries],
   );
   const orderedThreadKeys = useMemo(
     () =>
@@ -2587,18 +2618,26 @@ export default function SidebarV2() {
             <ul ref={attachListAutoAnimateRef} role="list" className="flex flex-col gap-px">
               {(() => {
                 const renderThreadRow = (
-                  thread: EnvironmentThreadShell,
+                  entry: SidebarThreadTreeEntry<EnvironmentThreadShell>,
                   section: "active" | "snoozed" | "settled",
                 ) => {
+                  const { thread } = entry;
                   const threadKey = scopedThreadKey(
                     scopeThreadRef(thread.environmentId, thread.id),
                   );
-                  // Settled and snoozed are the ONLY things that collapse a
-                  // row: every other thread is a full card. Density comes
-                  // from users (or the auto rules) actually parking work,
-                  // not from the sidebar second-guessing what still matters.
-                  const isCard = section === "active";
+                  // Lifecycle shelves stay compact, and Pi descendants do too:
+                  // the owning session is the full card while subagent work
+                  // reads as its tree rather than as unrelated inbox items.
+                  const isPiChild = thread.backing?.parentThreadId !== undefined;
+                  const isCard = section === "active" && !isPiChild;
                   const rowVariant = isCard ? "card" : "slim";
+                  const treePrefix = !isPiChild
+                    ? null
+                    : entry.depth === 0
+                      ? "└─ "
+                      : `${entry.ancestorContinues
+                          .map((continues) => (continues ? "│  " : "   "))
+                          .join("")}${entry.isLast ? "└─ " : "├─ "}`;
                   return (
                     <SidebarV2Row
                       // Keyed per variant on purpose: when a thread settles,
@@ -2667,11 +2706,12 @@ export default function SidebarV2() {
                       onSnooze={attemptSnooze}
                       onUnsnooze={attemptUnsnooze}
                       onChangeRequestState={handleChangeRequestState}
+                      treePrefix={treePrefix}
                     />
                   );
                 };
-                const items: ReactNode[] = activeThreads.map((thread) =>
-                  renderThreadRow(thread, "active"),
+                const items: ReactNode[] = activeThreadEntries.map((entry) =>
+                  renderThreadRow(entry, "active"),
                 );
                 // Snoozed shelf: between the inbox and Settled — out of the
                 // way, never gone. The header always renders while anything
@@ -2702,8 +2742,8 @@ export default function SidebarV2() {
                       </button>
                     </li>,
                   );
-                  for (const thread of visibleSnoozedThreads) {
-                    items.push(renderThreadRow(thread, "snoozed"));
+                  for (const entry of visibleSnoozedThreadEntries) {
+                    items.push(renderThreadRow(entry, "snoozed"));
                   }
                 }
                 if (settledThreads.length > 0) {
@@ -2731,8 +2771,8 @@ export default function SidebarV2() {
                     </li>,
                   );
                 }
-                for (const thread of renderedSettledThreads) {
-                  items.push(renderThreadRow(thread, "settled"));
+                for (const entry of renderedSettledThreadEntries) {
+                  items.push(renderThreadRow(entry, "settled"));
                 }
                 return items;
               })()}

@@ -86,4 +86,37 @@ describe("SessionCatalog", () => {
         ),
     ),
   );
+  it.effect("resolves Pi parent session paths to parent thread ids", () =>
+    Effect.acquireUseRelease(
+      Effect.tryPromise(() => NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-"))),
+      (root) =>
+        Effect.gen(function* () {
+          const parentFile = NodePath.join(root, "parent.jsonl");
+          const childFile = NodePath.join(root, "child.jsonl");
+          yield* Effect.tryPromise(() =>
+            Promise.all([
+              NodeFS.promises.writeFile(
+                parentFile,
+                JSON.stringify({ type: "session", id: "parent", cwd: root }) + "\n",
+              ),
+              NodeFS.promises.writeFile(
+                childFile,
+                JSON.stringify({
+                  type: "session",
+                  id: "child",
+                  cwd: root,
+                  parentSession: parentFile,
+                }) + "\n",
+              ),
+            ]),
+          );
+
+          const listed = yield* makeSessionCatalog({ root }).list();
+          const parent = listed.find((record) => record.sessionId === "parent");
+          const child = listed.find((record) => record.sessionId === "child");
+          expect(child?.parentThreadId).toBe(parent?.threadId);
+        }),
+      (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
+    ),
+  );
 });

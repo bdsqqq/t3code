@@ -118,13 +118,12 @@ describe("branding logic", () => {
 });
 
 describe("resolveSidebarV2Default", () => {
-  it.each(["Nightly", "Dev", "nightly", " dev "])("enables the beta for %s builds", (stage) => {
-    expect(resolveSidebarV2Default(stage)).toBe(true);
-  });
-
-  it.each(["Alpha", "Latest", ""])("leaves the beta off for %s builds", (stage) => {
-    expect(resolveSidebarV2Default(stage)).toBe(false);
-  });
+  it.each(["Nightly", "Dev", "Alpha", "Latest", ""])(
+    "uses the settled sidebar for %s builds",
+    (stage) => {
+      expect(resolveSidebarV2Default(stage)).toBe(true);
+    },
+  );
 });
 
 describe("resolveSidebarV2Enabled", () => {
@@ -162,7 +161,7 @@ describe("resolveSidebarV2Enabled", () => {
         configuredByUser: false,
         stageLabel: "Latest",
       }),
-    ).toBe(false);
+    ).toBe(true);
   });
 
   it("honors an explicit opt-out over the stage default", () => {

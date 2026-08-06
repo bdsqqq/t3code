@@ -136,6 +136,7 @@ export function projectPiBacking(
   return {
     ...backingFor(runtime),
     sourceKey: record.sourceKey,
+    ...(record.parentThreadId === undefined ? {} : { parentThreadId: record.parentThreadId }),
   };
 }
 

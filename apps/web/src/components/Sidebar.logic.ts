@@ -497,6 +497,75 @@ export function sortThreadsForSidebarV2<
   );
 }
 
+export interface SidebarThreadTreeEntry<T> {
+  readonly thread: T;
+  readonly depth: number;
+  readonly isLast: boolean;
+  readonly ancestorContinues: readonly boolean[];
+}
+
+/**
+ * Pi stores a sub-session's parent as another session file. The server
+ * resolves that path to `parentThreadId`; this client-only projection keeps
+ * descendants beside their root while preserving the caller's existing sort.
+ * Missing parents are roots, matching Pi's session picker.
+ */
+export function buildSidebarThreadTree<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+    readonly backing?:
+      | {
+          readonly parentThreadId?: string | undefined;
+        }
+      | undefined;
+  },
+>(threads: readonly T[]): SidebarThreadTreeEntry<T>[] {
+  type Node = { readonly thread: T; readonly children: Node[] };
+  const keyFor = (thread: Pick<T, "environmentId" | "id">) =>
+    `${thread.environmentId}:${thread.id}`;
+  const nodes = new Map<string, Node>();
+  for (const thread of threads) nodes.set(keyFor(thread), { thread, children: [] });
+  const roots: Node[] = [];
+
+  for (const thread of threads) {
+    const node = nodes.get(keyFor(thread))!;
+    const parentId = thread.backing?.parentThreadId;
+    const parent =
+      parentId === undefined ? undefined : nodes.get(`${thread.environmentId}:${parentId}`);
+    if (parent === undefined || parent === node) roots.push(node);
+    else parent.children.push(node);
+  }
+
+  const entries: SidebarThreadTreeEntry<T>[] = [];
+  const visited = new Set<Node>();
+  const walk = (
+    node: Node,
+    depth: number,
+    ancestorContinues: readonly boolean[],
+    isLast: boolean,
+  ) => {
+    if (visited.has(node)) return;
+    visited.add(node);
+    entries.push({ thread: node.thread, depth, isLast, ancestorContinues });
+    const children = node.children.filter((child) => !visited.has(child));
+    children.forEach((child, index) =>
+      walk(
+        child,
+        depth + 1,
+        [...ancestorContinues, depth > 0 && !isLast],
+        index === children.length - 1,
+      ),
+    );
+  };
+
+  roots.forEach((root, index) => walk(root, 0, [], index === roots.length - 1));
+  // Generated Pi metadata is acyclic. If a hand-edited header introduces a
+  // cycle, promote its first listed node rather than silently dropping rows.
+  for (const node of nodes.values()) if (!visited.has(node)) walk(node, 0, [], true);
+  return entries;
+}
+
 type SettledTimestampInput = Pick<
   SidebarThreadSummary,
   "settledAt" | "latestUserMessageAt" | "latestTurn" | "updatedAt"

@@ -363,6 +363,10 @@ export const ExternalThreadBacking = Schema.Struct({
   kind: Schema.Literal("external"),
   source: Schema.Literal("pi"),
   sourceKey: TrimmedNonEmptyString,
+  // Pi forks and subagents persist their owning session file in the JSONL
+  // header. Projecting the resolved thread id lets clients preserve that
+  // lineage without exposing environment-local filesystem paths.
+  parentThreadId: Schema.optional(ThreadId),
   control: Schema.Literals(["live", "resumable", "readOnly"]),
   capabilities: ExternalThreadCapabilities,
 });

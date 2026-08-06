@@ -42,6 +42,7 @@ export interface PiSessionCatalogRecord {
   readonly threadId: ThreadId;
   readonly canonicalFile: string;
   readonly sessionId: string;
+  readonly parentThreadId?: ThreadId;
   readonly cwd: string;
   readonly title: string;
   readonly createdAt: string;
@@ -303,10 +304,16 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
         const created =
           typeof header.timestamp === "string" ? header.timestamp : stat.birthtime.toISOString();
         const headerCwd = header.cwd;
+        const rawParentSession = header.parentSession;
+        const parentSession =
+          typeof rawParentSession === "string" && rawParentSession.trim()
+            ? await NodeFS.promises.realpath(rawParentSession).catch(() => rawParentSession)
+            : undefined;
         const metadata = {
           sourceKey: keyFor(canonical),
           canonicalFile: canonical,
           sessionId: header.id,
+          ...(parentSession === undefined ? {} : { parentThreadId: threadIdFor(parentSession) }),
           cwd: await NodeFS.promises.realpath(headerCwd).catch(() => NodePath.resolve(headerCwd)),
           title: titleFrom(bounded.metadataEntries),
           createdAt: created,
