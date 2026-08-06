@@ -429,7 +429,9 @@ function SidebarTreeConnector(props: {
       />
       <span
         className="absolute right-0 top-1/2 h-px bg-sidebar-border/75"
-        style={{ left: branchLeft }}
+        // The horizontal begins after the vertical's occupied pixel. Starting
+        // both at branchLeft compounds their translucent color at every elbow.
+        style={{ left: branchLeft + 1 }}
       />
     </span>
   );
