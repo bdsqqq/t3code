@@ -107,6 +107,7 @@ import { formatRelativeTimeLabel, parseTimestampDate } from "../timestampFormat"
 import type { SidebarThreadSummary } from "../types";
 import { cn } from "~/lib/utils";
 import {
+  buildCollapsibleSidebarThreadTree,
   buildSidebarThreadTree,
   buildBulkTitleRegenerationContextMenuItem,
   formatWorkingDurationLabel,
@@ -116,14 +117,19 @@ import {
   orderItemsByPreferredIds,
   partitionSidebarThreadTrees,
   resolveAdjacentThreadId,
+  resolveCollapsedSidebarTreeParentKeys,
   resolveSettledTimestamp,
   resolveSidebarV2Status,
   resolveWorkingStartedAt,
+  sidebarTreeAncestorKeysForThread,
+  sidebarTreeParentKeysContainingHiddenThread,
+  sidebarThreadTreeSubtreeContainingThread,
   shouldNavigateAfterProjectRemoval,
   sortLogicalProjectsForSidebar,
   sortSettledThreadsForSidebarV2,
   sortThreadsForSidebarV2,
   type SidebarThreadTreeEntry,
+  type SidebarThreadTreeDisplayItem,
 } from "./Sidebar.logic";
 import { resolveLocalCheckoutBranchMismatch } from "./BranchToolbar.logic";
 import {
@@ -387,6 +393,119 @@ function SnoozePopoverButton(props: {
   );
 }
 
+const TREE_GUIDE_STEP_PX = 18;
+
+function SidebarTreeConnector(props: {
+  readonly depth: number;
+  readonly isLast: boolean;
+  readonly ancestorMask: string;
+}) {
+  const branchLeft = props.depth * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2;
+  return (
+    <span
+      aria-hidden
+      className="relative -my-1.5 h-[calc(100%+0.75rem)] shrink-0"
+      style={{ width: (props.depth + 1) * TREE_GUIDE_STEP_PX }}
+    >
+      {[...props.ancestorMask].map((continues, index) =>
+        continues === "1" ? (
+          <span
+            key={index}
+            className="absolute inset-y-0 w-px bg-sidebar-border/75"
+            style={{ left: index * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2 }}
+          />
+        ) : null,
+      )}
+      <span
+        className="absolute top-0 w-px bg-sidebar-border/75"
+        style={{ bottom: props.isLast ? "50%" : 0, left: branchLeft }}
+      />
+      <span
+        className="absolute right-0 top-1/2 h-px bg-sidebar-border/75"
+        style={{ left: branchLeft }}
+      />
+    </span>
+  );
+}
+
+function SidebarTreeOutgoingStem(props: { readonly childDepth: number }) {
+  return (
+    <span
+      aria-hidden
+      className="pointer-events-none absolute -bottom-2 h-2 w-px bg-sidebar-border/75"
+      style={{
+        left: 10 + props.childDepth * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2,
+      }}
+    />
+  );
+}
+
+type SidebarTreeControlItem = Extract<
+  SidebarThreadTreeDisplayItem<EnvironmentThreadShell>,
+  { readonly kind: "control" }
+>;
+
+function SidebarTreeControlRow(props: {
+  readonly item: SidebarTreeControlItem;
+  readonly onToggle: (parentKey: string) => void;
+}) {
+  const expanded = props.item.action === "collapse";
+  return (
+    <li data-thread-selection-safe className="relative list-none">
+      <button
+        type="button"
+        aria-expanded={expanded}
+        aria-label={
+          expanded ? "Collapse sub-sessions" : `Show ${props.item.hiddenCount} more sub-sessions`
+        }
+        onClick={() => props.onToggle(props.item.parentKey)}
+        className="relative flex h-9 w-full cursor-pointer items-center gap-2.5 overflow-visible rounded-md px-2.5 text-left text-xs text-muted-foreground/55 transition-[color,transform] duration-150 hover:text-sidebar-foreground active:scale-[0.98]"
+      >
+        <span
+          aria-hidden
+          className="pointer-events-none absolute inset-y-0 left-10 right-2 bg-gradient-to-b from-transparent via-sidebar-row-hover/80 to-transparent [mask-image:linear-gradient(to_right,transparent,black_18%,black_82%,transparent)]"
+        />
+        <SidebarTreeConnector
+          depth={props.item.depth}
+          isLast={props.item.isLast}
+          ancestorMask={props.item.ancestorContinues
+            .map((continues) => (continues ? "1" : "0"))
+            .join("")}
+        />
+        <span className="relative truncate">
+          {expanded ? "Show less" : `… ${props.item.hiddenCount} more`}
+        </span>
+      </button>
+    </li>
+  );
+}
+
+function SidebarTreeVisibilityButton(props: {
+  readonly expanded: boolean;
+  readonly forced: boolean;
+  readonly onToggle: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      aria-label={props.expanded ? "Hide sub-sessions" : "Show sub-sessions"}
+      aria-expanded={props.expanded}
+      disabled={props.forced}
+      onClick={(event) => {
+        event.stopPropagation();
+        props.onToggle();
+      }}
+      onDoubleClick={(event) => event.stopPropagation()}
+      className="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded text-muted-foreground/45 transition-[color,transform] duration-150 hover:bg-sidebar-row-hover hover:text-sidebar-foreground active:scale-90 disabled:cursor-default disabled:opacity-35"
+    >
+      <ChevronDownIcon
+        aria-hidden
+        className={cn("size-3.5 transition-transform", !props.expanded && "-rotate-90")}
+      />
+    </button>
+  );
+}
+
 const SidebarV2Row = memo(function SidebarV2Row(props: {
   thread: SidebarThreadSummary;
   variant: "card" | "slim";
@@ -424,7 +543,14 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   onSnooze: (threadRef: ScopedThreadRef, preset: SnoozePreset) => void;
   onUnsnooze: (threadRef: ScopedThreadRef) => void;
   onChangeRequestState: (threadKey: string, state: "open" | "closed" | "merged" | null) => void;
-  treePrefix: string | null;
+  treeDepth: number | null;
+  treeIsLast: boolean;
+  treeAncestorMask: string;
+  treeChildCount: number;
+  treeChildrenVisible: boolean;
+  treeVisibilityForced: boolean;
+  treeSection: "active" | "snoozed" | "settled";
+  onToggleTreeChildren: (parentKey: string, section: "active" | "snoozed" | "settled") => void;
 }) {
   const {
     isRenaming,
@@ -450,6 +576,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
     [thread.environmentId, thread.id],
   );
   const threadKey = scopedThreadKey(threadRef);
+  const treeParentKey = `${thread.environmentId}:${thread.id}`;
   const isRegeneratingTitle = thread.titleRegeneration != null;
   const lastVisitedAt = useUiStateStore((state) => state.threadLastVisitedAtById[threadKey]);
   const isSelected = useThreadSelectionStore((state) => state.selectedThreadKeys.has(threadKey));
@@ -793,7 +920,12 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
     return (
       <li
         data-thread-item
-        className="list-none [content-visibility:auto] [contain-intrinsic-size:auto_34px]"
+        className={cn(
+          "relative list-none",
+          props.treeDepth === null &&
+            props.treeChildCount === 0 &&
+            "[content-visibility:auto] [contain-intrinsic-size:auto_34px]",
+        )}
       >
         <Tooltip>
           <TooltipTrigger
@@ -803,7 +935,10 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                 tabIndex={0}
                 data-testid="sidebar-v2-row-slim"
                 aria-busy={isRegeneratingTitle || undefined}
-                className={cn(rowSurfaceClassName, "flex h-9 items-center gap-2.5 px-2.5")}
+                className={cn(
+                  rowSurfaceClassName,
+                  "flex h-9 items-center gap-2.5 overflow-visible px-2.5",
+                )}
                 onClick={handleClick}
                 onDoubleClick={handleDoubleClick}
                 onKeyDown={handleKeyDown}
@@ -811,14 +946,20 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
               />
             }
           >
-            {props.treePrefix === null ? null : (
-              <span
-                aria-hidden
-                className="shrink-0 whitespace-pre font-mono text-xs text-muted-foreground/35"
-              >
-                {props.treePrefix}
-              </span>
+            {props.treeDepth === null ? null : (
+              <SidebarTreeConnector
+                depth={props.treeDepth}
+                isLast={props.treeIsLast}
+                ancestorMask={props.treeAncestorMask}
+              />
             )}
+            {props.treeChildCount > 0 ? (
+              <SidebarTreeVisibilityButton
+                expanded={props.treeChildrenVisible}
+                forced={props.treeVisibilityForced}
+                onToggle={() => props.onToggleTreeChildren(treeParentKey, props.treeSection)}
+              />
+            ) : null}
             {/* Settled history recedes: dimmed favicon at rest, restored on
               hover so the tail stays scannable when you're hunting. */}
             <span
@@ -917,6 +1058,9 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
           </TooltipTrigger>
           {detailsTooltip}
         </Tooltip>
+        {props.treeChildCount > 0 && props.treeChildrenVisible ? (
+          <SidebarTreeOutgoingStem childDepth={(props.treeDepth ?? 0) + 1} />
+        ) : null}
       </li>
     );
   }
@@ -926,7 +1070,11 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   return (
     <li
       data-thread-item
-      className="list-none py-0.5 [content-visibility:auto] [contain-intrinsic-size:auto_96px]"
+      className={cn(
+        "relative list-none py-0.5",
+        props.treeChildCount === 0 &&
+          "[content-visibility:auto] [contain-intrinsic-size:auto_96px]",
+      )}
     >
       <Tooltip>
         <TooltipTrigger
@@ -946,6 +1094,13 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
         >
           <div className="relative z-10 h-[4.875rem] px-2.5 py-2">
             <div className="flex h-5 min-w-0 items-center gap-1.5">
+              {props.treeChildCount > 0 ? (
+                <SidebarTreeVisibilityButton
+                  expanded={props.treeChildrenVisible}
+                  forced={props.treeVisibilityForced}
+                  onToggle={() => props.onToggleTreeChildren(treeParentKey, props.treeSection)}
+                />
+              ) : null}
               <ProjectFavicon
                 environmentId={thread.environmentId}
                 cwd={props.projectCwd ?? ""}
@@ -1081,6 +1236,9 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
         </TooltipTrigger>
         {detailsTooltip}
       </Tooltip>
+      {props.treeChildCount > 0 && props.treeChildrenVisible ? (
+        <SidebarTreeOutgoingStem childDepth={(props.treeDepth ?? 0) + 1} />
+      ) : null}
     </li>
   );
 });
@@ -1097,6 +1255,7 @@ function latestTurnDiff(
 export default function SidebarV2() {
   const projects = useProjects();
   const projectOrder = useUiStateStore((store) => store.projectOrder);
+  const threadLastVisitedAtById = useUiStateStore((store) => store.threadLastVisitedAtById);
   const threads = useThreadShells();
   const router = useRouter();
   const { isMobile, setOpenMobile } = useSidebar();
@@ -1565,14 +1724,27 @@ export default function SidebarV2() {
     return () => window.clearTimeout(id);
   }, [snoozedThreads]);
 
-  const activeThreadEntries = useMemo(() => buildSidebarThreadTree(activeThreads), [activeThreads]);
+  const hasThreadNotification = useCallback(
+    (thread: EnvironmentThreadShell) => {
+      const threadKey = scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id));
+      return hasUnseenCompletion({
+        ...thread,
+        lastVisitedAt: threadLastVisitedAtById[threadKey],
+      });
+    },
+    [threadLastVisitedAtById],
+  );
+  const activeThreadEntries = useMemo(
+    () => buildSidebarThreadTree(activeThreads, hasThreadNotification),
+    [activeThreads, hasThreadNotification],
+  );
   const snoozedThreadEntries = useMemo(
-    () => buildSidebarThreadTree(snoozedThreads),
-    [snoozedThreads],
+    () => buildSidebarThreadTree(snoozedThreads, hasThreadNotification),
+    [hasThreadNotification, snoozedThreads],
   );
   const settledThreadEntries = useMemo(
-    () => buildSidebarThreadTree(settledThreads),
-    [settledThreads],
+    () => buildSidebarThreadTree(settledThreads, hasThreadNotification),
+    [hasThreadNotification, settledThreads],
   );
 
   // The settled tail renders in pages: history shouldn't dominate the
@@ -1586,24 +1758,46 @@ export default function SidebarV2() {
     lastSettledResetKeyRef.current = settledResetKey;
     setSettledVisibleCount(SETTLED_TAIL_INITIAL_COUNT);
   }
+  const settledRootCount = useMemo(
+    () => settledThreadEntries.filter((entry) => entry.depth === 0).length,
+    [settledThreadEntries],
+  );
   const visibleSettledThreadEntries = useMemo(() => {
-    if (settledThreadEntries.length <= settledVisibleCount) return settledThreadEntries;
-    const visible = settledThreadEntries.slice(0, settledVisibleCount);
+    if (settledRootCount <= settledVisibleCount) return settledThreadEntries;
+    const visible: SidebarThreadTreeEntry<EnvironmentThreadShell>[] = [];
+    let rootIndex = -1;
+    let includeSubtree = false;
+    for (const entry of settledThreadEntries) {
+      if (entry.depth === 0) {
+        rootIndex += 1;
+        includeSubtree = rootIndex < settledVisibleCount;
+      }
+      if (includeSubtree) visible.push(entry);
+    }
     // The open thread must never hide under "Show more": navigating into a
-    // deep settled thread (search, deep link) pulls its row into the visible
-    // tail so the highlight and the un-settle affordance stay reachable.
+    // deep settled subtree pulls its complete ancestry into the visible tail.
     if (routeThreadKey !== null) {
-      const routeThread = settledThreadEntries
-        .slice(settledVisibleCount)
-        .find(
-          ({ thread }) =>
-            scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-        );
-      if (routeThread !== undefined) visible.push(routeThread);
+      const visibleKeys = new Set(
+        visible.map(({ thread }) =>
+          scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)),
+        ),
+      );
+      if (!visibleKeys.has(routeThreadKey)) {
+        for (const entry of sidebarThreadTreeSubtreeContainingThread(
+          settledThreadEntries,
+          routeThreadKey,
+        )) {
+          const key = scopedThreadKey(scopeThreadRef(entry.thread.environmentId, entry.thread.id));
+          if (!visibleKeys.has(key)) visible.push(entry);
+        }
+      }
     }
     return visible;
-  }, [routeThreadKey, settledThreadEntries, settledVisibleCount]);
-  const hiddenSettledCount = settledThreadEntries.length - visibleSettledThreadEntries.length;
+  }, [routeThreadKey, settledRootCount, settledThreadEntries, settledVisibleCount]);
+  const visibleSettledRootCount = visibleSettledThreadEntries.filter(
+    (entry) => entry.depth === 0,
+  ).length;
+  const hiddenSettledCount = settledRootCount - visibleSettledRootCount;
   const showMoreSettled = useCallback(
     () => setSettledVisibleCount((count) => count + SETTLED_TAIL_PAGE_COUNT),
     [],
@@ -1613,12 +1807,8 @@ export default function SidebarV2() {
   const renderedSettledThreadEntries = useMemo(() => {
     if (settledShelfExpanded) return visibleSettledThreadEntries;
     if (routeThreadKey === null) return [];
-    const routeThread = visibleSettledThreadEntries.find(
-      ({ thread }) =>
-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-    );
-    return routeThread === undefined ? [] : [routeThread];
-  }, [routeThreadKey, settledShelfExpanded, visibleSettledThreadEntries]);
+    return sidebarThreadTreeSubtreeContainingThread(settledThreadEntries, routeThreadKey);
+  }, [routeThreadKey, settledShelfExpanded, settledThreadEntries, visibleSettledThreadEntries]);
 
   // The snoozed shelf is collapsed by default: out of the way, never gone.
   // Collapsed threads don't render (and so don't participate in jump
@@ -1632,18 +1822,110 @@ export default function SidebarV2() {
     // elsewhere) keeps its row — with highlight and wake affordance — same
     // exception the settled tail's "Show more" makes.
     if (routeThreadKey === null) return [];
-    const routeThread = snoozedThreadEntries.find(
-      ({ thread }) =>
-        scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id)) === routeThreadKey,
-    );
-    return routeThread === undefined ? [] : [routeThread];
+    return sidebarThreadTreeSubtreeContainingThread(snoozedThreadEntries, routeThreadKey);
   }, [routeThreadKey, snoozedShelfExpanded, snoozedThreadEntries]);
+  const [expandedTreeParentKeys, setExpandedTreeParentKeys] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [treeParentVisibilityOverrides, setTreeParentVisibilityOverrides] = useState<
+    ReadonlyMap<string, boolean>
+  >(() => new Map());
+  const toggleTreeParent = useCallback((parentKey: string) => {
+    setExpandedTreeParentKeys((current) => {
+      const next = new Set(current);
+      if (next.has(parentKey)) next.delete(parentKey);
+      else next.add(parentKey);
+      return next;
+    });
+  }, []);
+  const toggleTreeParentVisibility = useCallback(
+    (parentKey: string, section: "active" | "snoozed" | "settled") => {
+      setTreeParentVisibilityOverrides((current) => {
+        const next = new Map(current);
+        const visible = current.get(parentKey) ?? section !== "settled";
+        next.set(parentKey, !visible);
+        return next;
+      });
+    },
+    [],
+  );
+  const routeForcedExpandedParentKeys = useMemo(() => {
+    const forced = new Set<string>();
+    if (routeThreadKey === null) return forced;
+    for (const entries of [activeThreadEntries, snoozedThreadEntries, settledThreadEntries]) {
+      for (const parentKey of sidebarTreeParentKeysContainingHiddenThread(
+        entries,
+        routeThreadKey,
+      )) {
+        forced.add(parentKey);
+      }
+    }
+    return forced;
+  }, [activeThreadEntries, routeThreadKey, settledThreadEntries, snoozedThreadEntries]);
+  const routeForcedVisibleParentKeys = useMemo(() => {
+    const forced = new Set<string>();
+    if (routeThreadKey === null) return forced;
+    for (const entries of [activeThreadEntries, snoozedThreadEntries, settledThreadEntries]) {
+      for (const parentKey of sidebarTreeAncestorKeysForThread(entries, routeThreadKey)) {
+        forced.add(parentKey);
+      }
+    }
+    return forced;
+  }, [activeThreadEntries, routeThreadKey, settledThreadEntries, snoozedThreadEntries]);
+  const effectiveExpandedTreeParentKeys = useMemo(() => {
+    if (routeForcedExpandedParentKeys.size === 0) return expandedTreeParentKeys;
+    const next = new Set(expandedTreeParentKeys);
+    for (const parentKey of routeForcedExpandedParentKeys) next.add(parentKey);
+    return next;
+  }, [expandedTreeParentKeys, routeForcedExpandedParentKeys]);
+  const collapsedTreeParentKeys = useMemo(() => {
+    return resolveCollapsedSidebarTreeParentKeys({
+      active: activeThreadEntries,
+      snoozed: snoozedThreadEntries,
+      settled: settledThreadEntries,
+      visibilityOverrides: treeParentVisibilityOverrides,
+      forcedVisibleParentKeys: routeForcedVisibleParentKeys,
+    });
+  }, [
+    activeThreadEntries,
+    routeForcedVisibleParentKeys,
+    settledThreadEntries,
+    snoozedThreadEntries,
+    treeParentVisibilityOverrides,
+  ]);
+  const activeThreadDisplay = useMemo(
+    () =>
+      buildCollapsibleSidebarThreadTree(
+        activeThreadEntries,
+        effectiveExpandedTreeParentKeys,
+        collapsedTreeParentKeys,
+      ),
+    [activeThreadEntries, collapsedTreeParentKeys, effectiveExpandedTreeParentKeys],
+  );
+  const snoozedThreadDisplay = useMemo(
+    () =>
+      buildCollapsibleSidebarThreadTree(
+        visibleSnoozedThreadEntries,
+        effectiveExpandedTreeParentKeys,
+        collapsedTreeParentKeys,
+      ),
+    [collapsedTreeParentKeys, effectiveExpandedTreeParentKeys, visibleSnoozedThreadEntries],
+  );
+  const settledThreadDisplay = useMemo(
+    () =>
+      buildCollapsibleSidebarThreadTree(
+        renderedSettledThreadEntries,
+        effectiveExpandedTreeParentKeys,
+        collapsedTreeParentKeys,
+      ),
+    [collapsedTreeParentKeys, effectiveExpandedTreeParentKeys, renderedSettledThreadEntries],
+  );
   const orderedThreads = useMemo(
     () =>
-      [...activeThreadEntries, ...visibleSnoozedThreadEntries, ...renderedSettledThreadEntries].map(
-        (entry) => entry.thread,
+      [...activeThreadDisplay, ...snoozedThreadDisplay, ...settledThreadDisplay].flatMap((item) =>
+        item.kind === "thread" ? [item.entry.thread] : [],
       ),
-    [activeThreadEntries, renderedSettledThreadEntries, visibleSnoozedThreadEntries],
+    [activeThreadDisplay, settledThreadDisplay, snoozedThreadDisplay],
   );
   const orderedThreadKeys = useMemo(
     () =>
@@ -2633,13 +2915,6 @@ export default function SidebarV2() {
                   const isPiChild = thread.backing?.parentThreadId !== undefined;
                   const isCard = section === "active" && !isPiChild;
                   const rowVariant = isCard ? "card" : "slim";
-                  const treePrefix = !isPiChild
-                    ? null
-                    : entry.depth === 0
-                      ? "└─ "
-                      : `${entry.ancestorContinues
-                          .map((continues) => (continues ? "│  " : "   "))
-                          .join("")}${entry.isLast ? "└─ " : "├─ "}`;
                   return (
                     <SidebarV2Row
                       // Keyed per variant on purpose: when a thread settles,
@@ -2662,10 +2937,12 @@ export default function SidebarV2() {
                             : "settle"
                       }
                       settlementSupported={
+                        !isPiChild &&
                         serverConfigs.get(thread.environmentId)?.environment.capabilities
                           .threadSettlement === true
                       }
                       snoozeSupported={
+                        !isPiChild &&
                         serverConfigs.get(thread.environmentId)?.environment.capabilities
                           .threadSnooze === true
                       }
@@ -2708,13 +2985,43 @@ export default function SidebarV2() {
                       onSnooze={attemptSnooze}
                       onUnsnooze={attemptUnsnooze}
                       onChangeRequestState={handleChangeRequestState}
-                      treePrefix={treePrefix}
+                      treeDepth={isPiChild ? entry.depth : null}
+                      treeIsLast={entry.isLast}
+                      treeAncestorMask={entry.ancestorContinues
+                        .map((continues) => (continues ? "1" : "0"))
+                        .join("")}
+                      treeChildCount={entry.childCount}
+                      treeChildrenVisible={!collapsedTreeParentKeys.has(threadKey)}
+                      treeVisibilityForced={routeForcedVisibleParentKeys.has(threadKey)}
+                      treeSection={section}
+                      onToggleTreeChildren={toggleTreeParentVisibility}
                     />
                   );
                 };
-                const items: ReactNode[] = activeThreadEntries.map((entry) =>
-                  renderThreadRow(entry, "active"),
-                );
+                const renderTreeDisplay = (
+                  display: ReadonlyArray<SidebarThreadTreeDisplayItem<EnvironmentThreadShell>>,
+                  section: "active" | "snoozed" | "settled",
+                ) =>
+                  display.map((item) => {
+                    if (item.kind === "thread") return renderThreadRow(item.entry, section);
+                    // A routed hidden descendant forces its ancestors open.
+                    // Don't offer "Show less" until the user explicitly pins
+                    // that expansion; the route must remain visible.
+                    if (
+                      item.action === "collapse" &&
+                      routeForcedExpandedParentKeys.has(item.parentKey)
+                    ) {
+                      return null;
+                    }
+                    return (
+                      <SidebarTreeControlRow
+                        key={`tree-control:${item.parentKey}`}
+                        item={item}
+                        onToggle={toggleTreeParent}
+                      />
+                    );
+                  });
+                const items: ReactNode[] = renderTreeDisplay(activeThreadDisplay, "active");
                 // Snoozed shelf: between the inbox and Settled — out of the
                 // way, never gone. The header always renders while anything
                 // is snoozed (the count is the whole footprint when
@@ -2744,9 +3051,7 @@ export default function SidebarV2() {
                       </button>
                     </li>,
                   );
-                  for (const entry of visibleSnoozedThreadEntries) {
-                    items.push(renderThreadRow(entry, "snoozed"));
-                  }
+                  items.push(...renderTreeDisplay(snoozedThreadDisplay, "snoozed"));
                 }
                 if (settledThreads.length > 0) {
                   items.push(
@@ -2773,9 +3078,7 @@ export default function SidebarV2() {
                     </li>,
                   );
                 }
-                for (const entry of renderedSettledThreadEntries) {
-                  items.push(renderThreadRow(entry, "settled"));
-                }
+                items.push(...renderTreeDisplay(settledThreadDisplay, "settled"));
                 return items;
               })()}
               {settledShelfExpanded && hiddenSettledCount > 0 ? (

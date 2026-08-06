@@ -502,7 +502,23 @@ export interface SidebarThreadTreeEntry<T> {
   readonly depth: number;
   readonly isLast: boolean;
   readonly ancestorContinues: readonly boolean[];
+  readonly childCount: number;
 }
+
+export type SidebarThreadTreeDisplayItem<T> =
+  | {
+      readonly kind: "thread";
+      readonly entry: SidebarThreadTreeEntry<T>;
+    }
+  | {
+      readonly kind: "control";
+      readonly action: "expand" | "collapse";
+      readonly parentKey: string;
+      readonly hiddenCount: number;
+      readonly depth: number;
+      readonly isLast: boolean;
+      readonly ancestorContinues: readonly boolean[];
+    };
 
 /**
  * Pi stores a sub-session's parent as another session file. The server
@@ -520,7 +536,7 @@ export function buildSidebarThreadTree<
         }
       | undefined;
   },
->(threads: readonly T[]): SidebarThreadTreeEntry<T>[] {
+>(threads: readonly T[], hasNotification?: (thread: T) => boolean): SidebarThreadTreeEntry<T>[] {
   type Node = { readonly thread: T; readonly children: Node[] };
   const keyFor = (thread: Pick<T, "environmentId" | "id">) =>
     `${thread.environmentId}:${thread.id}`;
@@ -536,6 +552,18 @@ export function buildSidebarThreadTree<
     if (parent === undefined || parent === node) roots.push(node);
     else parent.children.push(node);
   }
+  if (hasNotification) {
+    const prioritizeChildren = (nodes: readonly Node[]) => {
+      for (const node of nodes) {
+        node.children.sort(
+          (left, right) =>
+            Number(hasNotification(right.thread)) - Number(hasNotification(left.thread)),
+        );
+        prioritizeChildren(node.children);
+      }
+    };
+    prioritizeChildren(roots);
+  }
 
   const entries: SidebarThreadTreeEntry<T>[] = [];
   const visited = new Set<Node>();
@@ -547,7 +575,13 @@ export function buildSidebarThreadTree<
   ) => {
     if (visited.has(node)) return;
     visited.add(node);
-    entries.push({ thread: node.thread, depth, isLast, ancestorContinues });
+    entries.push({
+      thread: node.thread,
+      depth,
+      isLast,
+      ancestorContinues,
+      childCount: node.children.length,
+    });
     const children = node.children.filter((child) => !visited.has(child));
     children.forEach((child, index) =>
       walk(
@@ -566,12 +600,246 @@ export function buildSidebarThreadTree<
   return entries;
 }
 
+const COLLAPSED_TREE_LEADING_CHILDREN = 2;
+const COLLAPSED_TREE_TRAILING_CHILDREN = 1;
+const DEFAULT_TREE_CHILD_COLLAPSE_THRESHOLD = 5;
+const EMPTY_TREE_PARENT_KEYS: ReadonlySet<string> = new Set();
+
+export function sidebarTreeParentKeysContainingHiddenThread<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+    readonly backing?:
+      | {
+          readonly parentThreadId?: string | undefined;
+        }
+      | undefined;
+  },
+>(
+  entries: readonly SidebarThreadTreeEntry<T>[],
+  targetKey: string,
+  collapseThreshold = DEFAULT_TREE_CHILD_COLLAPSE_THRESHOLD,
+): ReadonlySet<string> {
+  const entryByKey = new Map<string, SidebarThreadTreeEntry<T>>(
+    entries.map((entry) => [`${entry.thread.environmentId}:${entry.thread.id}`, entry] as const),
+  );
+  const childrenByParentKey = new Map<string, SidebarThreadTreeEntry<T>[]>();
+  for (const entry of entries) {
+    const parentId = entry.thread.backing?.parentThreadId;
+    if (parentId === undefined) continue;
+    const parentKey = `${entry.thread.environmentId}:${parentId}`;
+    const siblings = childrenByParentKey.get(parentKey);
+    if (siblings) siblings.push(entry);
+    else childrenByParentKey.set(parentKey, [entry]);
+  }
+
+  const parentKeys = new Set<string>();
+  const visitedKeys = new Set<string>();
+  let currentKey = targetKey;
+  let current = entryByKey.get(targetKey);
+  while (current && !visitedKeys.has(currentKey)) {
+    visitedKeys.add(currentKey);
+    const parentId = current.thread.backing?.parentThreadId;
+    if (parentId === undefined) break;
+    const parentKey = `${current.thread.environmentId}:${parentId}`;
+    const siblings = childrenByParentKey.get(parentKey) ?? [];
+    const index = siblings.indexOf(current);
+    if (
+      siblings.length > collapseThreshold &&
+      index >= COLLAPSED_TREE_LEADING_CHILDREN &&
+      index < siblings.length - COLLAPSED_TREE_TRAILING_CHILDREN
+    ) {
+      parentKeys.add(parentKey);
+    }
+    currentKey = parentKey;
+    current = entryByKey.get(parentKey);
+  }
+  return parentKeys;
+}
+
+export function sidebarTreeAncestorKeysForThread<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+    readonly backing?:
+      | {
+          readonly parentThreadId?: string | undefined;
+        }
+      | undefined;
+  },
+>(entries: readonly SidebarThreadTreeEntry<T>[], targetKey: string): ReadonlySet<string> {
+  const entryByKey = new Map<string, SidebarThreadTreeEntry<T>>(
+    entries.map((entry) => [`${entry.thread.environmentId}:${entry.thread.id}`, entry] as const),
+  );
+  const ancestors = new Set<string>();
+  const visited = new Set<string>();
+  let currentKey = targetKey;
+  let current = entryByKey.get(currentKey);
+  while (current && !visited.has(currentKey)) {
+    visited.add(currentKey);
+    const parentId = current.thread.backing?.parentThreadId;
+    if (parentId === undefined) break;
+    const parentKey = `${current.thread.environmentId}:${parentId}`;
+    if (!entryByKey.has(parentKey)) break;
+    ancestors.add(parentKey);
+    currentKey = parentKey;
+    current = entryByKey.get(parentKey);
+  }
+  return ancestors;
+}
+
+export function sidebarThreadTreeSubtreeContainingThread<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+  },
+>(
+  entries: readonly SidebarThreadTreeEntry<T>[],
+  targetKey: string,
+): readonly SidebarThreadTreeEntry<T>[] {
+  const targetIndex = entries.findIndex(
+    (entry) => `${entry.thread.environmentId}:${entry.thread.id}` === targetKey,
+  );
+  if (targetIndex < 0) return [];
+  let rootIndex = targetIndex;
+  while (rootIndex > 0 && entries[rootIndex]!.depth > 0) rootIndex -= 1;
+  let endIndex = rootIndex + 1;
+  while (endIndex < entries.length && entries[endIndex]!.depth > 0) endIndex += 1;
+  return entries.slice(rootIndex, endIndex);
+}
+
+export function resolveCollapsedSidebarTreeParentKeys<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+  },
+>(input: {
+  readonly active: readonly SidebarThreadTreeEntry<T>[];
+  readonly snoozed: readonly SidebarThreadTreeEntry<T>[];
+  readonly settled: readonly SidebarThreadTreeEntry<T>[];
+  readonly visibilityOverrides: ReadonlyMap<string, boolean>;
+  readonly forcedVisibleParentKeys: ReadonlySet<string>;
+}): ReadonlySet<string> {
+  const collapsed = new Set<string>();
+  const collect = (entries: readonly SidebarThreadTreeEntry<T>[], defaultVisible: boolean) => {
+    for (const entry of entries) {
+      if (entry.childCount === 0) continue;
+      const key = `${entry.thread.environmentId}:${entry.thread.id}`;
+      const visible = input.visibilityOverrides.get(key) ?? defaultVisible;
+      if (!visible && !input.forcedVisibleParentKeys.has(key)) collapsed.add(key);
+    }
+  };
+  collect(input.active, true);
+  collect(input.snoozed, true);
+  collect(input.settled, false);
+  return collapsed;
+}
+
+/**
+ * Dense subagent families keep their first and last children visible while
+ * replacing the middle with one expandable row. Collapse happens per parent,
+ * so nested trees retain their own hierarchy rather than being sliced flat.
+ */
+export function buildCollapsibleSidebarThreadTree<
+  T extends {
+    readonly id: string;
+    readonly environmentId: string;
+    readonly backing?:
+      | {
+          readonly parentThreadId?: string | undefined;
+        }
+      | undefined;
+  },
+>(
+  entries: readonly SidebarThreadTreeEntry<T>[],
+  expandedParentKeys: ReadonlySet<string>,
+  collapsedParentKeys: ReadonlySet<string> = EMPTY_TREE_PARENT_KEYS,
+  collapseThreshold = DEFAULT_TREE_CHILD_COLLAPSE_THRESHOLD,
+): SidebarThreadTreeDisplayItem<T>[] {
+  type Node = {
+    readonly entry: SidebarThreadTreeEntry<T>;
+    readonly children: Node[];
+  };
+  const roots: Node[] = [];
+  const stack: Node[] = [];
+  for (const entry of entries) {
+    const node: Node = { entry, children: [] };
+    const parent = entry.depth === 0 ? undefined : stack[entry.depth - 1];
+    const parentId = entry.thread.backing?.parentThreadId;
+    const parentMatches =
+      parent !== undefined &&
+      parentId === parent.entry.thread.id &&
+      entry.thread.environmentId === parent.entry.thread.environmentId;
+    if (parentMatches) parent.children.push(node);
+    else roots.push(node);
+    stack[entry.depth] = node;
+    stack.length = entry.depth + 1;
+  }
+
+  const countNodes = (node: Node): number =>
+    1 + node.children.reduce((total, child) => total + countNodes(child), 0);
+  const result: SidebarThreadTreeDisplayItem<T>[] = [];
+  const walk = (
+    node: Node,
+    depth: number,
+    ancestorContinues: readonly boolean[],
+    isLast: boolean,
+  ) => {
+    const entry = {
+      ...node.entry,
+      depth,
+      ancestorContinues,
+      isLast,
+      childCount: node.children.length,
+    };
+    result.push({ kind: "thread", entry });
+    const { children } = node;
+    const parentKey = `${entry.thread.environmentId}:${entry.thread.id}`;
+    if (collapsedParentKeys.has(parentKey)) return;
+    const childAncestorContinues = [...ancestorContinues, depth > 0 && !isLast];
+    const walkChild = (child: Node, index: number) =>
+      walk(child, depth + 1, childAncestorContinues, index === children.length - 1);
+    if (children.length <= collapseThreshold) {
+      children.forEach(walkChild);
+      return;
+    }
+
+    const expanded = expandedParentKeys.has(parentKey);
+    const leading = children.slice(0, COLLAPSED_TREE_LEADING_CHILDREN);
+    const trailing = children.slice(-COLLAPSED_TREE_TRAILING_CHILDREN);
+    leading.forEach(walkChild);
+    const middle = children.slice(
+      COLLAPSED_TREE_LEADING_CHILDREN,
+      expanded ? children.length : -COLLAPSED_TREE_TRAILING_CHILDREN,
+    );
+    result.push({
+      kind: "control",
+      action: expanded ? "collapse" : "expand",
+      parentKey,
+      hiddenCount: middle.reduce((total, child) => total + countNodes(child), 0),
+      depth: depth + 1,
+      isLast: false,
+      ancestorContinues: childAncestorContinues,
+    });
+    if (expanded) {
+      middle.forEach((child, index) => walkChild(child, index + COLLAPSED_TREE_LEADING_CHILDREN));
+    } else {
+      trailing.forEach((child, index) =>
+        walkChild(child, children.length - COLLAPSED_TREE_TRAILING_CHILDREN + index),
+      );
+    }
+  };
+
+  roots.forEach((root, index) => walk(root, 0, [], index === roots.length - 1));
+  return result;
+}
+
 export type SidebarThreadSection = "active" | "snoozed" | "settled";
 
 /**
- * A Pi session tree moves through lifecycle shelves as one unit. Otherwise a
- * fresh child can sort above its settled parent and the hierarchy degrades
- * back into unrelated rows. Active work wins, then snoozed, then settled.
+ * A Pi session tree moves through lifecycle shelves with its root parent.
+ * Otherwise a fresh child can pull a settled parent back into the inbox and
+ * the hierarchy degrades into unrelated lifecycle states.
  */
 export function partitionSidebarThreadTrees<
   T extends {
@@ -593,21 +861,19 @@ export function partitionSidebarThreadTrees<
     settled: [],
   };
   let subtree: T[] = [];
-  let subtreeSection: SidebarThreadSection = "settled";
+  let subtreeSection: SidebarThreadSection = "active";
   const flush = () => {
     if (subtree.length === 0) return;
     partitioned[subtreeSection].push(...subtree);
     subtree = [];
-    subtreeSection = "settled";
   };
 
   for (const entry of buildSidebarThreadTree(threads)) {
-    if (entry.depth === 0) flush();
-    subtree.push(entry.thread);
-    const section = sectionFor(entry.thread);
-    if (section === "active" || (section === "snoozed" && subtreeSection === "settled")) {
-      subtreeSection = section;
+    if (entry.depth === 0) {
+      flush();
+      subtreeSection = sectionFor(entry.thread);
     }
+    subtree.push(entry.thread);
   }
   flush();
   return partitioned;
