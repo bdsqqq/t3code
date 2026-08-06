@@ -8,7 +8,11 @@ describe("renderSafeMermaidSvg", () => {
 
     expect(svg).toContain("<svg");
     expect(svg).toContain('aria-hidden="true"');
-    expect(svg).toContain("var(--foreground)");
+    expect(svg).toContain(
+      'style="--bg:var(--background);--fg:var(--foreground);--line:var(--muted-foreground);' +
+        "--accent:var(--primary);--muted:var(--muted-foreground);--surface:var(--card);" +
+        '--border:var(--input)"',
+    );
     expect(svg).toContain('id="diagram-one-arrowhead"');
     expect(svg).toContain('data-id="A"');
     expect(svg).not.toContain("fonts.googleapis.com");

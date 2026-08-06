@@ -7,6 +7,17 @@ import { prepareMermaidSource } from "./mermaid-source";
 const MAX_SVG_LENGTH = 2_000_000;
 const MAX_FLOWCHART_NODES = 150;
 const MAX_FLOWCHART_EDGES = 100;
+const MERMAID_THEME = {
+  bg: "var(--background)",
+  fg: "var(--foreground)",
+  line: "var(--muted-foreground)",
+  accent: "var(--primary)",
+  muted: "var(--muted-foreground)",
+  surface: "var(--card)",
+  // beautiful-mermaid names its own variable --border, so referencing T3's
+  // --border here would create a self-reference on the generated SVG.
+  border: "var(--input)",
+} as const;
 const SVG_TAGS = [
   "svg",
   "style",
@@ -142,11 +153,7 @@ export function renderSafeMermaidSvg(code: string, namespace: string): string {
   // beautiful-mermaid decodes XML entities internally. Re-encode ampersands so the
   // source validated above is exactly the source its parser and renderer receive.
   const rendered = renderMermaidSVG(source.replaceAll("&", "&amp;"), {
-    bg: "color-mix(in srgb, var(--muted) 78%, var(--background))",
-    fg: "var(--foreground)",
-    line: "var(--muted-foreground)",
-    accent: "var(--foreground)",
-    border: "var(--border)",
+    ...MERMAID_THEME,
     font: "DM Sans Variable",
     transparent: true,
     interactive: false,
