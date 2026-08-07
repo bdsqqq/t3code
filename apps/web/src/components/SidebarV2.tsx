@@ -394,9 +394,9 @@ function SnoozePopoverButton(props: {
 }
 
 const TREE_GUIDE_STEP_PX = 18;
-// Tree rows use `gap-1` (4px). Each guide owns exactly half that gap so
-// adjacent translucent segments meet without overlapping and darkening.
-const TREE_GUIDE_GAP_HALF_PX = 2;
+// Tree rows use `gap-px`. The preceding row owns that one gap pixel, which
+// keeps every segment on integer CSS pixels without overlap or a hairline seam.
+const TREE_GUIDE_ROW_GAP_PX = 1;
 
 function SidebarTreeConnector(props: {
   readonly depth: number;
@@ -407,25 +407,29 @@ function SidebarTreeConnector(props: {
   return (
     <span
       aria-hidden
-      className="relative shrink-0"
+      className="relative h-full shrink-0"
       style={{
         width: (props.depth + 1) * TREE_GUIDE_STEP_PX,
-        height: `calc(100% + ${TREE_GUIDE_GAP_HALF_PX * 2}px)`,
-        marginBlock: -TREE_GUIDE_GAP_HALF_PX,
       }}
     >
       {[...props.ancestorMask].map((continues, index) =>
         continues === "1" ? (
           <span
             key={index}
-            className="absolute inset-y-0 w-px bg-sidebar-border/75"
-            style={{ left: index * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2 }}
+            className="absolute top-0 w-px bg-sidebar-border/75"
+            style={{
+              bottom: -TREE_GUIDE_ROW_GAP_PX,
+              left: index * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2,
+            }}
           />
         ) : null,
       )}
       <span
         className="absolute top-0 w-px bg-sidebar-border/75"
-        style={{ bottom: props.isLast ? "50%" : 0, left: branchLeft }}
+        style={{
+          bottom: props.isLast ? "50%" : -TREE_GUIDE_ROW_GAP_PX,
+          left: branchLeft,
+        }}
       />
       <span
         className="absolute right-0 top-1/2 h-px bg-sidebar-border/75"
@@ -447,8 +451,8 @@ function SidebarTreeOutgoingStem(props: {
       className="pointer-events-none absolute w-px bg-sidebar-border/75"
       style={{
         left: 10 + props.childDepth * TREE_GUIDE_STEP_PX + TREE_GUIDE_STEP_PX / 2,
-        bottom: -TREE_GUIDE_GAP_HALF_PX,
-        height: TREE_GUIDE_GAP_HALF_PX + props.surfaceBottomInset,
+        bottom: -TREE_GUIDE_ROW_GAP_PX,
+        height: TREE_GUIDE_ROW_GAP_PX + props.surfaceBottomInset,
       }}
     />
   );
