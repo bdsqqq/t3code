@@ -425,18 +425,22 @@ function SidebarTreeConnector(props: {
         ) : null,
       )}
       <span
-        className="absolute top-0 w-px bg-sidebar-border/75"
+        className="absolute right-0 top-0 border-b border-l border-sidebar-border/75"
         style={{
-          bottom: props.isLast ? "50%" : -TREE_GUIDE_ROW_GAP_PX,
+          bottom: "calc(50% - 1px)",
           left: branchLeft,
         }}
       />
-      <span
-        className="absolute right-0 top-1/2 h-px bg-sidebar-border/75"
-        // The horizontal begins after the vertical's occupied pixel. Starting
-        // both at branchLeft compounds their translucent color at every elbow.
-        style={{ left: branchLeft + 1 }}
-      />
+      {props.isLast ? null : (
+        <span
+          className="absolute w-px bg-sidebar-border/75"
+          style={{
+            top: "calc(50% + 1px)",
+            bottom: -TREE_GUIDE_ROW_GAP_PX,
+            left: branchLeft,
+          }}
+        />
+      )}
     </span>
   );
 }
