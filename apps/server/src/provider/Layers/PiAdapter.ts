@@ -451,12 +451,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
       return;
     }
     if (type?.startsWith("tool_execution_")) {
-      const lifecycle =
-        type === "tool_execution_start"
-          ? "item.started"
-          : type === "tool_execution_update"
-            ? "item.updated"
-            : "item.completed";
+      // pi's partial result is a cumulative snapshot, not a delta. persisting
+      // every snapshot duplicates all prior output and can outrun the serial
+      // ingestion worker; start/end preserve lifecycle and final output.
+      if (type === "tool_execution_update") return;
+      const lifecycle = type === "tool_execution_start" ? "item.started" : "item.completed";
       const itemId = yield* itemForTool(turn, event);
       const toolKey = toolEventKey(event);
       const eventArgs = isRecord(event.args) ? event.args : undefined;

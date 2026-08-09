@@ -41,6 +41,36 @@ const modelSelection = createModelSelection(instanceId, "openai/gpt-5", [
   { id: "thinkingLevel", value: "max" },
 ]);
 type Adapter = ProviderAdapterShape<ProviderAdapterError>;
+type ToolLifecycleEvent = Extract<
+  ProviderRuntimeEvent,
+  { type: "item.started" | "item.updated" | "item.completed" }
+>;
+
+const isToolLifecycleEvent = (event: ProviderRuntimeEvent): event is ToolLifecycleEvent =>
+  event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed";
+
+const toolCallIdOf = (event: ToolLifecycleEvent): string | undefined => {
+  const data = event.payload.data;
+  if (typeof data !== "object" || data === null) return undefined;
+  const toolCallId = Reflect.get(data, "toolCallId");
+  return typeof toolCallId === "string" ? toolCallId : undefined;
+};
+
+const toolEventsByCallId = (events: ReadonlyArray<ProviderRuntimeEvent>) => {
+  const byCallId = new Map<string, ToolLifecycleEvent[]>();
+  for (const event of events) {
+    if (!isToolLifecycleEvent(event)) continue;
+    const toolCallId = toolCallIdOf(event);
+    if (!toolCallId) continue;
+    const toolEvents = byCallId.get(toolCallId) ?? [];
+    toolEvents.push(event);
+    byCallId.set(toolCallId, toolEvents);
+  }
+  return byCallId;
+};
+
+const completesToolCall = (toolCallId: string) => (event: ProviderRuntimeEvent) =>
+  event.type === "item.completed" && toolCallIdOf(event) === toolCallId;
 
 class FakeClient implements PiRpcClient {
   // oxlint-disable-next-line t3code/no-manual-effect-runtime-in-tests -- The synchronous fake exposes its queue through the PiRpcClient stream interface.
@@ -301,7 +331,8 @@ describe("PiAdapter", () => {
     return withAdapter(h, (adapter) =>
       Effect.gen(function* () {
         yield* start(adapter);
-        const collected = yield* Stream.take(adapter.streamEvents, 7).pipe(
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil(completesToolCall("edit-1")),
           Stream.runCollect,
           Effect.forkChild,
         );
@@ -363,19 +394,20 @@ describe("PiAdapter", () => {
         ]);
 
         const events = Array.from(yield* Fiber.join(collected));
-        const tools = events.filter(
-          (
-            event,
-          ): event is Extract<
-            ProviderRuntimeEvent,
-            { type: "item.started" | "item.updated" | "item.completed" }
-          > =>
-            event.type === "item.started" ||
-            event.type === "item.updated" ||
-            event.type === "item.completed",
+        const tools = toolEventsByCallId(events);
+        const bashEvents = tools.get("bash-1");
+        const editEvents = tools.get("edit-1");
+        assert.deepEqual(
+          bashEvents?.map((event) => event.type),
+          ["item.started", "item.completed"],
         );
-        assert.equal(tools.length, 6);
-        assert.deepEqual(tools[2]?.payload, {
+        assert.deepEqual(
+          editEvents?.map((event) => event.type),
+          ["item.started", "item.completed"],
+        );
+        const bashCompleted = bashEvents?.find((event) => event.type === "item.completed");
+        const editCompleted = editEvents?.find((event) => event.type === "item.completed");
+        assert.deepEqual(bashCompleted?.payload, {
           itemType: "command_execution",
           title: "Ran command",
           status: "completed",
@@ -392,7 +424,7 @@ describe("PiAdapter", () => {
             item: { input: { command: "git status --short" } },
           },
         });
-        assert.deepEqual(tools[5]?.payload, {
+        assert.deepEqual(editCompleted?.payload, {
           itemType: "file_change",
           title: "Edited file",
           detail: "src/app.ts",
@@ -421,7 +453,8 @@ describe("PiAdapter", () => {
     return withAdapter(h, (adapter) =>
       Effect.gen(function* () {
         yield* start(adapter);
-        const collected = yield* Stream.take(adapter.streamEvents, 4).pipe(
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil(completesToolCall("agent-1")),
           Stream.runCollect,
           Effect.forkChild,
         );
@@ -459,28 +492,21 @@ describe("PiAdapter", () => {
         ]);
 
         const events = Array.from(yield* Fiber.join(collected));
-        const tools = events.filter(
-          (
-            event,
-          ): event is Extract<
-            ProviderRuntimeEvent,
-            { type: "item.started" | "item.updated" | "item.completed" }
-          > =>
-            event.type === "item.started" ||
-            event.type === "item.updated" ||
-            event.type === "item.completed",
+        const agentEvents = toolEventsByCallId(events).get("agent-1");
+        assert.deepEqual(
+          agentEvents?.map((event) => event.type),
+          ["item.started", "item.completed"],
         );
-        assert.equal(tools.length, 3);
-        assert.equal(tools[0]?.payload.itemType, "dynamic_tool_call");
-        for (const event of tools.slice(1)) {
-          assert.equal(event.payload.itemType, "collab_agent_tool_call");
-          assert.equal(event.payload.title, "Security scout agent");
-          assert.equal(event.payload.detail, "Locate the authentication flow");
-          assert.equal(
-            (event.payload.data as Record<string, unknown> | undefined)?.toolName,
-            "security_scout",
-          );
-        }
+        const started = agentEvents?.find((event) => event.type === "item.started");
+        const completed = agentEvents?.find((event) => event.type === "item.completed");
+        assert.equal(started?.payload.itemType, "dynamic_tool_call");
+        assert.equal(completed?.payload.itemType, "collab_agent_tool_call");
+        assert.equal(completed?.payload.title, "Security scout agent");
+        assert.equal(completed?.payload.detail, "Locate the authentication flow");
+        assert.equal(
+          (completed?.payload.data as Record<string, unknown> | undefined)?.toolName,
+          "security_scout",
+        );
       }),
     );
   });
