@@ -5,6 +5,7 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 const PROTOCOL = "t3-control-v2";
+const LIFECYCLE_CUSTOM_TYPE = "t3.thread-lifecycle.v1";
 const SOCKET_PATH = NodePath.join(NodeOS.homedir(), ".pi", "agent", PROTOCOL, "supervisor.sock");
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
 
@@ -19,6 +20,17 @@ export type BridgeCommand =
       readonly type: "command";
       readonly commandId: string;
       readonly command: "abort" | "shutdown";
+    }
+  | {
+      readonly type: "command";
+      readonly commandId: string;
+      readonly command: "setLifecycle";
+      readonly lifecycle: {
+        readonly version: 1;
+        readonly sessionId: string;
+        readonly override: "settled" | "active";
+        readonly operationId: string;
+      };
     };
 
 export class CommandDeduper {
@@ -63,6 +75,28 @@ export function parseBridgeCommand(value: unknown): BridgeCommand | undefined {
     return { type: "command", commandId: value.commandId, command: value.command };
   }
   if (
+    value.command === "setLifecycle" &&
+    isRecord(value.lifecycle) &&
+    value.lifecycle.version === 1 &&
+    typeof value.lifecycle.sessionId === "string" &&
+    value.lifecycle.sessionId !== "" &&
+    (value.lifecycle.override === "settled" || value.lifecycle.override === "active") &&
+    typeof value.lifecycle.operationId === "string" &&
+    value.lifecycle.operationId !== ""
+  ) {
+    return {
+      type: "command",
+      commandId: value.commandId,
+      command: "setLifecycle",
+      lifecycle: {
+        version: 1,
+        sessionId: value.lifecycle.sessionId,
+        override: value.lifecycle.override,
+        operationId: value.lifecycle.operationId,
+      },
+    };
+  }
+  if (
     (value.command === "send" || value.command === "steer" || value.command === "followUp") &&
     typeof value.text === "string"
   ) {
@@ -72,6 +106,19 @@ export function parseBridgeCommand(value: unknown): BridgeCommand | undefined {
       command: value.command,
       text: value.text,
     };
+  }
+}
+
+export function lifecycleCommandError(
+  command: Extract<BridgeCommand, { readonly command: "setLifecycle" }>,
+  sessionId: string,
+  isIdle: boolean,
+): string | undefined {
+  if (command.lifecycle.sessionId !== sessionId) {
+    return "lifecycle session id does not match the active session";
+  }
+  if (command.lifecycle.override === "settled" && !isIdle) {
+    return "a running pi session cannot be settled";
   }
 }
 
@@ -112,6 +159,7 @@ type ExtensionApi = {
     text: string,
     options?: { deliverAs: "steer" | "followUp" },
   ): void | Promise<void>;
+  appendEntry(customType: string, data: unknown): void;
 };
 
 type WireMessage = Record<string, unknown>;
@@ -160,6 +208,15 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
       } else if (command.command === "steer" || command.command === "followUp") {
         pi.sendUserMessage(command.text, { deliverAs: command.command });
         receipt(command.commandId, "submitted");
+      } else if (command.command === "setLifecycle") {
+        const error = lifecycleCommandError(
+          command,
+          ctx.sessionManager.getSessionId(),
+          ctx.isIdle(),
+        );
+        if (error !== undefined) throw new Error(error);
+        pi.appendEntry(LIFECYCLE_CUSTOM_TYPE, command.lifecycle);
+        receipt(command.commandId, "accepted");
       } else {
         if (command.command === "abort") ctx.abort();
         else ctx.shutdown();

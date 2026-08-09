@@ -101,6 +101,45 @@ describe("effectiveSettled", () => {
   ] as const;
   const runningCases = [false, true] as const;
   const pendingCases = [undefined, "approval", "user-input"] as const;
+
+  it("uses the configured inactivity window for historical Pi sessions without an override", () => {
+    const externalBacking = {
+      kind: "external",
+      source: "pi",
+      sourceKey: "source",
+      control: "readOnly",
+      capabilities: {
+        send: false,
+        attachments: false,
+        streamingBehaviors: [],
+        interrupt: false,
+        stop: false,
+        rename: false,
+        archive: false,
+        settle: true,
+        unsettle: true,
+        delete: false,
+        changeModel: false,
+        changeRuntimeMode: false,
+        changeInteractionMode: false,
+        checkpoints: false,
+      },
+    } as const;
+
+    expect(
+      effectiveSettled(
+        { ...makeShell({ activityAt: STALE }), backing: externalBacking },
+        { now: NOW, autoSettleAfterDays: 3 },
+      ),
+    ).toBe(true);
+    expect(
+      effectiveSettled(
+        { ...makeShell({ activityAt: FRESH }), backing: externalBacking },
+        { now: NOW, autoSettleAfterDays: 3 },
+      ),
+    ).toBe(false);
+  });
+
   const truthTable = overrideCases.flatMap((settledOverride) =>
     changeRequestStates.flatMap((changeRequestState) =>
       inactivityCases.flatMap(([inactivity, activityAt]) =>

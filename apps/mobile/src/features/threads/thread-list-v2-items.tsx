@@ -4,6 +4,7 @@ import type {
 } from "@t3tools/client-runtime/state/shell";
 import type { EnvironmentThreadSearchMatch } from "@t3tools/client-runtime/state/thread-search";
 import { canSnooze, resolveSnoozePresets } from "@t3tools/client-runtime/state/thread-settled";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import type { MenuAction } from "@react-native-menu/menu";
 import { memo, useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
 import {
@@ -75,6 +76,12 @@ const CARD_MENU_ACTIONS: MenuAction[] = [
 const SLIM_MENU_ACTIONS: MenuAction[] = [
   { id: "unsettle", title: "Un-settle", image: "arrow.uturn.backward" },
   { id: "delete", title: "Delete", image: "trash", attributes: { destructive: true } },
+];
+const EXTERNAL_SETTLE_MENU_ACTIONS: MenuAction[] = [
+  { id: "settle", title: "Settle", image: "checkmark" },
+];
+const EXTERNAL_UNSETTLE_MENU_ACTIONS: MenuAction[] = [
+  { id: "unsettle", title: "Un-settle", image: "arrow.uturn.backward" },
 ];
 
 const SNOOZED_MENU_ACTIONS: MenuAction[] = [
@@ -743,7 +750,17 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         <ThreadListV2SectionDivider label="Settled" pane={props.pane} />
       ) : null}
       {thread.backing?.kind === "external" ? (
-        rowContent(() => undefined)
+        props.settlementSupported && threadAllows(thread, canUnsettle ? "unsettle" : "settle") ? (
+          <ControlPillMenu
+            actions={canUnsettle ? EXTERNAL_UNSETTLE_MENU_ACTIONS : EXTERNAL_SETTLE_MENU_ACTIONS}
+            onPressAction={handleMenuAction}
+            shouldOpenOnLongPress
+          >
+            {rowContent(() => undefined)}
+          </ControlPillMenu>
+        ) : (
+          rowContent(() => undefined)
+        )
       ) : (
         <ThreadSwipeable
           backgroundColor={sidebarPane ? drawerColor : screenColor}

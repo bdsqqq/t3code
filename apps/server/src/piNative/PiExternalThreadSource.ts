@@ -42,6 +42,8 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import type { PiExternalLifecycleOverride } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
+import { PiExternalLifecycleOverrideRepository } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
 import type { ProviderRuntimeBindingWithMetadata } from "../provider/Services/ProviderSessionDirectory.ts";
 import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
 import { PiSessionCursor } from "../provider/pi/PiSessionFile.ts";
@@ -70,6 +72,23 @@ const EXTERNAL_THREAD_PREFIX = "external:pi:";
 const CATALOG_MAX_THREADS = 5_000;
 const CATALOG_MAX_SERIALIZED_BYTES = 8 * 1024 * 1024;
 const CATALOG_ENVELOPE_RESERVE_BYTES = 1_024;
+export function validExternalLifecycleOverride(
+  record: PiSessionCatalogRecord,
+  override: PiExternalLifecycleOverride | undefined,
+) {
+  const local =
+    override?.observedFileSize === record.fileSize &&
+    override.observedFileMtimeMs === record.fileMtimeMs
+      ? {
+          override: override.lifecycleOverride,
+          updatedAt: override.updatedAt,
+        }
+      : undefined;
+  const jsonl = record.jsonlLifecycle;
+  if (local === undefined) return jsonl;
+  if (jsonl === undefined) return local;
+  return Date.parse(local.updatedAt) >= Date.parse(jsonl.updatedAt) ? local : jsonl;
+}
 export function shutdownCreatedRuntime(
   supervisor: Pick<SupervisorClient["Service"], "dispatch">,
   runtimeId: SupervisorRuntimeState["runtimeId"],
@@ -428,6 +447,7 @@ export class PiExternalThreadSource extends Context.Service<
       const supervisor = yield* SupervisorClient;
       const snapshots = yield* ProjectionSnapshotQuery;
       const providerSessions = yield* ProviderSessionDirectory;
+      const lifecycleOverrides = yield* PiExternalLifecycleOverrideRepository;
       const catalogBuildSemaphore = yield* Semaphore.make(1);
       let catalogSequence = 0;
       let catalogSignature = "";
@@ -485,8 +505,24 @@ export class PiExternalThreadSource extends Context.Service<
           });
         }
         const association = cachedAssociation;
+        const lifecycleBySourceKey = new Map(
+          (yield* lifecycleOverrides
+            .list()
+            .pipe(
+              Effect.mapError(() =>
+                privateSourceError(
+                  "lifecycle_store",
+                  "External Pi lifecycle state could not be loaded.",
+                ),
+              ),
+            )).map((value) => [value.sourceKey, value] as const),
+        );
         const projectedThreads = resolvedRecords.slice(0, CATALOG_MAX_THREADS).map((record) => {
           const projectId = association.projectIdByThread.get(record.threadId)!;
+          const lifecycle = validExternalLifecycleOverride(
+            record,
+            lifecycleBySourceKey.get(record.sourceKey),
+          );
           const detail = projectPiThread({
             record,
             entries: [],
@@ -494,6 +530,7 @@ export class PiExternalThreadSource extends Context.Service<
             ...(runtimeFor(record, runtimes) === undefined
               ? {}
               : { runtime: runtimeFor(record, runtimes)! }),
+            ...(lifecycle === undefined ? {} : { lifecycle }),
           });
           return projectPiThreadShell(detail);
         });
@@ -598,11 +635,27 @@ export class PiExternalThreadSource extends Context.Service<
           catch: () =>
             privateSourceError("thread_association", "Thread project association failed."),
         });
+        const lifecycle = validExternalLifecycleOverride(
+          result.record,
+          Option.getOrUndefined(
+            yield* lifecycleOverrides
+              .getBySourceKey(result.record.sourceKey)
+              .pipe(
+                Effect.mapError(() =>
+                  privateSourceError(
+                    "lifecycle_store",
+                    "External Pi lifecycle state could not be loaded.",
+                  ),
+                ),
+              ),
+          ),
+        );
         return projectPiThread({
           record: result.record,
           entries: entriesOverride ?? result.entries,
           projectId: association.projectIdByThread.get(threadId)!,
           ...(runtime === undefined ? {} : { runtime }),
+          ...(lifecycle === undefined ? {} : { lifecycle }),
         });
       });
 
@@ -811,12 +864,6 @@ export class PiExternalThreadSource extends Context.Service<
           Stream.filter((runtime): runtime is SupervisorRuntimeState => runtime !== undefined),
           Stream.take(1),
         );
-      const replacementRuntimeStreams = (record: PiSessionCatalogRecord) =>
-        awaitRuntime(record).pipe(
-          Stream.flatMap((runtime) => runtimeStream(record, runtime)),
-          Stream.repeat(Schedule.spaced("100 millis")),
-        );
-
       const dispatchSupervisor = Effect.fn("PiExternalThreadSource.dispatchSupervisor")(function* (
         command: SupervisorCommand,
       ) {
@@ -837,7 +884,177 @@ export class PiExternalThreadSource extends Context.Service<
           return yield* privateSourceError("thread_not_found", "Native Pi thread was not found.");
         }
         const result = yield* catalog.read(command.threadId);
-        const runtimes = yield* supervisor.list().pipe(Effect.orElseSucceed(() => []));
+        if (command.type === "thread.settle" || command.type === "thread.unsettle") {
+          const lifecycleOverride = command.type === "thread.settle" ? "settled" : "active";
+          const priorReceipt = yield* lifecycleOverrides
+            .getByCommandId(command.commandId)
+            .pipe(
+              Effect.mapError(() =>
+                privateSourceError(
+                  "lifecycle_store",
+                  "External Pi lifecycle receipt could not be loaded.",
+                ),
+              ),
+            );
+          if (Option.isSome(priorReceipt)) {
+            if (
+              priorReceipt.value.sourceKey !== result.record.sourceKey ||
+              priorReceipt.value.lifecycleOverride !== lifecycleOverride
+            ) {
+              return yield* sourceError(
+                "command_id_conflict",
+                "The Pi lifecycle command id was already used for another operation.",
+              );
+            }
+            const snapshot = yield* buildCatalog(true);
+            yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+            yield* PubSub.publish(catalogInvalidations, undefined);
+            yield* PubSub.publish(lifecycleInvalidations, command.threadId);
+            return {
+              sequence: snapshot.snapshotSequence,
+              deliveryStatus: "completed",
+            } satisfies DispatchResult;
+          }
+          const jsonlOperation = yield* catalog.findLifecycleOperation(
+            command.threadId,
+            command.commandId,
+          );
+          if (jsonlOperation !== undefined) {
+            if (jsonlOperation.override !== lifecycleOverride) {
+              return yield* sourceError(
+                "command_id_conflict",
+                "The Pi lifecycle command id was already used for another operation.",
+              );
+            }
+            const receipt = yield* lifecycleOverrides
+              .recordReceipt({
+                sourceKey: result.record.sourceKey,
+                commandId: command.commandId,
+                lifecycleOverride,
+                observedFileSize: result.record.fileSize,
+                observedFileMtimeMs: result.record.fileMtimeMs,
+                updatedAt: jsonlOperation.updatedAt,
+              })
+              .pipe(
+                Effect.mapError(() =>
+                  privateSourceError(
+                    "lifecycle_store",
+                    "External Pi lifecycle receipt could not be saved.",
+                  ),
+                ),
+              );
+            if (
+              receipt.sourceKey !== result.record.sourceKey ||
+              receipt.lifecycleOverride !== lifecycleOverride
+            ) {
+              return yield* sourceError(
+                "command_id_conflict",
+                "The Pi lifecycle command id was already used for another operation.",
+              );
+            }
+            const snapshot = yield* buildCatalog(true);
+            yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+            yield* PubSub.publish(catalogInvalidations, undefined);
+            yield* PubSub.publish(lifecycleInvalidations, command.threadId);
+            return {
+              sequence: snapshot.snapshotSequence,
+              deliveryStatus: "completed",
+            } satisfies DispatchResult;
+          }
+          let lifecycleRuntime: SupervisorRuntimeState | undefined;
+          if (command.type === "thread.settle") {
+            lifecycleRuntime = runtimeFor(
+              result.record,
+              yield* supervisor
+                .list()
+                .pipe(
+                  Effect.mapError(() =>
+                    privateSourceError(
+                      "runtime_state_unavailable",
+                      "Pi runtime state could not be verified.",
+                    ),
+                  ),
+                ),
+            );
+            if (
+              lifecycleRuntime?.status === "starting" ||
+              lifecycleRuntime?.status === "streaming"
+            ) {
+              return yield* sourceError(
+                "active_session",
+                "A running Pi session cannot be settled.",
+              );
+            }
+          } else {
+            lifecycleRuntime = runtimeFor(
+              result.record,
+              yield* supervisor.list().pipe(Effect.orElseSucceed(() => [])),
+            );
+          }
+          if (
+            lifecycleRuntime?.writerKind === "tuiBridge" &&
+            lifecycleRuntime.status !== "starting"
+          ) {
+            yield* dispatchSupervisor({
+              type: "setLifecycle",
+              commandId: command.commandId,
+              runtimeId: lifecycleRuntime.runtimeId,
+              lifecycle: {
+                version: 1,
+                sessionId: result.record.sessionId,
+                override: lifecycleOverride,
+                operationId: command.commandId,
+              },
+            });
+          }
+          const updatedAt = yield* DateTime.now.pipe(Effect.map(DateTime.formatIso));
+          const application = yield* lifecycleOverrides
+            .apply({
+              sourceKey: result.record.sourceKey,
+              commandId: command.commandId,
+              lifecycleOverride,
+              observedFileSize: result.record.fileSize,
+              observedFileMtimeMs: result.record.fileMtimeMs,
+              updatedAt,
+            })
+            .pipe(
+              Effect.mapError(() =>
+                privateSourceError(
+                  "lifecycle_store",
+                  "External Pi lifecycle state could not be saved.",
+                ),
+              ),
+            );
+          if (
+            application.value.sourceKey !== result.record.sourceKey ||
+            application.value.lifecycleOverride !== lifecycleOverride
+          ) {
+            return yield* sourceError(
+              "command_id_conflict",
+              "The Pi lifecycle command id was already used for another operation.",
+            );
+          }
+          // Reconcile on replays too: the first attempt may have committed its
+          // receipt before a disconnect prevented publication to subscribers.
+          const snapshot = yield* buildCatalog(true);
+          yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+          yield* PubSub.publish(catalogInvalidations, undefined);
+          yield* PubSub.publish(lifecycleInvalidations, command.threadId);
+          return {
+            sequence: snapshot.snapshotSequence,
+            deliveryStatus: "completed",
+          } satisfies DispatchResult;
+        }
+        const runtimes = yield* supervisor
+          .list()
+          .pipe(
+            Effect.mapError(() =>
+              privateSourceError(
+                "runtime_state_unavailable",
+                "Pi runtime state could not be verified.",
+              ),
+            ),
+          );
         const runtime = runtimeFor(result.record, runtimes);
         let receipt: SupervisorCommandReceipt;
         if (command.type === "thread.turn.start") {
@@ -930,7 +1147,30 @@ export class PiExternalThreadSource extends Context.Service<
       );
       const catalogSnapshots = yield* SubscriptionRef.make(initialCatalogSnapshot);
       const catalogInvalidations = yield* PubSub.sliding<void>(1);
+      const lifecycleInvalidations = yield* PubSub.sliding<ThreadId>(16);
       yield* Effect.addFinalizer(() => PubSub.shutdown(catalogInvalidations));
+      yield* Effect.addFinalizer(() => PubSub.shutdown(lifecycleInvalidations));
+      const runtimeStreamWithLifecycle = (
+        record: PiSessionCatalogRecord,
+        runtime: SupervisorRuntimeState,
+      ) => {
+        const lifecycleUpdates = Stream.fromPubSub(lifecycleInvalidations).pipe(
+          Stream.filter((threadId) => threadId === record.threadId),
+          Stream.mapEffect(() => readProjected(record.threadId)),
+          Stream.map((snapshot) => ({
+            kind: "snapshot" as const,
+            snapshot,
+          })),
+        );
+        return Stream.merge(runtimeStream(record, runtime), lifecycleUpdates, {
+          haltStrategy: "left",
+        });
+      };
+      const replacementRuntimeStreams = (record: PiSessionCatalogRecord) =>
+        awaitRuntime(record).pipe(
+          Stream.flatMap((runtime) => runtimeStreamWithLifecycle(record, runtime)),
+          Stream.repeat(Schedule.spaced("100 millis")),
+        );
       const filesystemUpdates = Stream.fromAsyncIterable(catalogTriggers(), () =>
         privateSourceError("catalog_watch", "Native Pi catalog watch failed."),
       ).pipe(
@@ -990,7 +1230,7 @@ export class PiExternalThreadSource extends Context.Service<
               );
               if (runtime) {
                 return Stream.concat(
-                  runtimeStream(record, runtime),
+                  runtimeStreamWithLifecycle(record, runtime),
                   replacementRuntimeStreams(record),
                 );
               }

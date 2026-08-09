@@ -351,6 +351,8 @@ export const ExternalThreadCapabilities = Schema.Struct({
   stop: Schema.Boolean,
   rename: Schema.Boolean,
   archive: Schema.Boolean,
+  settle: Schema.optional(Schema.Boolean),
+  unsettle: Schema.optional(Schema.Boolean),
   delete: Schema.Boolean,
   changeModel: Schema.Boolean,
   changeRuntimeMode: Schema.Boolean,

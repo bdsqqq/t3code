@@ -824,6 +824,10 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
   // would fade the hover actions out from under the open menu; pin them.
   const [snoozeMenuOpenRaw, setSnoozeMenuOpen] = useState(false);
   const allowsLifecycle = threadAllows(thread, "lifecycle");
+  const allowsSettlement = threadAllows(
+    thread,
+    variantAction === "unsettle" ? "unsettle" : "settle",
+  );
   // Snooze is offered only where it can succeed: capability-gated and never
   // on blocked-on-you work or queued turns (the server rejects both).
   const showSnoozeButton =
@@ -1055,7 +1059,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                     <AlarmClockOffIcon className="size-3" />
                   </button>
                 )
-              ) : !props.settlementSupported || !allowsLifecycle ? null : variantAction ===
+              ) : !props.settlementSupported || !allowsSettlement ? null : variantAction ===
                 "unsettle" ? (
                 <button
                   type="button"
@@ -1182,7 +1186,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                     threadTimeLabel(thread)
                   )}
                 </span>
-                {(props.settlementSupported && allowsLifecycle) || showSnoozeButton ? (
+                {(props.settlementSupported && allowsSettlement) || showSnoozeButton ? (
                   <span
                     className={cn(
                       "absolute inset-y-0 right-0 flex items-stretch opacity-0 transition-opacity focus-within:static focus-within:opacity-100 group-hover/v2-row:static group-hover/v2-row:opacity-100",
@@ -1196,7 +1200,7 @@ const SidebarV2Row = memo(function SidebarV2Row(props: {
                         onSnooze={handleSnoozePreset}
                       />
                     ) : null}
-                    {props.settlementSupported && allowsLifecycle ? (
+                    {props.settlementSupported && allowsSettlement ? (
                       <button
                         type="button"
                         aria-label="Settle thread"
@@ -2279,9 +2283,7 @@ export default function SidebarV2() {
         const thread = threadByKeyRef.current.get(threadKey);
         return thread ? [thread] : [];
       });
-      const canSettleSelection = selectedThreads.every((thread) =>
-        threadAllows(thread, "lifecycle"),
-      );
+      const canSettleSelection = selectedThreads.every((thread) => threadAllows(thread, "settle"));
       const canDeleteSelection = selectedThreads.every((thread) => threadAllows(thread, "delete"));
       const canSnoozeSelection = selectedThreads.every(
         (thread) =>
@@ -2464,9 +2466,12 @@ export default function SidebarV2() {
         // clears the override, for auto-settled rows it pins the thread
         // active until real activity clears the pin. Environments without
         // the settlement capability get no lifecycle items at all.
+        const isSettled =
+          thread.settledOverride === "settled" ||
+          (thread.settledOverride !== "active" && settledThreadKeysRef.current.has(threadKey));
         const supportsSettlement =
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSettlement ===
-            true && threadAllows(thread, "lifecycle");
+            true && threadAllows(thread, isSettled ? "unsettle" : "settle");
         const supportsSnooze =
           serverConfigs.get(thread.environmentId)?.environment.capabilities.threadSnooze === true &&
           threadAllows(thread, "lifecycle");
@@ -2474,7 +2479,6 @@ export default function SidebarV2() {
           serverConfigs.get(thread.environmentId)?.environment.capabilities
             .threadTitleRegeneration === true && threadAllows(thread, "rename");
         const isRegeneratingTitle = thread.titleRegeneration != null;
-        const isSettled = settledThreadKeysRef.current.has(threadKey);
         const isSnoozed = snoozedThreadKeysRef.current.has(threadKey);
         // Presets resolve at menu-open time (same as the popover).
         const snoozePresets = resolveSnoozePresets(new Date());
@@ -2954,12 +2958,15 @@ export default function SidebarV2() {
                       variantAction={
                         section === "snoozed"
                           ? "unsnooze"
-                          : section === "settled"
+                          : isPiChild && thread.settledOverride === "settled"
                             ? "unsettle"
-                            : "settle"
+                            : isPiChild && thread.settledOverride === "active"
+                              ? "settle"
+                              : section === "settled"
+                                ? "unsettle"
+                                : "settle"
                       }
                       settlementSupported={
-                        !isPiChild &&
                         serverConfigs.get(thread.environmentId)?.environment.capabilities
                           .threadSettlement === true
                       }

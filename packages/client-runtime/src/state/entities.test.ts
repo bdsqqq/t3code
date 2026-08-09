@@ -261,6 +261,8 @@ describe("environment entity projections", () => {
           stop: true,
           rename: false,
           archive: false,
+          settle: true,
+          unsettle: true,
           delete: false,
           changeModel: false,
           changeRuntimeMode: false,

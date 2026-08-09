@@ -23,6 +23,8 @@ const record: PiSessionCatalogRecord = {
   title: "native session",
   createdAt: "2026-07-30T00:00:00.000Z",
   updatedAt: "2026-07-30T00:01:00.000Z",
+  fileSize: 1,
+  fileMtimeMs: 1,
   historyTruncation: {
     truncated: false,
     omittedEntryCount: 0,
@@ -117,7 +119,49 @@ describe("PiSessionProjection", () => {
     expect(snapshot.thread.backing?.capabilities.send).toBe(false);
     expect(snapshot.thread.backing?.capabilities.attachments).toBe(false);
     expect(snapshot.thread.backing?.capabilities.rename).toBe(false);
+    expect(snapshot.thread.backing?.capabilities.settle).toBe(true);
+    expect(snapshot.thread.backing?.capabilities.unsettle).toBe(true);
     expect(snapshot.thread.historyTruncation?.truncated).toBe(false);
+  });
+
+  it("projects a persisted external lifecycle override", () => {
+    const settled = projectPiThread({
+      record,
+      entries,
+      projectId: ProjectId.make("project-1"),
+      lifecycle: {
+        override: "settled",
+        updatedAt: "2026-07-30T00:02:00.000Z",
+      },
+    });
+    const active = projectPiThread({
+      record,
+      entries,
+      projectId: ProjectId.make("project-1"),
+      lifecycle: {
+        override: "active",
+        updatedAt: "2026-07-30T00:03:00.000Z",
+      },
+    });
+
+    expect(settled.thread.settledOverride).toBe("settled");
+    expect(settled.thread.settledAt).toBe("2026-07-30T00:02:00.000Z");
+    expect(active.thread.settledOverride).toBe("active");
+    expect(active.thread.settledAt).toBeNull();
+  });
+
+  it("retains catalog activity for inactivity-based settlement", () => {
+    const snapshot = projectPiThread({
+      record: {
+        ...record,
+        lastActivityAt: "2026-07-20T00:00:00.000Z",
+      },
+      entries: [],
+      projectId: ProjectId.make("project-1"),
+    });
+
+    expect(snapshot.thread.latestTurn?.requestedAt).toBe("2026-07-20T00:00:00.000Z");
+    expect(snapshot.thread.settledOverride).toBeNull();
   });
 
   it("does not advertise images without an external asset resolver", () => {

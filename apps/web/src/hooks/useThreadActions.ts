@@ -456,7 +456,7 @@ export function useThreadActions() {
         );
       }
       const resolved = resolveThreadTarget(target);
-      if (resolved && !threadAllows(resolved.thread, "lifecycle")) {
+      if (resolved && !threadAllows(resolved.thread, "settle")) {
         return capabilityFailure(resolved.thread);
       }
       // Settle may only target what effectiveSettled could classify as
@@ -485,7 +485,7 @@ export function useThreadActions() {
   const unsettleThread = useCallback(
     async (target: ScopedThreadRef) => {
       const resolved = resolveThreadTarget(target);
-      if (resolved && !threadAllows(resolved.thread, "lifecycle")) {
+      if (resolved && !threadAllows(resolved.thread, "unsettle")) {
         return capabilityFailure(resolved.thread);
       }
       if (!readEnvironmentSupportsSettlement(target.environmentId)) {

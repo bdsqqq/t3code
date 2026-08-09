@@ -11,6 +11,7 @@ import {
   threadSearchMatchKey,
   type EnvironmentThreadSearchMatch,
 } from "@t3tools/client-runtime/state/thread-search";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import type {
   EnvironmentId,
   SidebarProjectGroupingMode,
@@ -734,7 +735,9 @@ export function HomeScreen(props: HomeScreenProps) {
           onArchiveThread={props.onArchiveThread}
           settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
           onSettleThread={handleSettleThread}
-          snoozeSupported={snoozeEnvironmentIds.has(thread.environmentId)}
+          snoozeSupported={
+            snoozeEnvironmentIds.has(thread.environmentId) && threadAllows(thread, "lifecycle")
+          }
           onSnoozeThread={handleSnoozeThread}
           onUnsnoozeThread={handleUnsnoozeThread}
           onUnsettleThread={handleUnsettleThread}

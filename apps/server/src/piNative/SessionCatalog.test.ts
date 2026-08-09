@@ -6,12 +6,59 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { makeSessionCatalog } from "./SessionCatalog.ts";
+import { makeSessionCatalog, piThreadLifecycleFromEntries } from "./SessionCatalog.ts";
 const digest = async (file: string) =>
   NodeCrypto.createHash("sha256")
     .update(await NodeFS.promises.readFile(file))
     .digest("hex");
 describe("SessionCatalog", () => {
+  it("projects the latest valid lifecycle marker and resets it on later activity", () => {
+    const marker = {
+      type: "custom",
+      id: "lifecycle-1",
+      parentId: "message-1",
+      timestamp: "2026-08-08T10:00:00.000Z",
+      customType: "t3.thread-lifecycle.v1",
+      data: {
+        version: 1,
+        sessionId: "s1",
+        override: "settled",
+        operationId: "operation-1",
+      },
+    } as const;
+
+    expect(piThreadLifecycleFromEntries([marker], "s1")).toMatchObject({
+      override: "settled",
+      operationId: "operation-1",
+    });
+    expect(
+      piThreadLifecycleFromEntries(
+        [
+          marker,
+          {
+            type: "message",
+            id: "message-2",
+            parentId: "lifecycle-1",
+            timestamp: "2026-08-08T10:01:00.000Z",
+            message: { role: "user", content: "new work" },
+          },
+        ],
+        "s1",
+      ),
+    ).toBeUndefined();
+    expect(
+      piThreadLifecycleFromEntries(
+        [
+          {
+            ...marker,
+            data: { ...marker.data, sessionId: "another-session" },
+          },
+        ],
+        "s1",
+      ),
+    ).toBeUndefined();
+  });
+
   it.effect("reads without mutation", () =>
     Effect.acquireUseRelease(
       Effect.tryPromise(() => NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-"))),
@@ -84,6 +131,81 @@ describe("SessionCatalog", () => {
             NodeFS.promises.rm(outside, { recursive: true, force: true }),
           ]).then(() => undefined),
         ),
+    ),
+  );
+  it.effect("finds lifecycle state beyond the bounded catalog tail", () =>
+    Effect.acquireUseRelease(
+      Effect.tryPromise(() =>
+        NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-lifecycle-")),
+      ),
+      (root) =>
+        Effect.gen(function* () {
+          const file = NodePath.join(root, "session.jsonl");
+          const entries = [
+            { type: "session", id: "s1", cwd: root },
+            {
+              type: "message",
+              id: "user-1",
+              parentId: null,
+              timestamp: "2026-08-08T09:00:00.000Z",
+              message: { role: "user", content: "work" },
+            },
+            {
+              type: "custom",
+              id: "lifecycle-1",
+              parentId: "user-1",
+              timestamp: "2026-08-08T10:00:00.000Z",
+              customType: "t3.thread-lifecycle.v1",
+              data: {
+                version: 1,
+                sessionId: "s1",
+                override: "settled",
+                operationId: "operation-1",
+              },
+            },
+            ...Array.from({ length: 200 }, (_, index) => ({
+              type: "custom",
+              id: `noise-${String(index)}`,
+              parentId: "lifecycle-1",
+              timestamp: "2026-08-08T10:01:00.000Z",
+              customType: "test.noise",
+              data: { text: "x".repeat(1_024) },
+            })),
+          ];
+          yield* Effect.tryPromise(() =>
+            NodeFS.promises.writeFile(
+              file,
+              `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+            ),
+          );
+
+          const catalog = makeSessionCatalog({ root });
+          const listed = yield* catalog.list();
+          expect(listed[0]?.jsonlLifecycle?.override).toBe("settled");
+          expect(
+            yield* catalog.findLifecycleOperation(listed[0]!.threadId, "operation-1"),
+          ).toMatchObject({ override: "settled", supersededByUser: false });
+          yield* Effect.tryPromise(() =>
+            NodeFS.promises.appendFile(
+              file,
+              `${JSON.stringify({
+                type: "message",
+                id: "user-2",
+                parentId: "lifecycle-1",
+                timestamp: "2026-08-08T11:00:00.000Z",
+                message: {
+                  content: "new work".repeat(150_000),
+                  role: "user",
+                },
+              })}\n`,
+            ),
+          );
+          expect((yield* catalog.list())[0]?.jsonlLifecycle).toBeUndefined();
+          expect(
+            yield* catalog.findLifecycleOperation(listed[0]!.threadId, "operation-1"),
+          ).toMatchObject({ override: "settled", supersededByUser: true });
+        }),
+      (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),
   );
   it.effect("resolves Pi parent session paths to parent thread ids", () =>

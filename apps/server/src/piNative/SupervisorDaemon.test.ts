@@ -7,6 +7,7 @@ import * as NodePath from "node:path";
 
 import {
   projectOverlayPayload,
+  bridgeCommandFrame,
   projectListedRuntime,
   projectQueuePayload,
   projectQueueValues,
@@ -24,6 +25,28 @@ import {
 import { JsonLineDecoder } from "./SupervisorProtocol.ts";
 
 describe("native Pi replay projection", () => {
+  it("forwards lifecycle data to the Pi-owned TUI bridge writer", () => {
+    expect(
+      bridgeCommandFrame({
+        type: "setLifecycle",
+        commandId: "operation-1",
+        runtimeId: "runtime-1",
+        lifecycle: {
+          version: 1,
+          sessionId: "session-1",
+          override: "settled",
+          operationId: "operation-1",
+        },
+      }),
+    ).toMatchObject({
+      command: "setLifecycle",
+      lifecycle: {
+        sessionId: "session-1",
+        override: "settled",
+      },
+    });
+  });
+
   it("starts rpc sessions in the cataloged sessions root", () => {
     expect(piRpcSpawnArgs({ sessionsRoot: "/isolated/sessions" })).toEqual([
       "--mode",

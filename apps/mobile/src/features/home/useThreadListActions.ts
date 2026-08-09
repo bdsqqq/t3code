@@ -78,7 +78,7 @@ function useThreadActionExecutor(
           ? "archive"
           : action === "delete"
             ? "delete"
-            : "lifecycle";
+            : action;
       if (!threadAllows(thread, capability)) return false;
       const key = scopedThreadKey(thread.environmentId, thread.id);
       if (inFlightThreadKeys.current.has(key)) {
@@ -228,6 +228,7 @@ export function useThreadListActions(): {
   );
   const snoozeThread = useCallback(
     async (thread: EnvironmentThreadShell, snoozedUntil: string) => {
+      if (!threadAllows(thread, "lifecycle")) return false;
       const key = scopedThreadKey(thread.environmentId, thread.id);
       if (snoozeInFlightThreadKeys.current.has(key)) {
         return false;
@@ -278,6 +279,7 @@ export function useThreadListActions(): {
   );
   const unsnoozeThread = useCallback(
     async (thread: EnvironmentThreadShell) => {
+      if (!threadAllows(thread, "lifecycle")) return false;
       const key = scopedThreadKey(thread.environmentId, thread.id);
       if (snoozeInFlightThreadKeys.current.has(key)) {
         return false;

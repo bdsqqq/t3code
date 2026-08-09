@@ -661,6 +661,16 @@ async function stopChild(runtime: Runtime): Promise<void> {
   });
 }
 
+export function bridgeCommandFrame(command: Record<string, unknown>) {
+  return {
+    type: "command",
+    commandId: String(command.commandId),
+    command: command.type,
+    ...(typeof command.message === "string" ? { text: command.message } : {}),
+    ...(isRecord(command.lifecycle) ? { lifecycle: command.lifecycle } : {}),
+  };
+}
+
 async function execute(command: Record<string, unknown>): Promise<SupervisorCommandReceipt> {
   const commandId = String(command.commandId);
   if (command.type === "start") {
@@ -706,14 +716,7 @@ async function execute(command: Record<string, unknown>): Promise<SupervisorComm
         clearTimeout(timer);
         resolve(frame);
       });
-      runtime.bridge!.write(
-        encodeLine({
-          type: "command",
-          commandId,
-          command: command.type,
-          ...(typeof command.message === "string" ? { text: command.message } : {}),
-        }),
-      );
+      runtime.bridge!.write(encodeLine(bridgeCommandFrame(command)));
     });
     if (receipt.status === "submitted")
       throw new IndeterminateCommandError(
@@ -727,6 +730,9 @@ async function execute(command: Record<string, unknown>): Promise<SupervisorComm
       status: "completed",
       runtimeId: runtime.state.runtimeId,
     };
+  }
+  if (command.type === "setLifecycle") {
+    throw new Error("pi rpc does not support lifecycle entry emission");
   }
   if (command.type === "shutdown") {
     await stopChild(runtime);

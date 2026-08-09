@@ -30,6 +30,19 @@ rename, archive, delete, model changes, runtime-mode changes, interaction-mode
 changes, and checkpoints are unavailable because pi, rather than t3, owns this
 history.
 
+settle and un-settle are available for every native pi session. t3 stores that
+inbox state in the current environment and clears the local override when the
+jsonl file changes, so new pi activity cannot remain hidden behind stale
+settlement. historical sessions without an explicit override use the same
+configured inactivity window as ordinary t3 threads.
+
+t3 also reads `t3.thread-lifecycle.v1` custom entries written through pi's
+extension API. a connected tui bridge writes those entries when settlement is
+changed from t3, allowing pi-side extensions and t3 to share the state for that
+session. native rpc and t3-managed pi runtimes do not yet expose pi's
+`appendEntry` API; their settlement remains environment-local until pi adds
+that rpc capability.
+
 image attachments are unavailable in v1 because native jsonl images do not yet
 have an authenticated t3 asset URL.
 

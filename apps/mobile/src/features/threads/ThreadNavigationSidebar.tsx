@@ -7,6 +7,7 @@ import {
   threadSearchMatchKey,
   type EnvironmentThreadSearchMatch,
 } from "@t3tools/client-runtime/state/thread-search";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import { LegendList } from "@legendapp/list/react-native";
 import type { MenuAction } from "@react-native-menu/menu";
 import { useAtomValue } from "@effect/atom-react";
@@ -900,7 +901,9 @@ function ThreadNavigationSidebarPane(
               onArchiveThread={archiveThread}
               settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
               onSettleThread={settleThread}
-              snoozeSupported={snoozeEnvironmentIds.has(thread.environmentId)}
+              snoozeSupported={
+                snoozeEnvironmentIds.has(thread.environmentId) && threadAllows(thread, "lifecycle")
+              }
               onSnoozeThread={snoozeThread}
               onUnsnoozeThread={unsnoozeThread}
               onUnsettleThread={unsettleThread}

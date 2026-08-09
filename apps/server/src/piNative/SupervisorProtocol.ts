@@ -4,6 +4,7 @@ import type {
   PiNativeJsonlEntry,
   PiNativeRuntimeId,
   PiNativeSessionKey,
+  PiThreadLifecycleData,
 } from "@t3tools/contracts";
 
 export const SUPERVISOR_PROTOCOL = "t3-control-v2";
@@ -44,6 +45,12 @@ export type SupervisorCommand =
       readonly type: "abort" | "shutdown";
       readonly commandId: CommandId;
       readonly runtimeId: PiNativeRuntimeId;
+    }
+  | {
+      readonly type: "setLifecycle";
+      readonly commandId: CommandId;
+      readonly runtimeId: PiNativeRuntimeId;
+      readonly lifecycle: PiThreadLifecycleData;
     };
 export interface SupervisorRuntimeState {
   readonly runtimeId: PiNativeRuntimeId;

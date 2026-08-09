@@ -120,6 +120,8 @@ function backingFor(runtime: SupervisorRuntimeState | undefined): ExternalThread
       stop: controlled,
       rename: false,
       archive: false,
+      settle: true,
+      unsettle: true,
       delete: false,
       changeModel: false,
       changeRuntimeMode: false,
@@ -335,16 +337,30 @@ export function projectPiThread(input: {
   readonly entries: ReadonlyArray<JsonRecord>;
   readonly projectId: ProjectId;
   readonly runtime?: SupervisorRuntimeState;
+  readonly lifecycle?: {
+    readonly override: "settled" | "active";
+    readonly updatedAt: string;
+  };
 }): OrchestrationThreadDetailSnapshot {
   const history = projectHistory(input.record, input.entries);
   const session = runtimeSession(input.record, input.runtime, history.activeTurnId);
   const running = session?.status === "running";
+  const lifecycle = running ? undefined : input.lifecycle;
   const lastAssistant = history.messages.findLast(
     (message) => message.role === "assistant" && message.turnId === history.activeTurnId,
   );
   const latestTurn =
     history.activeTurnId === null
-      ? null
+      ? input.record.lastActivityAt === undefined
+        ? null
+        : {
+            turnId: turnId(input.record, "catalog-activity"),
+            state: "completed" as const,
+            requestedAt: input.record.lastActivityAt,
+            startedAt: input.record.lastActivityAt,
+            completedAt: input.record.lastActivityAt,
+            assistantMessageId: null,
+          }
       : {
           turnId: history.activeTurnId,
           state: running ? ("running" as const) : ("completed" as const),
@@ -372,8 +388,18 @@ export function projectPiThread(input: {
     createdAt: input.record.createdAt,
     updatedAt: input.record.updatedAt,
     archivedAt: null,
-    settledOverride: null,
-    settledAt: running ? null : input.record.updatedAt,
+    settledOverride:
+      lifecycle?.override === "settled"
+        ? "settled"
+        : lifecycle?.override === "active"
+          ? "active"
+          : null,
+    settledAt:
+      lifecycle?.override === "settled"
+        ? lifecycle.updatedAt
+        : running || lifecycle?.override === "active"
+          ? null
+          : input.record.updatedAt,
     snoozedUntil: null,
     snoozedAt: null,
     deletedAt: null,

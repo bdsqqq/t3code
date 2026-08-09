@@ -1,6 +1,6 @@
 import * as Schema from "effect/Schema";
 
-import { CommandId, NonNegativeInt, ThreadId } from "./baseSchemas.ts";
+import { CommandId, IsoDateTime, NonNegativeInt, ThreadId } from "./baseSchemas.ts";
 import { OrchestrationProjectShell, OrchestrationThreadShell } from "./orchestration.ts";
 
 export const PiNativeSessionKey = Schema.String.pipe(Schema.brand("PiNativeSessionKey"));
@@ -12,6 +12,25 @@ export type PiNativeEventId = typeof PiNativeEventId.Type;
 
 export const PiNativeJsonlEntry = Schema.Record(Schema.String, Schema.Unknown);
 export type PiNativeJsonlEntry = typeof PiNativeJsonlEntry.Type;
+export const PI_THREAD_LIFECYCLE_CUSTOM_TYPE = "t3.thread-lifecycle.v1";
+export const PiThreadLifecycleOverride = Schema.Literals(["settled", "active"]);
+export type PiThreadLifecycleOverride = typeof PiThreadLifecycleOverride.Type;
+export const PiThreadLifecycleData = Schema.Struct({
+  version: Schema.Literal(1),
+  sessionId: Schema.String,
+  override: PiThreadLifecycleOverride,
+  operationId: CommandId,
+});
+export type PiThreadLifecycleData = typeof PiThreadLifecycleData.Type;
+export const PiThreadLifecycleCustomEntry = Schema.Struct({
+  type: Schema.Literal("custom"),
+  id: Schema.String,
+  parentId: Schema.NullOr(Schema.String),
+  timestamp: IsoDateTime,
+  customType: Schema.Literal(PI_THREAD_LIFECYCLE_CUSTOM_TYPE),
+  data: PiThreadLifecycleData,
+});
+export type PiThreadLifecycleCustomEntry = typeof PiThreadLifecycleCustomEntry.Type;
 export const PiNativeLiveness = Schema.Literals(["live", "historical", "unmanaged"]);
 export type PiNativeLiveness = typeof PiNativeLiveness.Type;
 export const PiNativeWriterKind = Schema.Literals(["rpc", "tuiBridge"]);

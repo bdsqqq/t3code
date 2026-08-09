@@ -24,6 +24,7 @@ import {
   receiptSessionFile,
   resolveManagedPiParentThreadIds,
   shutdownCreatedRuntime,
+  validExternalLifecycleOverride,
 } from "./PiExternalThreadSource.ts";
 import type { SupervisorRuntimeState } from "./SupervisorProtocol.ts";
 
@@ -128,6 +129,8 @@ describe("PiExternalThreadSource hardening", () => {
         title: "child",
         createdAt: "2026-08-06T00:00:00.000Z",
         updatedAt: "2026-08-06T00:01:00.000Z",
+        fileSize: 1,
+        fileMtimeMs: 1,
         historyTruncation: { truncated: false },
       } as const;
 
@@ -170,6 +173,47 @@ describe("PiExternalThreadSource hardening", () => {
     expect(managedPiBindingSignature([{ ...binding, lastSeenAt: "later" }])).toBe(
       managedPiBindingSignature([binding]),
     );
+  });
+
+  it("invalidates a lifecycle override after the Pi session file changes", () => {
+    const record = {
+      sourceKey: PiNativeSessionKey.make("source"),
+      threadId: ThreadId.make("external:pi:path:source"),
+      canonicalFile: "/sessions/source.jsonl",
+      sessionId: "session",
+      cwd: "/workspace",
+      title: "session",
+      createdAt: "2026-08-06T00:00:00.000Z",
+      updatedAt: "2026-08-06T00:01:00.000Z",
+      fileSize: 10,
+      fileMtimeMs: 20,
+      historyTruncation: { truncated: false },
+    } as const;
+    const override = {
+      sourceKey: record.sourceKey,
+      commandId: CommandId.make("settle"),
+      lifecycleOverride: "settled" as const,
+      observedFileSize: 10,
+      observedFileMtimeMs: 20,
+      updatedAt: "2026-08-06T00:01:00.000Z",
+    };
+
+    expect(validExternalLifecycleOverride(record, override)?.override).toBe("settled");
+    expect(validExternalLifecycleOverride({ ...record, fileSize: 11 }, override)).toBeUndefined();
+    expect(
+      validExternalLifecycleOverride(
+        {
+          ...record,
+          fileSize: 11,
+          jsonlLifecycle: {
+            override: "active",
+            operationId: "pi-operation",
+            updatedAt: "2026-08-06T00:02:00.000Z",
+          },
+        },
+        override,
+      )?.override,
+    ).toBe("active");
   });
 
   it("bounds aggregate catalog records and serialized bytes with omission counts", () => {

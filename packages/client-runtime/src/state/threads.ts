@@ -41,6 +41,8 @@ export type ThreadCapabilityAction =
   | "stop"
   | "rename"
   | "archive"
+  | "settle"
+  | "unsettle"
   | "delete"
   | "changeModel"
   | "changeRuntimeMode"
@@ -62,7 +64,7 @@ export function threadAllows(
   if (action === "lifecycle" || action === "approval" || action === "userInput") {
     return false;
   }
-  return backing.capabilities[action];
+  return backing.capabilities[action] === true;
 }
 
 function statusWithoutLiveData(data: Option.Option<OrchestrationThread>): EnvironmentThreadStatus {
