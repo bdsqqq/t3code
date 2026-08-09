@@ -63,6 +63,10 @@ import {
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
 const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
+const MAX_THREAD_ACTIVITY_COUNT = 2_000;
+const MAX_THREAD_ACTIVITY_PAYLOAD_BYTES = 64 * 1024 * 1024;
+const MAX_FULL_SNAPSHOT_ACTIVITY_COUNT = 2_000;
+const MAX_FULL_SNAPSHOT_ACTIVITY_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const ProjectionProjectDbRowSchema = ProjectionProject.mapFields(
   Struct.assign({
     defaultModelSelection: Schema.NullOr(Schema.fromJsonString(ModelSelection)),
@@ -512,22 +516,70 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     Result: ProjectionThreadActivityDbRowSchema,
     execute: () =>
       sql`
+        WITH ranked_activity_ids AS (
+          SELECT
+            activity_id,
+            thread_id,
+            sequence,
+            created_at,
+            ROW_NUMBER() OVER (
+              PARTITION BY thread_id
+              ORDER BY
+                CASE WHEN sequence IS NULL THEN 0 ELSE 1 END DESC,
+                sequence DESC,
+                created_at DESC,
+                activity_id DESC
+            ) AS thread_retention_rank
+          FROM projection_thread_activities
+        ),
+        per_thread_count_retained AS (
+          SELECT *
+          FROM ranked_activity_ids
+          WHERE thread_retention_rank <= ${MAX_THREAD_ACTIVITY_COUNT}
+        ),
+        globally_counted AS (
+          SELECT
+            *,
+            ROW_NUMBER() OVER (
+              ORDER BY created_at DESC, activity_id DESC
+            ) AS snapshot_retention_rank
+          FROM per_thread_count_retained
+        ),
+        snapshot_count_retained AS (
+          SELECT *
+          FROM globally_counted
+          WHERE snapshot_retention_rank <= ${MAX_FULL_SNAPSHOT_ACTIVITY_COUNT}
+        ),
+        payload_ranked AS (
+          SELECT
+            retained.*,
+            SUM(length(CAST(activity.payload_json AS BLOB))) OVER (
+              ORDER BY retained.created_at DESC, retained.activity_id DESC
+            ) AS snapshot_payload_bytes
+          FROM snapshot_count_retained AS retained
+          INNER JOIN projection_thread_activities AS activity
+            ON activity.activity_id = retained.activity_id
+        )
         SELECT
-          activity_id AS "activityId",
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          tone,
-          kind,
-          summary,
-          payload_json AS "payload",
-          sequence,
-          created_at AS "createdAt"
-        FROM projection_thread_activities
+          activity.activity_id AS "activityId",
+          activity.thread_id AS "threadId",
+          activity.turn_id AS "turnId",
+          activity.tone,
+          activity.kind,
+          activity.summary,
+          activity.payload_json AS "payload",
+          activity.sequence,
+          activity.created_at AS "createdAt"
+        FROM payload_ranked AS retained
+        INNER JOIN projection_thread_activities AS activity
+          ON activity.activity_id = retained.activity_id
+        WHERE retained.snapshot_payload_bytes <= ${MAX_FULL_SNAPSHOT_ACTIVITY_PAYLOAD_BYTES}
         ORDER BY
-          thread_id ASC,
-          sequence ASC,
-          created_at ASC,
-          activity_id ASC
+          activity.thread_id ASC,
+          CASE WHEN activity.sequence IS NULL THEN 0 ELSE 1 END ASC,
+          activity.sequence ASC,
+          activity.created_at ASC,
+          activity.activity_id ASC
       `,
   });
 
@@ -952,21 +1004,54 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     execute: ({ threadId }) =>
       sql`
         SELECT
-          activity_id AS "activityId",
-          thread_id AS "threadId",
-          turn_id AS "turnId",
-          tone,
-          kind,
-          summary,
-          payload_json AS "payload",
-          sequence,
-          created_at AS "createdAt"
-        FROM projection_thread_activities
-        WHERE thread_id = ${threadId}
+          activity.activity_id AS "activityId",
+          activity.thread_id AS "threadId",
+          activity.turn_id AS "turnId",
+          activity.tone,
+          activity.kind,
+          activity.summary,
+          activity.payload_json AS "payload",
+          activity.sequence,
+          activity.created_at AS "createdAt"
+        FROM projection_thread_activities AS activity
+        INNER JOIN (
+          SELECT
+            activity_id
+          FROM (
+            SELECT
+              retained.activity_id,
+              SUM(length(CAST(activity.payload_json AS BLOB))) OVER (
+                ORDER BY
+                  CASE WHEN retained.sequence IS NULL THEN 0 ELSE 1 END DESC,
+                  retained.sequence DESC,
+                  retained.created_at DESC,
+                  retained.activity_id DESC
+              ) AS payload_bytes
+            FROM (
+              SELECT
+                activity_id,
+                sequence,
+                created_at
+              FROM projection_thread_activities
+              WHERE thread_id = ${threadId}
+              ORDER BY
+                CASE WHEN sequence IS NULL THEN 0 ELSE 1 END DESC,
+                sequence DESC,
+                created_at DESC,
+                activity_id DESC
+              LIMIT ${MAX_THREAD_ACTIVITY_COUNT}
+            ) AS retained
+            INNER JOIN projection_thread_activities AS activity
+              ON activity.activity_id = retained.activity_id
+          )
+          WHERE payload_bytes <= ${MAX_THREAD_ACTIVITY_PAYLOAD_BYTES}
+        ) AS retained
+          ON activity.activity_id = retained.activity_id
         ORDER BY
-          sequence ASC,
-          created_at ASC,
-          activity_id ASC
+          CASE WHEN activity.sequence IS NULL THEN 0 ELSE 1 END ASC,
+          activity.sequence ASC,
+          activity.created_at ASC,
+          activity.activity_id ASC
       `,
   });
 

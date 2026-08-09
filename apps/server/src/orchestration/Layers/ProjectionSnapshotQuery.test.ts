@@ -1129,6 +1129,128 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
     }),
   );
 
+  it.effect("hydrates only the latest 2,000 activities per thread", () =>
+    Effect.gen(function* () {
+      const snapshotQuery = yield* ProjectionSnapshotQuery;
+      const sql = yield* SqlClient.SqlClient;
+
+      yield* sql`DELETE FROM projection_projects`;
+      yield* sql`DELETE FROM projection_threads`;
+      yield* sql`DELETE FROM projection_thread_activities`;
+
+      yield* sql`
+        INSERT INTO projection_projects (
+          project_id,
+          title,
+          workspace_root,
+          default_model_selection_json,
+          scripts_json,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'project-activity-window',
+          'Activity Window Project',
+          '/tmp/activity-window',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          '[]',
+          '2026-04-01T00:00:00.000Z',
+          '2026-04-01T00:00:01.000Z',
+          NULL
+        )
+      `;
+
+      yield* sql`
+        INSERT INTO projection_threads (
+          thread_id,
+          project_id,
+          title,
+          model_selection_json,
+          runtime_mode,
+          interaction_mode,
+          branch,
+          worktree_path,
+          latest_turn_id,
+          latest_user_message_at,
+          pending_approval_count,
+          pending_user_input_count,
+          has_actionable_proposed_plan,
+          created_at,
+          updated_at,
+          deleted_at
+        )
+        VALUES (
+          'thread-activity-window',
+          'project-activity-window',
+          'Activity Window Thread',
+          '{"provider":"codex","model":"gpt-5-codex"}',
+          'full-access',
+          'default',
+          NULL,
+          NULL,
+          NULL,
+          NULL,
+          0,
+          0,
+          0,
+          '2026-04-01T00:00:02.000Z',
+          '2026-04-01T00:00:03.000Z',
+          NULL
+        )
+      `;
+
+      yield* sql`
+        WITH RECURSIVE activity_numbers(value) AS (
+          VALUES (1)
+          UNION ALL
+          SELECT value + 1 FROM activity_numbers WHERE value < 2001
+        )
+        INSERT INTO projection_thread_activities (
+          activity_id,
+          thread_id,
+          turn_id,
+          tone,
+          kind,
+          summary,
+          payload_json,
+          sequence,
+          created_at
+        )
+        SELECT
+          printf('activity-%04d', value),
+          'thread-activity-window',
+          NULL,
+          'tool',
+          'tool.updated',
+          printf('activity %d', value),
+          json_object('value', value),
+          value,
+          '2026-04-01T00:00:04.000Z'
+        FROM activity_numbers
+      `;
+      yield* sql`
+        UPDATE projection_thread_activities
+        SET payload_json = 'not valid json'
+        WHERE activity_id = 'activity-0001'
+      `;
+
+      const snapshot = yield* snapshotQuery.getSnapshot();
+      const detail = yield* snapshotQuery.getThreadDetailById(
+        ThreadId.make("thread-activity-window"),
+      );
+      const snapshotActivities = snapshot.threads[0]?.activities ?? [];
+
+      assert.equal(detail._tag, "Some");
+      assert.equal(snapshotActivities.length, 2_000);
+      assert.equal(snapshotActivities[0]?.id, asEventId("activity-0002"));
+      assert.equal(snapshotActivities.at(-1)?.id, asEventId("activity-2001"));
+      if (detail._tag === "Some") {
+        assert.deepEqual(detail.value.activities, snapshotActivities);
+      }
+    }),
+  );
+
   it.effect("uses projection_threads.latest_turn_id for targeted thread latest turn queries", () =>
     Effect.gen(function* () {
       const snapshotQuery = yield* ProjectionSnapshotQuery;

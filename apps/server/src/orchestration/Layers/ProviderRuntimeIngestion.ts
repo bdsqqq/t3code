@@ -1308,6 +1308,10 @@ const make = Effect.gen(function* () {
       const now = event.createdAt;
       const eventTurnId = toTurnId(event.turnId);
       const activeTurnId = thread.session?.activeTurnId ?? null;
+      const runtimeActiveTurnId =
+        event.type === "session.started" || event.type === "thread.started"
+          ? yield* getExpectedProviderTurnIdForThread(thread.id)
+          : undefined;
       const pendingTurnStart = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
         threadId: thread.id,
       });
@@ -1385,22 +1389,28 @@ const make = Effect.gen(function* () {
                 : "ready";
             case "session.started":
             case "thread.started":
-              // Provider thread/session start notifications can arrive during an
-              // active or pending turn; preserve that lifecycle state.
-              return activeTurnId !== null ? "running" : hasPendingTurnStart ? "starting" : "ready";
+              // A resumed provider session is authoritative about whether the
+              // projected active turn survived the server restart.
+              return runtimeActiveTurnId !== undefined
+                ? "running"
+                : hasPendingTurnStart
+                  ? "starting"
+                  : "ready";
           }
         })();
         const nextActiveTurnId =
           event.type === "turn.started"
             ? (eventTurnId ?? null)
-            : event.type === "turn.completed" || event.type === "session.exited"
-              ? null
-              : event.type === "session.state.changed" &&
-                  !sessionStatusAllowsActiveTurn(
-                    orchestrationSessionStatusFromRuntimeState(event.payload.state),
-                  )
+            : event.type === "session.started" || event.type === "thread.started"
+              ? (runtimeActiveTurnId ?? null)
+              : event.type === "turn.completed" || event.type === "session.exited"
                 ? null
-                : activeTurnId;
+                : event.type === "session.state.changed" &&
+                    !sessionStatusAllowsActiveTurn(
+                      orchestrationSessionStatusFromRuntimeState(event.payload.state),
+                    )
+                  ? null
+                  : activeTurnId;
         const lastError =
           event.type === "session.state.changed" && event.payload.state === "error"
             ? (event.payload.reason ?? thread.session?.lastError ?? "Provider session error")

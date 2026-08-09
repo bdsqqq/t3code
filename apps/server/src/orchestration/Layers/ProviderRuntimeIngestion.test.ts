@@ -494,6 +494,39 @@ describe("ProviderRuntimeIngestion", () => {
     expect(thread.session?.lastError).toBeNull();
   });
 
+  it("settles a projected running turn when the resumed provider is idle", async () => {
+    const harness = await createHarness();
+    const threadId = asThreadId("thread-1");
+    const turnId = asTurnId("turn-completed-before-server-restart");
+
+    harness.emit({
+      type: "turn.started",
+      eventId: asEventId("evt-turn-started-before-server-restart"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      turnId,
+      createdAt: "2026-01-01T00:00:01.000Z",
+    });
+    await waitForThread(
+      harness.readModel,
+      (thread) => thread.session?.status === "running" && thread.session.activeTurnId === turnId,
+    );
+
+    harness.emit({
+      type: "session.started",
+      eventId: asEventId("evt-session-resumed-idle"),
+      provider: ProviderDriverKind.make("codex"),
+      threadId,
+      createdAt: "2026-01-01T00:00:02.000Z",
+    });
+
+    const thread = await waitForThread(
+      harness.readModel,
+      (entry) => entry.session?.status === "ready" && entry.session.activeTurnId === null,
+    );
+    expect(thread.session?.status).toBe("ready");
+  });
+
   effectIt.effect(
     "keeps a reconnecting pending turn starting while ready clears stale active state",
     () =>
@@ -581,6 +614,16 @@ describe("ProviderRuntimeIngestion", () => {
           ),
         );
         expect(thread.session?.status).toBe("running");
+
+        harness.setProviderSession({
+          provider: ProviderDriverKind.make("codex"),
+          status: "running",
+          runtimeMode: "approval-required",
+          threadId,
+          activeTurnId: asTurnId("turn-after-reconnect"),
+          createdAt: "2026-01-01T00:00:04.000Z",
+          updatedAt: "2026-01-01T00:00:04.000Z",
+        });
 
         harness.emit({
           type: "session.started",
@@ -693,6 +736,16 @@ describe("ProviderRuntimeIngestion", () => {
         thread.session?.activeTurnId === "turn-midturn-lifecycle",
       10_000,
     );
+
+    harness.setProviderSession({
+      provider: ProviderDriverKind.make("codex"),
+      status: "running",
+      runtimeMode: "approval-required",
+      threadId: asThreadId("thread-1"),
+      activeTurnId: asTurnId("turn-midturn-lifecycle"),
+      createdAt: now,
+      updatedAt: now,
+    });
 
     harness.emit({
       type: "thread.started",

@@ -148,6 +148,8 @@ describe("ProviderCommandReactor", () => {
     readonly requiresNewThreadForModelChange?: boolean;
     readonly titleRegenerationCompletionDispatchFailures?: number;
     readonly titleRegenerationBeforeStart?: "one" | "two";
+    readonly pendingTurnBeforeStart?: boolean;
+    readonly runningSessionBeforeStart?: boolean;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -408,6 +410,7 @@ describe("ProviderCommandReactor", () => {
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(NodeServices.layer),
     );
     runtime = ManagedRuntime.make(layer);
@@ -478,6 +481,85 @@ describe("ProviderCommandReactor", () => {
         }),
       );
     }
+    if (input?.pendingTurnBeforeStart === true) {
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-stopped-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "stopped",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("cmd-plan-mode-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          interactionMode: "plan",
+          createdAt: now,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("user-message-before-reactor-start"),
+            role: "user",
+            text: "resume after restart",
+            attachments: [],
+          },
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("codex_work"),
+            model: "gpt-5-codex",
+          },
+          titleSeed: "Thread",
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("cmd-default-mode-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        }),
+      );
+    }
+    if (input?.runningSessionBeforeStart === true) {
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.session.set",
+          commandId: CommandId.make("cmd-session-running-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          session: {
+            threadId: ThreadId.make("thread-1"),
+            status: "running",
+            providerName: "codex",
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            runtimeMode: "approval-required",
+            activeTurnId: asTurnId("turn-running-before-reactor-start"),
+            lastError: null,
+            updatedAt: now,
+          },
+          createdAt: now,
+        }),
+      );
+    }
 
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
@@ -544,6 +626,45 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.status).toBe("starting");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("replays a pending turn accepted before reactor startup", async () => {
+    const harness = await createHarness({ pendingTurnBeforeStart: true });
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.startSession).toHaveBeenCalledTimes(1);
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.startSession.mock.calls[0]?.[0]).toEqual(ThreadId.make("thread-1"));
+    expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
+      providerInstanceId: ProviderInstanceId.make("codex_work"),
+      modelSelection: {
+        instanceId: ProviderInstanceId.make("codex_work"),
+        model: "gpt-5-codex",
+      },
+    });
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+      input: "resume after restart",
+      interactionMode: "plan",
+    });
+    expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
+  });
+
+  it("resumes a projected running session before accepting new work", async () => {
+    const harness = await createHarness({ runningSessionBeforeStart: true });
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.startSession).toHaveBeenCalledTimes(1);
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.status).toBe("ready");
+    expect(thread?.session?.activeTurnId).toBeNull();
   });
 
   effectIt.effect("projects starting before a slow provider session finishes", () =>
