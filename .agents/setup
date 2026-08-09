@@ -1,0 +1,75 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$repo_root"
+
+run_step() {
+  local label="$1"
+  shift
+  echo "==> $label"
+  time "$@"
+}
+
+missing_packages=()
+for package in build-essential ca-certificates curl git pkg-config python3; do
+  if ! dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
+    missing_packages+=("$package")
+  fi
+done
+
+if ((${#missing_packages[@]} > 0)); then
+  apt_command=(apt-get)
+  if ((EUID != 0)); then
+    apt_command=(sudo apt-get)
+  fi
+  run_step "Refreshing apt package metadata" "${apt_command[@]}" update
+  run_step "Installing system packages: ${missing_packages[*]}" \
+    "${apt_command[@]}" install -y --no-install-recommends "${missing_packages[@]}"
+else
+  echo "==> System packages already installed"
+fi
+
+vp_version="$(awk '$1 == "vite-plus:" { print $2; exit }' pnpm-workspace.yaml)"
+installed_vp_version="$({ "$HOME/.vite-plus/bin/vp" --version 2>/dev/null || true; } | sed -n 's/^vp v//p' | head -n 1)"
+if [[ "$installed_vp_version" != "$vp_version" ]]; then
+  run_step "Installing Vite+ $vp_version" \
+    env VP_VERSION="$vp_version" VITE_PLUS_VERSION="$vp_version" \
+    bash -c 'curl -fsSL --connect-timeout 5 --max-time 30 https://viteplus.dev/install.sh | bash'
+else
+  echo "==> Vite+ $vp_version already installed"
+fi
+
+# The installer cannot update this running process.
+# shellcheck disable=SC1091
+source "$HOME/.vite-plus/env"
+
+node_version="$(python3 -c 'import json; print(json.load(open("package.json"))["engines"]["node"])')"
+vp env setup >/dev/null
+vp env on >/dev/null
+run_step "Selecting Node.js $node_version" vp env use "$node_version"
+run_step "Installing JavaScript dependencies" vp install --frozen-lockfile
+
+if [[ ! -x "$HOME/.cargo/bin/rustup" ]]; then
+  run_step "Installing the stable Rust toolchain" \
+    bash -c 'curl --proto "=https" --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt'
+else
+  # shellcheck disable=SC1091
+  source "$HOME/.cargo/env"
+  run_step "Updating the stable Rust toolchain" \
+    rustup toolchain install stable --profile minimal --component rustfmt
+  rustup default stable
+fi
+# The installer cannot update this running process.
+# shellcheck disable=SC1091
+source "$HOME/.cargo/env"
+
+touch "$HOME/.bash_profile"
+for activation in '. "$HOME/.vite-plus/env"' '. "$HOME/.cargo/env"'; do
+  grep -Fqx "$activation" "$HOME/.bash_profile" || echo "$activation" >> "$HOME/.bash_profile"
+done
+
+echo "==> Orb setup complete"
+vp --version
+node --version
+rustc --version

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# This repository has no persistent backing services. Development servers are
+# started on demand against worktree-local state.
+echo "T3 Code orb resumed; no services require repair."
