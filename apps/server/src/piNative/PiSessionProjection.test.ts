@@ -124,6 +124,92 @@ describe("PiSessionProjection", () => {
     expect(snapshot.thread.historyTruncation?.truncated).toBe(false);
   });
 
+  it("projects every durable Pi message surface", () => {
+    const surfaceEntries = [
+      {
+        type: "message",
+        id: "user",
+        parentId: null,
+        timestamp: "2026-07-30T00:00:01.000Z",
+        message: { role: "user", content: "start" },
+      },
+      {
+        type: "custom_message",
+        id: "hidden-custom",
+        parentId: "user",
+        timestamp: "2026-07-30T00:00:02.000Z",
+        customType: "hidden.extension",
+        content: "do not render",
+        display: false,
+      },
+      {
+        type: "custom_message",
+        id: "custom",
+        parentId: "hidden-custom",
+        timestamp: "2026-07-30T00:00:03.000Z",
+        customType: "review.extension",
+        content: [{ type: "text", text: "Extension output" }],
+        display: true,
+      },
+      {
+        type: "compaction",
+        id: "compaction",
+        parentId: "custom",
+        timestamp: "2026-07-30T00:00:04.000Z",
+        summary: "Earlier context summary",
+        firstKeptEntryId: "custom",
+        tokensBefore: 1234,
+      },
+      {
+        type: "branch_summary",
+        id: "branch-summary",
+        parentId: "compaction",
+        timestamp: "2026-07-30T00:00:05.000Z",
+        fromId: "other-branch",
+        summary: "Work retained from the other branch",
+      },
+      {
+        type: "message",
+        id: "system",
+        parentId: "branch-summary",
+        timestamp: "2026-07-30T00:00:06.000Z",
+        message: { role: "system", content: "Provider notice" },
+      },
+    ] as const;
+
+    const snapshot = projectPiThread({
+      record,
+      entries: surfaceEntries,
+      projectId: ProjectId.make("project-1"),
+    });
+
+    expect(
+      snapshot.thread.messages.map(({ role, text, surface }) => ({ role, text, surface })),
+    ).toEqual([
+      { role: "user", text: "start", surface: undefined },
+      {
+        role: "system",
+        text: "Extension output",
+        surface: { kind: "custom", label: "review.extension" },
+      },
+      {
+        role: "system",
+        text: "Earlier context summary",
+        surface: { kind: "compaction", label: "Context compacted" },
+      },
+      {
+        role: "system",
+        text: "Work retained from the other branch",
+        surface: { kind: "branch-summary", label: "Branch summarized" },
+      },
+      {
+        role: "system",
+        text: "Provider notice",
+        surface: { kind: "provider", label: "System message" },
+      },
+    ]);
+  });
+
   it("projects a persisted external lifecycle override", () => {
     const settled = projectPiThread({
       record,

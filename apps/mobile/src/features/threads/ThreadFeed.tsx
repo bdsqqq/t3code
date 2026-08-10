@@ -950,6 +950,42 @@ function renderFeedEntry(
       );
     }
 
+    if (message.role === "system") {
+      const surface = message.surface ?? { kind: "provider" as const, label: "System message" };
+      return (
+        <View className="mb-4 rounded-2xl border border-neutral-200/80 bg-neutral-100/60 px-3.5 py-3 dark:border-white/[0.08] dark:bg-white/[0.04]">
+          <View className="mb-1.5 flex-row items-center gap-1.5">
+            <SymbolView
+              name={surface.kind === "branch-summary" ? "arrow.triangle.branch" : "info.circle"}
+              size={14}
+              tintColor={iconSubtleColor}
+              type="monochrome"
+            />
+            <Text className="font-t3-medium text-xs text-foreground-muted">{surface.label}</Text>
+          </View>
+          {message.text.trim().length > 0 ? (
+            hasNativeSelectableMarkdownText() ? (
+              <SelectableMarkdownText
+                markdown={message.text}
+                skills={props.skills}
+                textStyle={markdownStyles.assistant.nativeTextStyle}
+                onLinkPress={props.onMarkdownLinkPress}
+              />
+            ) : (
+              <Markdown
+                options={{ gfm: true }}
+                renderers={markdownStyles.assistant.renderers}
+                styles={markdownStyles.assistant.styles}
+                theme={markdownStyles.assistant.theme}
+              >
+                {message.text}
+              </Markdown>
+            )
+          ) : null}
+        </View>
+      );
+    }
+
     // Skip empty assistant messages (no text, no attachments) — they would
     // render as an orphaned timestamp and break adjacent activity-group merging.
     if (message.text.trim().length === 0 && attachments.length === 0) {

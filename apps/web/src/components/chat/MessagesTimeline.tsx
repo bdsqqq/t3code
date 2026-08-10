@@ -45,6 +45,7 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   EyeIcon,
+  GitBranchIcon,
   GlobeIcon,
   HammerIcon,
   MessageCircleIcon,
@@ -852,6 +853,11 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       data-timeline-row-kind={row.kind}
       data-message-id={row.kind === "message" ? row.message.id : undefined}
       data-message-role={row.kind === "message" ? row.message.role : undefined}
+      data-message-surface={
+        row.kind === "message" && row.message.role === "system"
+          ? (row.message.surface?.kind ?? "provider")
+          : undefined
+      }
     >
       {row.kind === "work" ? <WorkGroupSection groupedEntries={row.groupedEntries} /> : null}
       {row.kind === "work-toggle" ? <WorkGroupToggleTimelineRow row={row} /> : null}
@@ -859,6 +865,9 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "message" && row.message.role === "user" ? <UserTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "assistant" ? (
         <AssistantTimelineRow row={row} />
+      ) : null}
+      {row.kind === "message" && row.message.role === "system" ? (
+        <SystemTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
       {row.kind === "working" ? <WorkingTimelineRow row={row} /> : null}
@@ -1054,6 +1063,40 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
         ) : null}
       </div>
     </>
+  );
+}
+
+function SystemTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
+  const ctx = use(TimelineRowCtx);
+  const surface = row.message.surface ?? { kind: "provider" as const, label: "System message" };
+  const Icon =
+    surface.kind === "compaction"
+      ? ZapIcon
+      : surface.kind === "branch-summary"
+        ? GitBranchIcon
+        : surface.kind === "custom"
+          ? MessageCircleIcon
+          : BotIcon;
+
+  return (
+    <section
+      className="mx-1 rounded-lg border border-border/60 bg-muted/25 px-3 py-2.5"
+      aria-label={surface.label}
+    >
+      <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
+        <Icon className="size-3.5 shrink-0" aria-hidden />
+        <p className="font-medium text-xs">{surface.label}</p>
+      </div>
+      {row.message.text.trim().length > 0 ? (
+        <ChatMarkdown
+          text={row.message.text}
+          cwd={ctx.markdownCwd}
+          threadRef={ctx.threadRef ?? undefined}
+          isStreaming={false}
+          skills={ctx.skills}
+        />
+      ) : null}
+    </section>
   );
 }
 

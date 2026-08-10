@@ -223,6 +223,45 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("renders generic cards for system message surfaces", () => {
+    const surfaces = [
+      { kind: "custom" as const, label: "review.extension", text: "Extension output" },
+      { kind: "compaction" as const, label: "Context compacted", text: "Earlier summary" },
+      {
+        kind: "branch-summary" as const,
+        label: "Branch summarized",
+        text: "Retained branch work",
+      },
+      { kind: "provider" as const, label: "System message", text: "Provider notice" },
+    ];
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={surfaces.map((surface, index) => ({
+          id: `surface-${index}`,
+          kind: "message" as const,
+          createdAt: MESSAGE_CREATED_AT,
+          message: {
+            id: MessageId.make(`surface-message-${index}`),
+            role: "system" as const,
+            text: surface.text,
+            surface: { kind: surface.kind, label: surface.label },
+            turnId: null,
+            createdAt: MESSAGE_CREATED_AT,
+            updatedAt: MESSAGE_CREATED_AT,
+            streaming: false,
+          },
+        }))}
+      />,
+    );
+
+    for (const surface of surfaces) {
+      expect(markup).toContain(`data-message-surface="${surface.kind}"`);
+      expect(markup).toContain(surface.label);
+      expect(markup).toContain(surface.text);
+    }
+  });
+
   it("uses the larger leading inset only when the top fade is enabled", () => {
     const timelineEntries = [buildUserTimelineEntry("Hello")];
 
