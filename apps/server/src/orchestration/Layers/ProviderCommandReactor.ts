@@ -2,6 +2,7 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  MANAGED_TURN_ADMISSION_PROTOCOL,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
@@ -73,6 +74,7 @@ type TurnStartRequest = {
   >["payload"]["messageId"];
   readonly operationId: CommandId | null;
   readonly recovered: boolean;
+  readonly admissionProtocol: typeof MANAGED_TURN_ADMISSION_PROTOCOL | null;
   readonly modelSelection?: ModelSelection;
   readonly titleSeed?: string;
   readonly interactionMode?: ProviderInteractionMode;
@@ -708,6 +710,7 @@ const make = Effect.gen(function* () {
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
+    readonly managedPiRecovery?: "claimable" | "durable-only";
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
@@ -716,10 +719,11 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(input.threadId, input.createdAt, {
-      ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-      pendingTurnStart: true,
-    });
+    if (input.managedPiRecovery === undefined)
+      yield* ensureSessionForThread(input.threadId, input.createdAt, {
+        ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+        pendingTurnStart: true,
+      });
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
@@ -760,6 +764,9 @@ const make = Effect.gen(function* () {
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      ...(input.managedPiRecovery === "durable-only"
+        ? { admissionMode: "recover-durable" as const }
+        : {}),
     };
   });
 
@@ -1085,28 +1092,15 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    if (request.recovered) {
-      const modelSelection = request.modelSelection ?? thread.modelSelection;
-      const instanceInfo = yield* providerService.getInstanceInfo(modelSelection.instanceId);
-      if (instanceInfo.driverKind === ProviderDriverKind.make("pi")) {
-        const detail =
-          "Pi turn admission is indeterminate because managed Pi prompts do not yet use the durable supervisor command ledger. The previous process may have accepted the prompt, so it was not resent.";
-        yield* setThreadSessionErrorOnTurnStartFailure({
-          threadId: request.threadId,
-          detail,
-          createdAt: request.createdAt,
-        });
-        yield* appendProviderFailureActivity({
-          threadId: request.threadId,
-          kind: "provider.turn.start.failed",
-          summary: "Pi turn admission is indeterminate",
-          detail,
-          turnId: null,
-          createdAt: request.createdAt,
-        });
-        return;
-      }
-    }
+    const managedPiRecovery =
+      request.recovered &&
+      (yield* providerService.getInstanceInfo(
+        (request.modelSelection ?? thread.modelSelection).instanceId,
+      )).driverKind === ProviderDriverKind.make("pi")
+        ? request.admissionProtocol === MANAGED_TURN_ADMISSION_PROTOCOL
+          ? "claimable"
+          : "durable-only"
+        : undefined;
 
     const isFirstUserMessageTurn =
       thread.messages.filter((entry) => entry.role === "user").length === 1;
@@ -1182,6 +1176,7 @@ const make = Effect.gen(function* () {
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(request.modelSelection !== undefined ? { modelSelection: request.modelSelection } : {}),
       interactionMode: request.interactionMode ?? thread.interactionMode,
+      ...(managedPiRecovery ? { managedPiRecovery } : {}),
       createdAt: request.createdAt,
     }).pipe(
       Effect.map(Option.some),
@@ -1380,6 +1375,7 @@ const make = Effect.gen(function* () {
           messageId: event.payload.messageId,
           operationId: event.commandId,
           recovered: false,
+          admissionProtocol: event.payload.admissionProtocol ?? null,
           ...(event.payload.modelSelection !== undefined
             ? { modelSelection: event.payload.modelSelection }
             : {}),
@@ -1477,6 +1473,7 @@ const make = Effect.gen(function* () {
             messageId: pendingTurnStart.messageId,
             operationId: pendingTurnStart.operationId,
             recovered: true,
+            admissionProtocol: pendingTurnStart.admissionProtocol,
             ...(pendingTurnStart.modelSelection !== null
               ? { modelSelection: pendingTurnStart.modelSelection }
               : {}),

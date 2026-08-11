@@ -8,6 +8,7 @@ import { ChildProcessSpawner } from "effect/unstable/process";
 
 import { BackgroundPolicy } from "../../background/BackgroundPolicy.ts";
 import { ServerConfig } from "../../config.ts";
+import { makeSupervisorClient } from "../../piNative/SupervisorClient.ts";
 import { ServerSettingsService } from "../../serverSettings.ts";
 import { makePiTextGeneration } from "../../textGeneration/PiTextGeneration.ts";
 import { ProviderDriverError } from "../Errors.ts";
@@ -49,6 +50,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
     Effect.gen(function* () {
       const serverConfig = yield* ServerConfig;
       const serverSettings = yield* ServerSettingsService;
+      const supervisor = makeSupervisorClient();
       const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
       const processEnv = mergeProviderInstanceEnvironment(environment);
       const effectiveConfig = { ...config, enabled } satisfies PiSettings;
@@ -70,6 +72,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
         stateDir: serverConfig.stateDir,
         attachmentsDir: serverConfig.attachmentsDir,
         environment: processEnv,
+        supervisor,
       }).pipe(
         Effect.mapError(
           (cause) =>

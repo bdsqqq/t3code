@@ -1097,6 +1097,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             modelSelection: event.payload.modelSelection ?? null,
             titleSeed: event.payload.titleSeed ?? null,
             interactionMode: event.payload.interactionMode,
+            admissionProtocol: event.payload.admissionProtocol ?? null,
             sourceProposedPlanThreadId: event.payload.sourceProposedPlan?.threadId ?? null,
             sourceProposedPlanId: event.payload.sourceProposedPlan?.planId ?? null,
             requestedAt: event.payload.createdAt,

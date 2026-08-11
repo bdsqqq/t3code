@@ -658,7 +658,7 @@ describe("ProviderCommandReactor", () => {
     expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
   });
 
-  it("reports recovered managed Pi admission as indeterminate without resending", async () => {
+  it("forwards marked managed Pi recovery as claimable with its stable identity", async () => {
     const piModelSelection = {
       instanceId: ProviderInstanceId.make("pi"),
       model: "openai/gpt-5",
@@ -669,22 +669,17 @@ describe("ProviderCommandReactor", () => {
       pendingTurnModelSelection: piModelSelection,
     });
 
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
     await harness.drain();
 
     expect(harness.startSession).not.toHaveBeenCalled();
-    expect(harness.sendTurn).not.toHaveBeenCalled();
-    const readModel = await harness.readModel();
-    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-    expect(thread?.session?.status).toBe("stopped");
-    expect(thread?.session?.lastError).toBe(
-      "Pi turn admission is indeterminate because managed Pi prompts do not yet use the durable supervisor command ledger. The previous process may have accepted the prompt, so it was not resent.",
-    );
-    expect(thread?.activities.at(-1)).toMatchObject({
-      summary: "Pi turn admission is indeterminate",
-      payload: {
-        detail:
-          "Pi turn admission is indeterminate because managed Pi prompts do not yet use the durable supervisor command ledger. The previous process may have accepted the prompt, so it was not resent.",
-      },
+    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+      operationId: CommandId.make("cmd-turn-start-before-reactor-start"),
+      input: "resume after restart",
+      modelSelection: piModelSelection,
+      interactionMode: "plan",
     });
   });
 

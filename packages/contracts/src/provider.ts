@@ -76,6 +76,7 @@ export const ProviderSendTurnInput = Schema.Struct({
   ),
   modelSelection: Schema.optional(ModelSelection),
   interactionMode: Schema.optional(ProviderInteractionMode),
+  admissionMode: Schema.optional(Schema.Literal("recover-durable")),
 });
 export type ProviderSendTurnInput = typeof ProviderSendTurnInput.Type;
 
