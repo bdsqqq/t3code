@@ -16,6 +16,7 @@ import { scopeThread } from "./models.ts";
 import { EMPTY_ENVIRONMENT_THREAD_STATE, type EnvironmentThreadState } from "./threadState.ts";
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { THREAD_STATE_IDLE_TTL_MS } from "./threadRetention.ts";
+import { mergeThreadActivitiesById } from "./threadActivityPagination.ts";
 
 const EMPTY_MESSAGES: ReadonlyArray<OrchestrationMessage> = Object.freeze([]);
 const EMPTY_ACTIVITIES: ReadonlyArray<OrchestrationThreadActivity> = Object.freeze([]);
@@ -70,6 +71,10 @@ export function createEnvironmentThreadDetailAtoms<E>(
     environmentId: ScopedThreadRef["environmentId"],
     threadId: ScopedThreadRef["threadId"],
   ) => Atom.Atom<AsyncResult.AsyncResult<EnvironmentThreadState, E>>,
+  activityHistoryAtom?: (
+    environmentId: ScopedThreadRef["environmentId"],
+    threadId: ScopedThreadRef["threadId"],
+  ) => Atom.Atom<{ readonly activities: ReadonlyArray<OrchestrationThreadActivity> }>,
 ) {
   const threadStateValueAtomFamily = Atom.family((key: string) => {
     const ref = parseThreadKey(key);
@@ -87,14 +92,24 @@ export function createEnvironmentThreadDetailAtoms<E>(
   const threadDetailAtomFamily = Atom.family((key: string) => {
     const ref = parseThreadKey(key);
     let previousSource: OrchestrationThread | null = null;
+    let previousHistory: ReadonlyArray<OrchestrationThreadActivity> = EMPTY_ACTIVITIES;
     let previousValue: EnvironmentThread | null = null;
     return Atom.make((get) => {
       const source = Option.getOrNull(get(threadStateValueAtomFamily(key)).data);
-      if (source === previousSource) {
+      const historySource = activityHistoryAtom?.(ref.environmentId, ref.threadId);
+      const history =
+        historySource === undefined ? EMPTY_ACTIVITIES : get(historySource).activities;
+      if (source === previousSource && history === previousHistory) {
         return previousValue;
       }
       previousSource = source;
-      previousValue = source === null ? null : scopeThread(ref.environmentId, source);
+      previousHistory = history;
+      if (source === null) {
+        previousValue = null;
+        return previousValue;
+      }
+      const activities = mergeThreadActivitiesById(history, source.activities);
+      previousValue = scopeThread(ref.environmentId, { ...source, activities });
       return previousValue;
     }).pipe(
       Atom.setIdleTTL(THREAD_STATE_IDLE_TTL_MS),

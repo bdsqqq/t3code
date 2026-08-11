@@ -163,6 +163,9 @@ export interface ThreadFeedProps {
   readonly layoutVariant?: LayoutVariant;
   readonly usesAutomaticContentInsets?: boolean;
   readonly onHeaderMaterialVisibilityChange?: (visible: boolean) => void;
+  readonly hasOlderActivities?: boolean;
+  readonly isLoadingOlderActivities?: boolean;
+  readonly onLoadOlderActivities?: () => void;
   readonly skills?: ReadonlyArray<SelectableMarkdownSkill>;
 }
 
@@ -1475,6 +1478,10 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
   // list opens pinned to the end.
   const nearListEnd = useSharedValue(true);
 
+  const olderActivityLoadArmedRef = useRef(false);
+  const handleScrollBeginDrag = useCallback(() => {
+    olderActivityLoadArmedRef.current = true;
+  }, []);
   const handleScroll = useCallback(
     (event: NativeSyntheticEvent<NativeScrollEvent>) => {
       // anchorTopInset, not topContentInset: under automatic insets the list
@@ -1483,10 +1490,26 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
       // header height back or the material toggles a full header too late.
       reportHeaderMaterialVisibility(event.nativeEvent.contentOffset.y + anchorTopInset > 6);
       const { contentOffset, contentSize, layoutMeasurement } = event.nativeEvent;
+      if (
+        olderActivityLoadArmedRef.current &&
+        contentOffset.y + anchorTopInset < 600 &&
+        props.hasOlderActivities === true &&
+        props.isLoadingOlderActivities !== true
+      ) {
+        olderActivityLoadArmedRef.current = false;
+        props.onLoadOlderActivities?.();
+      }
       nearListEnd.value =
         contentSize.height - layoutMeasurement.height - contentOffset.y < layoutMeasurement.height;
     },
-    [reportHeaderMaterialVisibility, anchorTopInset, nearListEnd],
+    [
+      reportHeaderMaterialVisibility,
+      anchorTopInset,
+      nearListEnd,
+      props.hasOlderActivities,
+      props.isLoadingOlderActivities,
+      props.onLoadOlderActivities,
+    ],
   );
 
   // Gated variant of the 180ms feed layout slide. Instant while browsing
@@ -1926,6 +1949,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
             // overflow the viewport (the padding clamps to zero).
             alignItemsAtEnd
             initialScrollAtEnd
+            onScrollBeginDrag={handleScrollBeginDrag}
             onScroll={handleScroll}
             scrollEventThrottle={16}
             ListHeaderComponent={

@@ -42,6 +42,8 @@ import {
 } from "./ThreadComposer";
 import { ThreadFeed } from "./ThreadFeed";
 import type { ThreadContentPresentation } from "./threadContentPresentation";
+import { environmentThreads, useEnvironmentThreadActivityHistory } from "../../state/threads";
+import { useAtomCommand } from "../../state/use-atom-command";
 
 export interface ThreadDetailScreenProps {
   readonly selectedThread: OrchestrationThread | OrchestrationThreadShell;
@@ -204,6 +206,20 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
     }
   })();
   const selectedThreadFeed = props.selectedThreadFeed;
+  const activityHistory = useEnvironmentThreadActivityHistory(
+    props.environmentId,
+    props.selectedThread.id,
+  );
+  const loadOlderActivities = useAtomCommand(environmentThreads.loadOlderActivities, {
+    reportFailure: false,
+  });
+  const handleLoadOlderActivities = useCallback(() => {
+    if (activityHistory.status !== "idle" && activityHistory.status !== "error") return;
+    void loadOlderActivities({
+      environmentId: props.environmentId,
+      input: { threadId: props.selectedThread.id },
+    });
+  }, [activityHistory.status, loadOlderActivities, props.environmentId, props.selectedThread.id]);
   const composerChrome = composerExpanded ? COMPOSER_EXPANDED_CHROME : COMPOSER_COLLAPSED_CHROME;
   const composerOverlapHeight = composerChrome + composerBottomInset;
   const estimatedOverlayHeight = composerOverlapHeight;
@@ -377,6 +393,11 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
             layoutVariant={layoutVariant}
             usesAutomaticContentInsets={props.usesAutomaticContentInsets}
             onHeaderMaterialVisibilityChange={props.onHeaderMaterialVisibilityChange}
+            hasOlderActivities={
+              activityHistory.status === "idle" || activityHistory.status === "error"
+            }
+            isLoadingOlderActivities={activityHistory.status === "loading"}
+            onLoadOlderActivities={handleLoadOlderActivities}
             skills={selectedProviderSkills}
           />
         </View>

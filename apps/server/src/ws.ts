@@ -1357,7 +1357,7 @@ const makeWsRpcLayer = (
                 }
 
                 const snapshot = yield* projectionSnapshotQuery
-                  .getThreadDetailSnapshot(input.threadId)
+                  .getThreadDetailPageSnapshot(input.threadId)
                   .pipe(
                     Effect.mapError(
                       (cause) =>

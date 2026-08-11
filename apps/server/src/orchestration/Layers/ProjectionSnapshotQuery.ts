@@ -1,15 +1,22 @@
 import {
   ChatAttachment,
   CheckpointRef,
+  EventId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
   OrchestrationCheckpointFile,
+  ORCHESTRATION_ACTIVITY_PAGE_DEFAULT_SIZE,
+  ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
+  type OrchestrationActivityPageRequest,
+  type OrchestrationActivityPageResult,
+  type OrchestrationActivityPosition,
   OrchestrationProposedPlanId,
   OrchestrationReadModel,
   OrchestrationThreadSearchSource,
   OrchestrationShellSnapshot,
   OrchestrationThread,
+  OrchestrationThreadActivityTone,
   OrchestrationThreadDetailSnapshot,
   ProjectScript,
   TurnId,
@@ -63,6 +70,18 @@ import {
 const decodeReadModel = Schema.decodeUnknownEffect(OrchestrationReadModel);
 const decodeShellSnapshot = Schema.decodeUnknownEffect(OrchestrationShellSnapshot);
 const decodeThread = Schema.decodeUnknownEffect(OrchestrationThread);
+const ActivityPageDbRow = Schema.Struct({
+  activityId: EventId,
+  threadId: ThreadId,
+  turnId: Schema.NullOr(TurnId),
+  tone: OrchestrationThreadActivityTone,
+  kind: Schema.String,
+  summary: Schema.String,
+  payloadJson: Schema.NullOr(Schema.String),
+  payloadBytes: NonNegativeInt,
+  sequence: Schema.NullOr(NonNegativeInt),
+  createdAt: IsoDateTime,
+});
 const MAX_THREAD_ACTIVITY_COUNT = 2_000;
 const MAX_THREAD_ACTIVITY_PAYLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_FULL_SNAPSHOT_ACTIVITY_COUNT = 2_000;
@@ -569,6 +588,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           activity.summary,
           activity.payload_json AS "payload",
           activity.sequence,
+          activity.applied_sequence AS "appliedSequence",
           activity.created_at AS "createdAt"
         FROM payload_ranked AS retained
         INNER JOIN projection_thread_activities AS activity
@@ -1012,6 +1032,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           activity.summary,
           activity.payload_json AS "payload",
           activity.sequence,
+          activity.applied_sequence AS "appliedSequence",
           activity.created_at AS "createdAt"
         FROM projection_thread_activities AS activity
         INNER JOIN (
@@ -2169,7 +2190,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       } satisfies OrchestrationThreadShell);
     });
 
-  const getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"] = (threadId) =>
+  const readThreadDetailById = (
+    threadId: ThreadId,
+    includeActivities: boolean,
+  ): Effect.Effect<Option.Option<OrchestrationThread>, ProjectionRepositoryError> =>
     Effect.gen(function* () {
       const [
         threadRow,
@@ -2204,14 +2228,16 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             ),
           ),
         ),
-        listThreadActivityRowsByThread({ threadId }).pipe(
-          Effect.mapError(
-            toPersistenceSqlOrDecodeError(
-              "ProjectionSnapshotQuery.getThreadDetailById:listActivities:query",
-              "ProjectionSnapshotQuery.getThreadDetailById:listActivities:decodeRows",
-            ),
-          ),
-        ),
+        includeActivities
+          ? listThreadActivityRowsByThread({ threadId }).pipe(
+              Effect.mapError(
+                toPersistenceSqlOrDecodeError(
+                  "ProjectionSnapshotQuery.getThreadDetailById:listActivities:query",
+                  "ProjectionSnapshotQuery.getThreadDetailById:listActivities:decodeRows",
+                ),
+              ),
+            )
+          : Effect.succeed([]),
         listCheckpointRowsByThread({ threadId }).pipe(
           Effect.mapError(
             toPersistenceSqlOrDecodeError(
@@ -2313,7 +2339,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       );
     });
 
-  const getThreadDetailSnapshot: ProjectionSnapshotQueryShape["getThreadDetailSnapshot"] = (
+  const getThreadDetailById: ProjectionSnapshotQueryShape["getThreadDetailById"] = (threadId) =>
+    readThreadDetailById(threadId, true);
+
+  const getThreadDetailPageSnapshot: ProjectionSnapshotQueryShape["getThreadDetailPageSnapshot"] = (
     threadId,
   ) =>
     // Read the thread detail and the snapshot sequence within a single
@@ -2321,6 +2350,50 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     // projector update landing between two separate reads could otherwise return
     // a sequence ahead of the thread detail, causing the client to resume from
     // too far and drop events.
+    sql
+      .withTransaction(
+        Effect.gen(function* () {
+          // Activity payloads are loaded by the bounded page query below. Do
+          // not run the legacy 2,000-row/64 MiB detail query just to replace it.
+          const thread = yield* readThreadDetailById(threadId, false);
+          if (Option.isNone(thread)) {
+            return Option.none<OrchestrationThreadDetailSnapshot>();
+          }
+          const { snapshotSequence } = yield* getSnapshotSequence();
+          const page = yield* readThreadActivityPage(
+            threadId,
+            {
+              cursor: { kind: "initial" },
+              pageSize: ORCHESTRATION_ACTIVITY_PAGE_DEFAULT_SIZE,
+            },
+            snapshotSequence,
+          );
+          if (Option.isNone(page) || page.value.kind !== "page") {
+            return Option.none<OrchestrationThreadDetailSnapshot>();
+          }
+          return Option.some({
+            snapshotSequence,
+            thread: { ...thread.value, activities: page.value.activities },
+            pageInfo: page.value.pageInfo,
+          });
+        }),
+      )
+      .pipe(
+        Effect.mapError((error) =>
+          isPersistenceError(error)
+            ? error
+            : toPersistenceSqlError(
+                "ProjectionSnapshotQuery.getThreadDetailPageSnapshot:transaction",
+              )(error),
+        ),
+      );
+
+  const getThreadDetailSnapshot: ProjectionSnapshotQueryShape["getThreadDetailSnapshot"] = (
+    threadId,
+  ) =>
+    // Compatibility-only full targeted snapshot. New clients use
+    // getThreadDetailPageSnapshot; keeping this read thread-scoped ensures the
+    // legacy endpoint can never hydrate global activity history.
     sql
       .withTransaction(
         Effect.gen(function* () {
@@ -2342,6 +2415,209 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ),
       );
 
+  const readThreadActivityPage = (
+    threadId: ThreadId,
+    request: OrchestrationActivityPageRequest,
+    initialAsOfSequence?: number,
+  ): Effect.Effect<Option.Option<OrchestrationActivityPageResult>, ProjectionRepositoryError> =>
+    Effect.gen(function* () {
+      const thread = yield* getActiveThreadRowById({ threadId }).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.getThreadActivityPage:getThread",
+            "ProjectionSnapshotQuery.getThreadActivityPage:decodeThread",
+          ),
+        ),
+      );
+      if (Option.isNone(thread)) return Option.none<OrchestrationActivityPageResult>();
+      const snapshot = yield* getSnapshotSequence();
+      const asOfSequence =
+        request.cursor.kind === "initial"
+          ? (initialAsOfSequence ?? snapshot.snapshotSequence)
+          : request.cursor.asOfSequence;
+      const anchor = request.cursor.kind === "before" ? request.cursor.position : null;
+
+      const floorRows = yield* sql<OrchestrationActivityPosition>`
+            SELECT sequence, created_at AS "createdAt", activity_id AS "activityId"
+            FROM projection_thread_activities
+            WHERE thread_id = ${threadId} AND applied_sequence <= ${asOfSequence}
+            ORDER BY sequence ASC, created_at ASC, activity_id ASC LIMIT 1
+          `.pipe(
+        Effect.mapError(
+          toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:floor"),
+        ),
+      );
+      const retentionFloor = floorRows[0]
+        ? { kind: "oldest-available" as const, position: floorRows[0] }
+        : { kind: "empty" as const };
+
+      if (anchor !== null) {
+        const exact = yield* sql<{ readonly present: number }>`
+              SELECT EXISTS(
+                SELECT 1 FROM projection_thread_activities
+                WHERE thread_id = ${threadId} AND activity_id = ${anchor.activityId}
+                  AND sequence IS ${anchor.sequence} AND created_at = ${anchor.createdAt}
+                  AND applied_sequence <= ${asOfSequence}
+              ) AS present
+            `.pipe(
+          Effect.mapError(
+            toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:anchor"),
+          ),
+        );
+        const cursorFloor =
+          request.cursor.kind === "before" ? request.cursor.retentionFloor : retentionFloor;
+        const retentionFloorChanged =
+          cursorFloor.kind !== retentionFloor.kind ||
+          (cursorFloor.kind === "oldest-available" &&
+            retentionFloor.kind === "oldest-available" &&
+            (cursorFloor.position.activityId !== retentionFloor.position.activityId ||
+              cursorFloor.position.sequence !== retentionFloor.position.sequence ||
+              cursorFloor.position.createdAt !== retentionFloor.position.createdAt));
+        if (
+          exact[0]?.present !== 1 ||
+          asOfSequence > snapshot.snapshotSequence ||
+          retentionFloorChanged
+        ) {
+          return Option.some({ kind: "cursor-expired", asOfSequence, retentionFloor });
+        }
+      }
+
+      const rows = yield* SqlSchema.findAll({
+        Request: Schema.Void,
+        Result: ActivityPageDbRow,
+        execute: () => sql`
+            WITH ranked_ids AS (
+              SELECT activity_id, sequence, created_at
+              FROM projection_thread_activities
+              WHERE thread_id = ${threadId}
+                AND applied_sequence <= ${asOfSequence}
+                AND (${anchor === null ? 1 : 0} = 1 OR
+                  CASE WHEN sequence IS NULL THEN 0 ELSE 1 END < ${anchor?.sequence === null ? 0 : 1}
+                  OR (CASE WHEN sequence IS NULL THEN 0 ELSE 1 END = ${anchor?.sequence === null ? 0 : 1}
+                    AND ((sequence IS NOT NULL AND sequence < ${anchor?.sequence ?? 0})
+                      OR ((sequence IS ${anchor?.sequence ?? null})
+                        AND (created_at < ${anchor?.createdAt ?? ""}
+                          OR (created_at = ${anchor?.createdAt ?? ""} AND activity_id < ${anchor?.activityId ?? ""}))))))
+              ORDER BY sequence DESC, created_at DESC, activity_id DESC
+              LIMIT ${request.pageSize + 1}
+            ), payload_sizes AS (
+              SELECT ids.*, length(CAST(a.payload_json AS BLOB)) AS payload_bytes,
+                SUM(length(CAST(a.payload_json AS BLOB))) OVER (
+                  ORDER BY ids.sequence DESC, ids.created_at DESC, ids.activity_id DESC
+                ) AS cumulative_bytes
+              FROM ranked_ids ids JOIN projection_thread_activities a USING (activity_id)
+            )
+            SELECT a.activity_id AS "activityId", a.thread_id AS "threadId",
+              a.turn_id AS "turnId", a.tone, a.kind, a.summary,
+              CASE WHEN sizes.cumulative_bytes <= ${ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES}
+                THEN a.payload_json ELSE NULL END AS "payloadJson",
+              sizes.payload_bytes AS "payloadBytes", a.sequence, a.created_at AS "createdAt"
+            FROM payload_sizes sizes JOIN projection_thread_activities a USING (activity_id)
+            WHERE sizes.cumulative_bytes - sizes.payload_bytes <= ${ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES}
+            ORDER BY a.sequence DESC, a.created_at DESC, a.activity_id DESC
+            LIMIT ${request.pageSize}
+          `,
+      })(undefined).pipe(
+        Effect.mapError(
+          toPersistenceSqlOrDecodeError(
+            "ProjectionSnapshotQuery.getThreadActivityPage:list",
+            "ProjectionSnapshotQuery.getThreadActivityPage:decode",
+          ),
+        ),
+      );
+      const omissions: Array<{
+        activityId: (typeof rows)[number]["activityId"];
+        originalPayloadBytes: number;
+        limitBytes: number;
+        reason: "page-payload-byte-limit";
+      }> = [];
+      const activities = rows
+        .map((row) => {
+          const payload =
+            row.payloadJson === null
+              ? {
+                  kind: "omitted" as const,
+                  reason: "page-payload-byte-limit" as const,
+                  originalPayloadBytes: row.payloadBytes,
+                  limitBytes: ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
+                }
+              : (JSON.parse(row.payloadJson) as unknown);
+          if (row.payloadJson === null)
+            omissions.push({
+              activityId: row.activityId,
+              originalPayloadBytes: row.payloadBytes,
+              limitBytes: ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
+              reason: "page-payload-byte-limit",
+            });
+          return {
+            id: row.activityId,
+            tone: row.tone,
+            kind: row.kind,
+            summary: row.summary,
+            payload,
+            turnId: row.turnId,
+            createdAt: row.createdAt,
+            ...(row.sequence === null ? {} : { sequence: row.sequence }),
+          };
+        })
+        .reverse();
+      const oldest = rows.at(-1);
+      const hasMore =
+        oldest !== undefined &&
+        retentionFloor.kind === "oldest-available" &&
+        (oldest.activityId !== retentionFloor.position.activityId ||
+          oldest.sequence !== retentionFloor.position.sequence ||
+          oldest.createdAt !== retentionFloor.position.createdAt);
+      const nextCursor =
+        hasMore && oldest
+          ? {
+              kind: "before" as const,
+              asOfSequence,
+              position: {
+                sequence: oldest.sequence,
+                createdAt: oldest.createdAt,
+                activityId: oldest.activityId,
+              },
+              retentionFloor,
+              historyRevision: null,
+            }
+          : null;
+      return Option.some({
+        kind: "page",
+        activities,
+        pageInfo: {
+          asOfSequence,
+          nextCursor,
+          retentionFloor,
+          limits: {
+            pageSize: request.pageSize,
+            payloadBytes: ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
+          },
+          payloadBytes: rows.reduce(
+            (n, row) => n + (row.payloadJson === null ? 0 : row.payloadBytes),
+            0,
+          ),
+          omittedPayloads: omissions,
+        },
+      });
+    });
+
+  const getThreadActivityPage: ProjectionSnapshotQueryShape["getThreadActivityPage"] = (
+    threadId,
+    request,
+  ) =>
+    sql
+      .withTransaction(readThreadActivityPage(threadId, request))
+      .pipe(
+        Effect.mapError((error) =>
+          isPersistenceError(error)
+            ? error
+            : toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:transaction")(
+                error,
+              ),
+        ),
+      );
+
   return {
     getCommandReadModel,
     getSnapshot,
@@ -2358,6 +2634,8 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getThreadShellById,
     getThreadDetailById,
     getThreadDetailSnapshot,
+    getThreadDetailPageSnapshot,
+    getThreadActivityPage,
   } satisfies ProjectionSnapshotQueryShape;
 });
 

@@ -52,6 +52,7 @@ import Migration0036 from "./Migrations/036_PiExternalLifecycleOverrides.ts";
 import Migration0037 from "./Migrations/037_ProjectionPendingTurnIntent.ts";
 import Migration0038 from "./Migrations/038_ProjectionPendingTurnOperationId.ts";
 import Migration0039 from "./Migrations/039_ProjectionPendingTurnAdmissionProtocol.ts";
+import Migration0040 from "./Migrations/040_ProjectionThreadActivityAppliedSequence.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -103,6 +104,7 @@ export const migrationEntries = [
   [37, "ProjectionPendingTurnIntent", Migration0037],
   [38, "ProjectionPendingTurnOperationId", Migration0038],
   [39, "ProjectionPendingTurnAdmissionProtocol", Migration0039],
+  [40, "ProjectionThreadActivityAppliedSequence", Migration0040],
 ] as const;
 
 export const makeMigrationLoader = (throughId?: number) =>
