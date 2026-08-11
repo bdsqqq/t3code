@@ -183,6 +183,9 @@ interface MessagesTimelineProps {
   contentInsetEndAdjustment: number;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
+  hasOlderActivities?: boolean;
+  isLoadingOlderActivities?: boolean;
+  onLoadOlderActivities?: () => void;
   hideEmptyPlaceholder?: boolean;
   topFadeEnabled?: boolean;
 }
@@ -218,6 +221,9 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   contentInsetEndAdjustment,
   onIsAtEndChange,
   onManualNavigation,
+  hasOlderActivities,
+  isLoadingOlderActivities,
+  onLoadOlderActivities,
   hideEmptyPlaceholder = false,
   topFadeEnabled = false,
 }: MessagesTimelineProps) {
@@ -331,6 +337,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   );
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
   const [minimapHitStripWidth, setMinimapHitStripWidth] = useState(0);
+  const previousScrollTopRef = useRef<number | null>(null);
+  const olderActivityLoadArmedRef = useRef(false);
   const handleAnchorReady = useCallback(
     (info: { anchorIndex: number | undefined }) => {
       if (anchorMessageId !== null && info.anchorIndex !== undefined) {
@@ -362,12 +370,29 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     if (isAtEnd !== undefined) {
       onIsAtEndChange(isAtEnd);
     }
-    if (!state || minimapItems.length === 0) {
+    if (!state) {
       return;
     }
 
     const scrollTop = state.scroll ?? 0;
     const scrollBottom = scrollTop + (state.scrollLength ?? 0);
+    const previousScrollTop = previousScrollTopRef.current;
+    previousScrollTopRef.current = scrollTop;
+    if (previousScrollTop !== null && scrollTop < previousScrollTop) {
+      olderActivityLoadArmedRef.current = true;
+    }
+    if (
+      olderActivityLoadArmedRef.current &&
+      scrollTop < 600 &&
+      hasOlderActivities === true &&
+      isLoadingOlderActivities !== true
+    ) {
+      olderActivityLoadArmedRef.current = false;
+      onLoadOlderActivities?.();
+    }
+    if (minimapItems.length === 0) {
+      return;
+    }
 
     for (const item of minimapItems) {
       const strip = minimapStripMap.get(item.id);
@@ -384,7 +409,15 @@ export const MessagesTimeline = memo(function MessagesTimeline({
 
       strip.dataset.inView = inView ? "true" : "false";
     }
-  }, [listRef, minimapItems, minimapStripMap, onIsAtEndChange]);
+  }, [
+    hasOlderActivities,
+    isLoadingOlderActivities,
+    listRef,
+    minimapItems,
+    minimapStripMap,
+    onIsAtEndChange,
+    onLoadOlderActivities,
+  ]);
 
   useEffect(() => {
     const frame = requestAnimationFrame(handleScroll);
@@ -484,7 +517,16 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   return (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
-        <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
+        <div
+          ref={setTimelineViewportElement}
+          className="relative h-full min-h-0"
+          onWheelCapture={(event) => {
+            if (event.deltaY < 0) {
+              olderActivityLoadArmedRef.current = true;
+              handleScroll();
+            }
+          }}
+        >
           <LegendList<MessagesTimelineRow>
             ref={listRef}
             data={rows}

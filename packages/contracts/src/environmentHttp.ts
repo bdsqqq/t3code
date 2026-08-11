@@ -29,7 +29,8 @@ import { ExecutionEnvironmentDescriptor } from "./environment.ts";
 import {
   ClientOrchestrationCommand,
   DispatchResult,
-  OrchestrationReadModel,
+  OrchestrationActivityPageRequest,
+  OrchestrationActivityPageResult,
   OrchestrationShellSnapshot,
   OrchestrationThreadDetailSnapshot,
 } from "./orchestration.ts";
@@ -460,13 +461,6 @@ const EnvironmentOrchestrationThreadSnapshotParams = Schema.Struct({
 
 export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestration")
   .add(
-    HttpApiEndpoint.get("snapshot", "/api/orchestration/snapshot", {
-      headers: OptionalBearerHeaders,
-      success: OrchestrationReadModel,
-      error: EnvironmentOrchestrationSnapshotErrors,
-    }).middleware(EnvironmentAuthenticatedAuth),
-  )
-  .add(
     HttpApiEndpoint.get("shellSnapshot", "/api/orchestration/shell", {
       headers: OptionalBearerHeaders,
       success: OrchestrationShellSnapshot,
@@ -474,12 +468,35 @@ export class EnvironmentOrchestrationHttpApi extends HttpApiGroup.make("orchestr
     }).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
-    HttpApiEndpoint.get("threadSnapshot", "/api/orchestration/threads/:threadId", {
+    HttpApiEndpoint.get("threadSnapshot", "/api/orchestration/threads/:threadId/detail", {
       headers: OptionalBearerHeaders,
       params: EnvironmentOrchestrationThreadSnapshotParams,
       success: OrchestrationThreadDetailSnapshot,
       error: EnvironmentOrchestrationThreadSnapshotErrors,
     }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    // Compatibility for clients released before activity paging. This remains
+    // targeted to one thread and is intentionally not used by current clients.
+    HttpApiEndpoint.get("legacyThreadSnapshot", "/api/orchestration/threads/:threadId", {
+      headers: OptionalBearerHeaders,
+      params: EnvironmentOrchestrationThreadSnapshotParams,
+      success: OrchestrationThreadDetailSnapshot,
+      error: EnvironmentOrchestrationThreadSnapshotErrors,
+    }).middleware(EnvironmentAuthenticatedAuth),
+  )
+  .add(
+    HttpApiEndpoint.post(
+      "threadActivitiesPage",
+      "/api/orchestration/threads/:threadId/activities/page",
+      {
+        headers: OptionalBearerHeaders,
+        params: EnvironmentOrchestrationThreadSnapshotParams,
+        payload: OrchestrationActivityPageRequest,
+        success: OrchestrationActivityPageResult,
+        error: EnvironmentOrchestrationThreadSnapshotErrors,
+      },
+    ).middleware(EnvironmentAuthenticatedAuth),
   )
   .add(
     HttpApiEndpoint.post("dispatch", "/api/orchestration/dispatch", {

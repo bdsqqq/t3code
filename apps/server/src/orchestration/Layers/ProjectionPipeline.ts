@@ -1031,6 +1031,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
             ...(event.payload.activity.sequence !== undefined
               ? { sequence: event.payload.activity.sequence }
               : {}),
+            appliedSequence: event.sequence,
             createdAt: event.payload.activity.createdAt,
           });
           return;

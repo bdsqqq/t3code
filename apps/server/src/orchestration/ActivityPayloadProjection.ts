@@ -1,4 +1,5 @@
 import type {
+  OrchestrationActivityPageResult,
   OrchestrationEvent,
   OrchestrationThreadActivity,
   OrchestrationThreadDetailSnapshot,
@@ -259,6 +260,17 @@ export function projectThreadDetailSnapshot(
       ),
     },
   };
+}
+
+export function projectThreadActivityPageResult(
+  result: OrchestrationActivityPageResult,
+): OrchestrationActivityPageResult {
+  return result.kind === "cursor-expired"
+    ? result
+    : {
+        ...result,
+        activities: dropStaleContextWindowActivities(result.activities).map(projectActivityPayload),
+      };
 }
 
 export function projectActivityEvent(event: OrchestrationEvent): OrchestrationEvent {

@@ -575,9 +575,93 @@ export const OrchestrationSubscribeThreadInput = Schema.Struct({
 });
 export type OrchestrationSubscribeThreadInput = typeof OrchestrationSubscribeThreadInput.Type;
 
+export const ORCHESTRATION_ACTIVITY_PAGE_MAX_SIZE = 100;
+export const ORCHESTRATION_ACTIVITY_PAGE_DEFAULT_SIZE = 50;
+export const ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES = 4 * 1024 * 1024;
+
+export const OrchestrationActivityPosition = Schema.Struct({
+  sequence: Schema.NullOr(NonNegativeInt),
+  createdAt: IsoDateTime,
+  activityId: EventId,
+});
+export type OrchestrationActivityPosition = typeof OrchestrationActivityPosition.Type;
+
+export const OrchestrationActivityRetentionFloor = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("empty") }),
+  Schema.Struct({
+    kind: Schema.Literal("oldest-available"),
+    position: OrchestrationActivityPosition,
+  }),
+]);
+export type OrchestrationActivityRetentionFloor = typeof OrchestrationActivityRetentionFloor.Type;
+
+export const OrchestrationActivityPageCursor = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("initial") }),
+  Schema.Struct({
+    kind: Schema.Literal("before"),
+    asOfSequence: NonNegativeInt,
+    position: OrchestrationActivityPosition,
+    retentionFloor: OrchestrationActivityRetentionFloor,
+    historyRevision: Schema.NullOr(TrimmedNonEmptyString),
+  }),
+]);
+export type OrchestrationActivityPageCursor = typeof OrchestrationActivityPageCursor.Type;
+
+export const OrchestrationActivityPayloadOmitted = Schema.Struct({
+  kind: Schema.Literal("omitted"),
+  reason: Schema.Literal("page-payload-byte-limit"),
+  originalPayloadBytes: NonNegativeInt,
+  limitBytes: NonNegativeInt,
+});
+export type OrchestrationActivityPayloadOmitted = typeof OrchestrationActivityPayloadOmitted.Type;
+
+export const OrchestrationActivityPageInfo = Schema.Struct({
+  asOfSequence: NonNegativeInt,
+  nextCursor: Schema.NullOr(OrchestrationActivityPageCursor),
+  retentionFloor: OrchestrationActivityRetentionFloor,
+  limits: Schema.Struct({ pageSize: NonNegativeInt, payloadBytes: NonNegativeInt }),
+  payloadBytes: NonNegativeInt,
+  omittedPayloads: Schema.Array(
+    Schema.Struct({
+      activityId: EventId,
+      originalPayloadBytes: NonNegativeInt,
+      limitBytes: NonNegativeInt,
+      reason: Schema.Literal("page-payload-byte-limit"),
+    }),
+  ),
+});
+export type OrchestrationActivityPageInfo = typeof OrchestrationActivityPageInfo.Type;
+
+export const OrchestrationActivityPageRequest = Schema.Struct({
+  cursor: OrchestrationActivityPageCursor,
+  pageSize: NonNegativeInt.pipe(
+    Schema.refine(
+      (size): size is number => size >= 1 && size <= ORCHESTRATION_ACTIVITY_PAGE_MAX_SIZE,
+    ),
+  ),
+});
+export type OrchestrationActivityPageRequest = typeof OrchestrationActivityPageRequest.Type;
+
+export const OrchestrationActivityPageResult = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("page"),
+    activities: Schema.Array(OrchestrationThreadActivity),
+    pageInfo: OrchestrationActivityPageInfo,
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("cursor-expired"),
+    asOfSequence: NonNegativeInt,
+    retentionFloor: OrchestrationActivityRetentionFloor,
+  }),
+]);
+export type OrchestrationActivityPageResult = typeof OrchestrationActivityPageResult.Type;
+
 export const OrchestrationThreadDetailSnapshot = Schema.Struct({
   snapshotSequence: NonNegativeInt,
   thread: OrchestrationThread,
+  // Optional so clients can still decode a snapshot from a pre-pagination
+  // server during a rolling desktop/mobile upgrade.
+  pageInfo: Schema.optional(OrchestrationActivityPageInfo),
 });
 export type OrchestrationThreadDetailSnapshot = typeof OrchestrationThreadDetailSnapshot.Type;
 
