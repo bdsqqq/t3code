@@ -60,6 +60,35 @@ authenticated.
 - `vp run lint:mobile`: Mobile native static analysis (`scripts/mobile-native-static-check.ts`).
 - `node apps/server/scripts/t3-sqlite-state.ts <query|exec> --base-dir <path> ...`: Inspects or seeds
   an isolated T3 SQLite database; writes create a private backup first.
+- `node apps/server/scripts/t3-sqlite-growth.ts --database <path>`: Analyzes T3 SQLite payload
+  growth without modifying the supplied database. Add `--json` for the complete machine-readable
+  report.
+
+### SQLite growth analysis
+
+The growth analyzer requires an explicit path and opens it with SQLite's strict read-only mode:
+
+```bash
+node apps/server/scripts/t3-sqlite-growth.ts \
+  --database ~/.t3/userdata/state.sqlite
+
+node apps/server/scripts/t3-sqlite-growth.ts \
+  --database /path/to/state.sqlite \
+  --json > growth-report.json
+```
+
+It reports database/page/WAL metadata and payload row counts plus UTF-8 byte totals by thread, kind,
+and age. `projection_thread_activities` is labeled as **derived projection data**;
+`orchestration_events` is labeled separately as the **canonical source of truth**. The report is
+evidence for planning only and does not recommend deleting canonical events.
+
+Payload size is measured inside grouped SQL aggregates with
+`length(CAST(payload_json AS BLOB))`. The analyzer does not select or parse payload JSON, start a
+transaction spanning the report, checkpoint the WAL, migrate, vacuum, or write any pragma. Each
+grouping query still scans the relevant table and can take time on a large database. A running
+server may grow its WAL while any individual scan holds a read snapshot. If WAL pinning is an
+operational concern, analyze a consistent copy made with SQLite's online backup API instead. Do not
+copy only a live `state.sqlite` file while omitting its WAL.
 
 ## Desktop artifacts
 
