@@ -6,10 +6,89 @@ import type {
   PiNativeSessionKey,
   PiThreadLifecycleData,
 } from "@t3tools/contracts";
+import { MANAGED_TURN_ADMISSION_PROTOCOL } from "@t3tools/contracts";
 
 export const SUPERVISOR_PROTOCOL = "t3-control-v2";
+export const MANAGED_ADMISSION_PROTOCOL = MANAGED_TURN_ADMISSION_PROTOCOL;
 export const SUPERVISOR_MAX_LINE_BYTES = 112 * 1024 * 1024;
 export const SUPERVISOR_MAX_STREAM_ITEM_BYTES = 32 * 1024 * 1024;
+
+export interface SupervisorCapabilities {
+  readonly managedAdmission: typeof MANAGED_ADMISSION_PROTOCOL;
+}
+
+export interface ManagedPiTurnStartPayload {
+  readonly type: "managed-pi.turn-start";
+  readonly providerInstanceId: string;
+  readonly threadId: string;
+  readonly session: {
+    readonly schemaVersion: 1;
+    readonly sessionFile: string;
+    readonly sessionId: string;
+  };
+  readonly message: string;
+  readonly attachments: ReadonlyArray<{
+    readonly type: "image";
+    readonly id: string;
+    readonly name: string;
+    readonly mimeType: string;
+    readonly sizeBytes: number;
+  }>;
+  readonly model: {
+    readonly provider: string;
+    readonly modelId: string;
+  };
+  // null is the stable accepted instruction to preserve Pi's configured level.
+  readonly thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | null;
+  readonly interactionMode: "default" | "plan";
+}
+
+export interface ManagedClaimRequest {
+  readonly protocol: typeof MANAGED_ADMISSION_PROTOCOL;
+  readonly intent: "execute" | "recover-existing";
+  readonly operationKey: string;
+  readonly payload: ManagedPiTurnStartPayload;
+}
+
+export interface ManagedCompletedReceipt {
+  readonly turnId: string;
+}
+
+export type ManagedOperationState =
+  | { readonly status: "absent" }
+  | { readonly status: "delivering" }
+  | { readonly status: "completed"; readonly receipt: ManagedCompletedReceipt }
+  | { readonly status: "rejected"; readonly error: string }
+  | { readonly status: "indeterminate"; readonly error: string };
+
+export type ManagedClaimResponse =
+  | {
+      readonly status: "granted";
+      readonly operationKey: string;
+      readonly leaseToken: string;
+    }
+  | ManagedOperationState
+  | { readonly status: "conflict"; readonly error: string };
+
+export type ManagedFinalization =
+  | { readonly status: "completed"; readonly receipt: ManagedCompletedReceipt }
+  | { readonly status: "rejected"; readonly error: string }
+  | { readonly status: "indeterminate"; readonly error: string };
+
+export interface ManagedFinalizeRequest {
+  readonly protocol: typeof MANAGED_ADMISSION_PROTOCOL;
+  readonly operationKey: string;
+  readonly leaseToken: string;
+  readonly finalization: ManagedFinalization;
+}
+
+export type ManagedFinalizeResponse =
+  | {
+      readonly status: "finalized";
+      readonly operation: Exclude<ManagedOperationState, { readonly status: "absent" }>;
+    }
+  | { readonly status: "staleLease"; readonly operation: ManagedOperationState };
+
 export type SupervisorCommand =
   | {
       readonly type: "start";
@@ -121,6 +200,18 @@ export type SupervisorRequest =
       readonly method: "subscribe";
       readonly runtimeId: string;
       readonly cursor?: number;
+    }
+  | {
+      readonly type: "request";
+      readonly requestId: string;
+      readonly method: "claimManaged";
+      readonly claim: ManagedClaimRequest;
+    }
+  | {
+      readonly type: "request";
+      readonly requestId: string;
+      readonly method: "finalizeManaged";
+      readonly finalization: ManagedFinalizeRequest;
     };
 export type BridgeFrame =
   | {
@@ -159,7 +250,12 @@ export type SupervisorResponse =
       readonly type: "response";
       readonly requestId: string;
       readonly ok: true;
-      readonly result: ReadonlyArray<SupervisorRuntimeState> | SupervisorCommandReceipt;
+      readonly result:
+        | ReadonlyArray<SupervisorRuntimeState>
+        | SupervisorCommandReceipt
+        | ManagedClaimResponse
+        | ManagedFinalizeResponse;
+      readonly capabilities?: SupervisorCapabilities;
     }
   | {
       readonly type: "response";

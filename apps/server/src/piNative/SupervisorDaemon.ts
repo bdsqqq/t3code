@@ -8,6 +8,13 @@ import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import type {
+  ManagedClaimRequest,
+  ManagedClaimResponse,
+  ManagedFinalization,
+  ManagedFinalizeRequest,
+  ManagedFinalizeResponse,
+  ManagedOperationState,
+  ManagedPiTurnStartPayload,
   SupervisorCommandReceipt,
   SupervisorRuntimeState,
   SupervisorStreamEvent,
@@ -15,6 +22,7 @@ import type {
 } from "./SupervisorProtocol.ts";
 import {
   JsonLineDecoder,
+  MANAGED_ADMISSION_PROTOCOL,
   SUPERVISOR_MAX_STREAM_ITEM_BYTES,
   SUPERVISOR_PROTOCOL,
   encodeLine,
@@ -52,12 +60,20 @@ const SNAPSHOT_HEAD_BYTES = 256 * 1024;
 const SNAPSHOT_TAIL_BYTES = 16 * 1024 * 1024;
 class IndeterminateCommandError extends Error {}
 class RpcCommandRejectedError extends Error {}
-type LedgerEntry = {
+type CommandLedgerEntry = {
   hash: string;
   command?: Record<string, unknown>;
   phase?: "queued" | "delivering";
   receipt: SupervisorCommandReceipt;
 };
+export type ManagedLedgerEntry = {
+  readonly kind: "managedAdmission";
+  readonly protocol: typeof MANAGED_ADMISSION_PROTOCOL;
+  readonly hash: string;
+  readonly receipt: SupervisorCommandReceipt;
+  readonly operation: Exclude<ManagedOperationState, { readonly status: "absent" }>;
+};
+type LedgerEntry = CommandLedgerEntry | ManagedLedgerEntry;
 type Runtime = {
   state: SupervisorRuntimeState;
   child?: ChildProcessWithoutNullStreams;
@@ -105,6 +121,145 @@ const canonicalJson = (value: unknown): string => {
   return JSON.stringify(value);
 };
 
+const hasOnlyKeys = (value: Record<string, unknown>, allowed: ReadonlySet<string>): boolean =>
+  Object.keys(value).every((key) => allowed.has(key));
+
+const requireStableString = (value: unknown, field: string): string => {
+  if (typeof value !== "string" || value.length === 0 || value.trim() !== value)
+    throw new Error(`invalid managed admission ${field}`);
+  return value;
+};
+
+const decodeManagedPayload = (value: unknown): ManagedPiTurnStartPayload => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(
+      value,
+      new Set([
+        "type",
+        "providerInstanceId",
+        "threadId",
+        "session",
+        "message",
+        "attachments",
+        "model",
+        "thinkingLevel",
+        "interactionMode",
+      ]),
+    ) ||
+    value.type !== "managed-pi.turn-start" ||
+    typeof value.message !== "string" ||
+    !Array.isArray(value.attachments) ||
+    !isRecord(value.session) ||
+    !hasOnlyKeys(value.session, new Set(["schemaVersion", "sessionFile", "sessionId"])) ||
+    value.session.schemaVersion !== 1 ||
+    !isRecord(value.model) ||
+    !hasOnlyKeys(value.model, new Set(["provider", "modelId"])) ||
+    (value.interactionMode !== "default" && value.interactionMode !== "plan")
+  )
+    throw new Error("invalid managed Pi turn-start payload");
+  const thinkingLevels = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
+  if (value.thinkingLevel !== null && !thinkingLevels.has(String(value.thinkingLevel)))
+    throw new Error("invalid managed Pi thinking level");
+  const attachments = value.attachments.map((attachment) => {
+    if (
+      !isRecord(attachment) ||
+      !hasOnlyKeys(attachment, new Set(["type", "id", "name", "mimeType", "sizeBytes"])) ||
+      attachment.type !== "image" ||
+      typeof attachment.sizeBytes !== "number" ||
+      !Number.isSafeInteger(attachment.sizeBytes) ||
+      attachment.sizeBytes < 0
+    )
+      throw new Error("invalid managed Pi attachment identity");
+    return {
+      type: "image" as const,
+      id: requireStableString(attachment.id, "attachment id"),
+      name: requireStableString(attachment.name, "attachment name"),
+      mimeType: requireStableString(attachment.mimeType, "attachment mime type"),
+      sizeBytes: attachment.sizeBytes,
+    };
+  });
+  return {
+    type: "managed-pi.turn-start",
+    providerInstanceId: requireStableString(value.providerInstanceId, "provider instance id"),
+    threadId: requireStableString(value.threadId, "thread id"),
+    session: {
+      schemaVersion: 1,
+      sessionFile: requireStableString(value.session.sessionFile, "session file"),
+      sessionId: requireStableString(value.session.sessionId, "session id"),
+    },
+    message: value.message,
+    attachments,
+    model: {
+      provider: requireStableString(value.model.provider, "model provider"),
+      modelId: requireStableString(value.model.modelId, "model id"),
+    },
+    thinkingLevel: value.thinkingLevel as ManagedPiTurnStartPayload["thinkingLevel"],
+    interactionMode: value.interactionMode,
+  };
+};
+
+const decodeManagedClaim = (value: unknown): ManagedClaimRequest => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, new Set(["protocol", "intent", "operationKey", "payload"])) ||
+    value.protocol !== MANAGED_ADMISSION_PROTOCOL ||
+    (value.intent !== "execute" && value.intent !== "recover-existing")
+  )
+    throw new Error("unsupported managed admission claim protocol");
+  const operationKey = requireStableString(value.operationKey, "operation key");
+  if (!operationKey.startsWith("managed-pi:turn-start:") || operationKey.length > 1_024)
+    throw new Error("invalid managed admission operation namespace");
+  return {
+    protocol: MANAGED_ADMISSION_PROTOCOL,
+    intent: value.intent,
+    operationKey,
+    payload: decodeManagedPayload(value.payload),
+  };
+};
+
+const decodeManagedFinalization = (value: unknown): ManagedFinalizeRequest => {
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, new Set(["protocol", "operationKey", "leaseToken", "finalization"])) ||
+    value.protocol !== MANAGED_ADMISSION_PROTOCOL ||
+    !isRecord(value.finalization)
+  )
+    throw new Error("invalid managed admission finalization");
+  const operationKey = requireStableString(value.operationKey, "operation key");
+  if (!operationKey.startsWith("managed-pi:turn-start:") || operationKey.length > 1_024)
+    throw new Error("invalid managed admission operation namespace");
+  const leaseToken = requireStableString(value.leaseToken, "lease token");
+  let finalization: ManagedFinalization;
+  if (value.finalization.status === "completed") {
+    if (
+      !hasOnlyKeys(value.finalization, new Set(["status", "receipt"])) ||
+      !isRecord(value.finalization.receipt) ||
+      !hasOnlyKeys(value.finalization.receipt, new Set(["turnId"]))
+    )
+      throw new Error("invalid managed admission completed receipt");
+    finalization = {
+      status: "completed",
+      receipt: {
+        turnId: requireStableString(value.finalization.receipt.turnId, "provider turn id"),
+      },
+    };
+  } else if (
+    value.finalization.status === "rejected" ||
+    value.finalization.status === "indeterminate"
+  ) {
+    if (!hasOnlyKeys(value.finalization, new Set(["status", "error"])))
+      throw new Error("invalid managed admission failure receipt");
+    finalization = {
+      status: value.finalization.status,
+      error: requireStableString(value.finalization.error, "finalization error"),
+    };
+  } else {
+    throw new Error("invalid managed admission finalization status");
+  }
+  return { protocol: MANAGED_ADMISSION_PROTOCOL, operationKey, leaseToken, finalization };
+};
+
 export function piRpcSpawnArgs(input: {
   readonly sessionsRoot: string;
   readonly sessionFile?: string;
@@ -147,6 +302,288 @@ const atomicLedger = async () => {
   ledgerWrite = write.catch(() => {});
   await write;
 };
+
+const isManagedLedgerEntry = (value: unknown): value is ManagedLedgerEntry =>
+  isRecord(value) &&
+  value.kind === "managedAdmission" &&
+  value.protocol === MANAGED_ADMISSION_PROTOCOL &&
+  typeof value.hash === "string" &&
+  isRecord(value.operation) &&
+  (value.operation.status === "delivering" ||
+    (value.operation.status === "completed" &&
+      isRecord(value.operation.receipt) &&
+      typeof value.operation.receipt.turnId === "string" &&
+      value.operation.receipt.turnId.length > 0) ||
+    ((value.operation.status === "rejected" || value.operation.status === "indeterminate") &&
+      typeof value.operation.error === "string" &&
+      value.operation.error.length > 0));
+
+interface ManagedAdmissionStore {
+  readonly get: (operationKey: string) => unknown;
+  readonly set: (operationKey: string, entry: ManagedLedgerEntry) => void;
+  readonly entries: () => ReadonlyArray<{
+    readonly operationKey: string;
+    readonly entry: unknown;
+  }>;
+  readonly persist: () => Promise<void>;
+}
+
+interface ManagedLeaseTimer {
+  readonly cancel: () => void;
+}
+
+export interface ManagedAdmissionController<TSocket extends object> {
+  readonly claim: (socket: TSocket, claim: ManagedClaimRequest) => Promise<ManagedClaimResponse>;
+  readonly finalize: (
+    socket: TSocket,
+    request: ManagedFinalizeRequest,
+  ) => Promise<ManagedFinalizeResponse>;
+  readonly disconnect: (socket: TSocket) => Promise<void>;
+  readonly recoverAfterRestart: () => Promise<boolean>;
+  readonly dispose: () => void;
+}
+
+export function makeManagedAdmissionController<TSocket extends object>(options: {
+  readonly store: ManagedAdmissionStore;
+  readonly leaseTimeoutMs?: number;
+  readonly randomToken?: () => string;
+  readonly schedule?: (work: () => void, delayMs: number) => ManagedLeaseTimer;
+}): ManagedAdmissionController<TSocket> {
+  const leaseTimeoutMs = options.leaseTimeoutMs ?? 5 * 60_000;
+  const randomToken = options.randomToken ?? randomUUID;
+  const schedule =
+    options.schedule ??
+    ((work: () => void, delayMs: number) => {
+      const timer = setTimeout(work, delayMs);
+      timer.unref();
+      return { cancel: () => clearTimeout(timer) };
+    });
+  type ManagedLease = {
+    readonly socket: TSocket;
+    readonly leaseToken: string;
+    readonly timer: ManagedLeaseTimer;
+    revocationError?: string;
+  };
+  const leases = new Map<string, ManagedLease>();
+  const transitions = new Map<string, Promise<void>>();
+  let poisoned: Error | undefined;
+
+  const poison = (cause: unknown): Error => {
+    poisoned ??= new Error("managed admission persistence failed; supervisor restart required", {
+      cause,
+    });
+    for (const lease of leases.values()) lease.timer.cancel();
+    leases.clear();
+    return poisoned;
+  };
+
+  const ensureHealthy = () => {
+    if (poisoned) throw poisoned;
+  };
+
+  const persist = async () => {
+    try {
+      await options.store.persist();
+    } catch (cause) {
+      throw poison(cause);
+    }
+  };
+
+  const withOperationLock = async <A>(operationKey: string, work: () => Promise<A>): Promise<A> => {
+    const previous = transitions.get(operationKey) ?? Promise.resolve();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => (release = resolve));
+    const current = previous.catch(() => {}).then(() => gate);
+    transitions.set(operationKey, current);
+    await previous.catch(() => {});
+    try {
+      ensureHealthy();
+      return await work();
+    } finally {
+      release();
+      if (transitions.get(operationKey) === current) transitions.delete(operationKey);
+    }
+  };
+
+  const visibleOperation = (operationKey: string): ManagedOperationState => {
+    const entry = options.store.get(operationKey);
+    return isManagedLedgerEntry(entry) ? entry.operation : { status: "absent" };
+  };
+
+  const persistRevokedLease = async (
+    operationKey: string,
+    lease: ManagedLease,
+  ): Promise<ManagedOperationState | undefined> => {
+    if (lease.revocationError === undefined) return undefined;
+    lease.timer.cancel();
+    if (leases.get(operationKey) === lease) leases.delete(operationKey);
+    const entry = options.store.get(operationKey);
+    if (!isManagedLedgerEntry(entry) || entry.operation.status !== "delivering")
+      return visibleOperation(operationKey);
+    const indeterminate = {
+      status: "indeterminate" as const,
+      error: lease.revocationError,
+    };
+    options.store.set(operationKey, { ...entry, operation: indeterminate });
+    await persist();
+    return indeterminate;
+  };
+
+  const markIndeterminate = (operationKey: string, leaseToken: string, error: string) =>
+    withOperationLock(operationKey, async () => {
+      const lease = leases.get(operationKey);
+      if (!lease || lease.leaseToken !== leaseToken) return;
+      lease.revocationError ??= error;
+      await persistRevokedLease(operationKey, lease);
+    });
+
+  const claim = async (
+    socket: TSocket,
+    request: ManagedClaimRequest,
+  ): Promise<ManagedClaimResponse> =>
+    withOperationLock(request.operationKey, async () => {
+      const hash = createHash("sha256").update(canonicalJson(request.payload)).digest("hex");
+      const prior = options.store.get(request.operationKey);
+      if (prior !== undefined) {
+        if (!isManagedLedgerEntry(prior) || prior.hash !== hash)
+          return { status: "conflict", error: "managed operation payload conflict" };
+        return prior.operation;
+      }
+      if (request.intent === "recover-existing") return { status: "absent" };
+
+      const leaseToken = randomToken();
+      const timeoutError = "managed admission lease timed out while delivery was in progress";
+      const timer = schedule(() => {
+        const lease = leases.get(request.operationKey);
+        if (!lease || lease.leaseToken !== leaseToken) return;
+        lease.revocationError ??= timeoutError;
+        void markIndeterminate(request.operationKey, leaseToken, timeoutError).catch(() => {});
+      }, leaseTimeoutMs);
+      const entry: ManagedLedgerEntry = {
+        kind: "managedAdmission",
+        protocol: MANAGED_ADMISSION_PROTOCOL,
+        hash,
+        receipt: {
+          commandId: request.operationKey as SupervisorCommandReceipt["commandId"],
+          status: "indeterminate",
+          error: "managed admission entry is not a legacy supervisor command",
+        },
+        operation: { status: "delivering" },
+      };
+      options.store.set(request.operationKey, entry);
+      leases.set(request.operationKey, { socket, leaseToken, timer });
+      await persist();
+
+      const lease = leases.get(request.operationKey);
+      const operation = visibleOperation(request.operationKey);
+      if (
+        lease?.leaseToken === leaseToken &&
+        lease.revocationError !== undefined &&
+        operation.status === "delivering"
+      ) {
+        const revoked = await persistRevokedLease(request.operationKey, lease);
+        if (revoked) return revoked;
+      }
+      if (
+        !lease ||
+        lease.socket !== socket ||
+        lease.leaseToken !== leaseToken ||
+        operation.status !== "delivering"
+      )
+        return operation.status === "absent"
+          ? { status: "indeterminate", error: "managed admission lease was lost" }
+          : operation;
+      return { status: "granted", operationKey: request.operationKey, leaseToken };
+    });
+
+  const finalize = async (
+    socket: TSocket,
+    request: ManagedFinalizeRequest,
+  ): Promise<ManagedFinalizeResponse> =>
+    withOperationLock(request.operationKey, async () => {
+      const lease = leases.get(request.operationKey);
+      if (
+        lease?.socket === socket &&
+        lease.leaseToken === request.leaseToken &&
+        lease.revocationError !== undefined
+      ) {
+        const revoked = await persistRevokedLease(request.operationKey, lease);
+        return {
+          status: "staleLease",
+          operation: revoked ?? visibleOperation(request.operationKey),
+        };
+      }
+      if (
+        !lease ||
+        lease.socket !== socket ||
+        lease.leaseToken !== request.leaseToken ||
+        visibleOperation(request.operationKey).status !== "delivering"
+      )
+        return { status: "staleLease", operation: visibleOperation(request.operationKey) };
+
+      lease.timer.cancel();
+      leases.delete(request.operationKey);
+      const entry = options.store.get(request.operationKey);
+      if (!isManagedLedgerEntry(entry))
+        return { status: "staleLease", operation: { status: "absent" } };
+      options.store.set(request.operationKey, { ...entry, operation: request.finalization });
+      await persist();
+      return { status: "finalized", operation: request.finalization };
+    });
+
+  const disconnect = async (socket: TSocket): Promise<void> => {
+    const abandoned = [...leases.entries()].flatMap(([operationKey, lease]) =>
+      lease.socket === socket ? [{ operationKey, lease }] : [],
+    );
+    if (abandoned.length === 0) return;
+    const disconnectError =
+      "managed admission requester disconnected while delivery was in progress";
+    for (const { lease } of abandoned) lease.revocationError ??= disconnectError;
+    for (const { operationKey, lease } of abandoned) {
+      await markIndeterminate(operationKey, lease.leaseToken, disconnectError);
+    }
+  };
+
+  const recoverAfterRestart = async (): Promise<boolean> => {
+    let recovered = false;
+    for (const { operationKey, entry } of options.store.entries()) {
+      if (!isManagedLedgerEntry(entry) || entry.operation.status !== "delivering") continue;
+      options.store.set(operationKey, {
+        ...entry,
+        operation: {
+          status: "indeterminate",
+          error: "supervisor restarted while managed delivery was in progress",
+        },
+      });
+      recovered = true;
+    }
+    if (recovered) await persist();
+    return recovered;
+  };
+
+  return {
+    claim,
+    finalize,
+    disconnect,
+    recoverAfterRestart,
+    dispose: () => {
+      for (const lease of leases.values()) lease.timer.cancel();
+      leases.clear();
+    },
+  };
+}
+
+const managedAdmissions = makeManagedAdmissionController<Socket>({
+  store: {
+    get: (operationKey) => ledger[operationKey],
+    set: (operationKey, entry) => {
+      ledger[operationKey] = entry;
+    },
+    entries: () => Object.entries(ledger).map(([operationKey, entry]) => ({ operationKey, entry })),
+    persist: atomicLedger,
+  },
+});
+
 const writeBounded = (socket: Socket, value: unknown): boolean => {
   if (socket.destroyed) return false;
   const line = encodeLine(value);
@@ -802,6 +1239,7 @@ async function dispatch(command: Record<string, unknown>): Promise<SupervisorCom
   }
   let prior = ledger[id];
   if (prior) {
+    if (isManagedLedgerEntry(prior)) throw new Error("commandId payload conflict");
     if (prior.hash !== hash) throw new Error("commandId payload conflict");
     if (prior.receipt.status !== "started") {
       if (
@@ -821,6 +1259,7 @@ async function dispatch(command: Record<string, unknown>): Promise<SupervisorCom
     }
   }
   if (prior) {
+    if (isManagedLedgerEntry(prior)) throw new Error("commandId payload conflict");
     if (prior.phase !== "queued" || !prior.command)
       return { ...prior.receipt, status: "indeterminate" };
     command = prior.command;
@@ -1151,11 +1590,13 @@ export async function runSupervisorDaemon(): Promise<never> {
   }
   try {
     ledger = JSON.parse(await fs.readFile(LEDGER, "utf8")) as typeof ledger;
-  } catch {
+  } catch (cause) {
+    if (!(cause instanceof Error && "code" in cause && cause.code === "ENOENT")) throw cause;
     ledger = {};
   }
   let recoveredIndeterminate = false;
   for (const [commandId, entry] of Object.entries(ledger)) {
+    if (isManagedLedgerEntry(entry)) continue;
     if (entry.receipt.status !== "started" || entry.phase !== "delivering") continue;
     ledger[commandId] = {
       hash: entry.hash,
@@ -1168,6 +1609,7 @@ export async function runSupervisorDaemon(): Promise<never> {
     recoveredIndeterminate = true;
   }
   if (recoveredIndeterminate) await atomicLedger();
+  await managedAdmissions.recoverAfterRestart();
   await fs.rm(supervisorSocketPath, { force: true });
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
@@ -1176,6 +1618,7 @@ export async function runSupervisorDaemon(): Promise<never> {
     let handling = Promise.resolve();
     socket.on("close", () => {
       socketWrites.delete(socket);
+      void managedAdmissions.disconnect(socket).catch(() => {});
       for (const runtime of runtimes.values())
         for (const subscriber of runtime.subscribers)
           if (subscriber.socket === socket) runtime.subscribers.delete(subscriber);
@@ -1280,6 +1723,7 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
         requestId: value.requestId,
         ok: true,
         result: [...runtimes.values()].map((runtime) => projectListedRuntime(runtime.state)),
+        capabilities: { managedAdmission: MANAGED_ADMISSION_PROTOCOL },
       });
     } else if (value.method === "dispatch" && isRecord(value.command)) {
       writeBounded(socket, {
@@ -1287,6 +1731,23 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
         requestId: value.requestId,
         ok: true,
         result: await dispatch(value.command),
+      });
+    } else if (value.method === "claimManaged") {
+      writeBounded(socket, {
+        type: "response",
+        requestId: value.requestId,
+        ok: true,
+        result: await managedAdmissions.claim(socket, decodeManagedClaim(value.claim)),
+      });
+    } else if (value.method === "finalizeManaged") {
+      writeBounded(socket, {
+        type: "response",
+        requestId: value.requestId,
+        ok: true,
+        result: await managedAdmissions.finalize(
+          socket,
+          decodeManagedFinalization(value.finalization),
+        ),
       });
     } else if (value.method === "subscribe" && typeof value.runtimeId === "string") {
       const runtime = runtimes.get(value.runtimeId);

@@ -2,9 +2,12 @@
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodeUtil from "node:util";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import {
+  CommandId,
+  PiNativeError,
   ProviderDriverKind,
   ProviderInstanceId,
   ThreadId,
@@ -28,6 +31,13 @@ import {
   type PiRpcSpawnOptions,
 } from "../pi/PiRpcClient.ts";
 import type { PiRpcEvent, PiThinkingLevel } from "../pi/PiRpcSchema.ts";
+import type { SupervisorManagedClaim } from "../../piNative/SupervisorClient.ts";
+import type {
+  ManagedClaimRequest,
+  ManagedFinalization,
+  ManagedOperationState,
+  ManagedPiTurnStartPayload,
+} from "../../piNative/SupervisorProtocol.ts";
 import type { ProviderAdapterError } from "../Errors.ts";
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 import { makePiAdapter, type PiRpcClientFactory } from "./PiAdapter.ts";
@@ -36,6 +46,7 @@ const assert: typeof NodeAssert = NodeAssert;
 const fs = NodeFS;
 const os = NodeOS;
 const path = NodePath;
+const { isDeepStrictEqual } = NodeUtil;
 const instanceId = ProviderInstanceId.make("pi-test");
 const modelSelection = createModelSelection(instanceId, "openai/gpt-5", [
   { id: "thinkingLevel", value: "max" },
@@ -165,12 +176,64 @@ class FakeClient implements PiRpcClient {
   };
 }
 
+interface FakeManagedEntry {
+  readonly payload: ManagedPiTurnStartPayload;
+  operation: Exclude<ManagedOperationState, { readonly status: "absent" }>;
+}
+
+class FakeManagedSupervisor {
+  readonly claims: ManagedClaimRequest[] = [];
+  readonly entries = new Map<string, FakeManagedEntry>();
+  failFinalization = false;
+  staleFinalization = false;
+
+  claimManaged = (claim: ManagedClaimRequest) =>
+    Effect.sync((): SupervisorManagedClaim => {
+      this.claims.push(claim);
+      const prior = this.entries.get(claim.operationKey);
+      if (prior) {
+        if (!isDeepStrictEqual(prior.payload, claim.payload))
+          return { status: "conflict", error: "managed operation payload conflict" };
+        return prior.operation;
+      }
+      if (claim.intent === "recover-existing") return { status: "absent" };
+      const entry: FakeManagedEntry = {
+        payload: claim.payload,
+        operation: { status: "delivering" },
+      };
+      this.entries.set(claim.operationKey, entry);
+      return {
+        status: "granted",
+        operationKey: claim.operationKey,
+        finalize: (finalization: ManagedFinalization) => {
+          if (this.failFinalization)
+            return Effect.fail(
+              new PiNativeError({ code: "supervisor", message: "finalization failed" }),
+            );
+          if (this.staleFinalization) {
+            const operation = {
+              status: "indeterminate" as const,
+              error: "managed admission lease timed out",
+            };
+            entry.operation = operation;
+            return Effect.succeed({ status: "staleLease" as const, operation });
+          }
+          return Effect.sync(() => {
+            entry.operation = finalization;
+            return { status: "finalized" as const, operation: finalization };
+          });
+        },
+      };
+    });
+}
+
 interface Harness {
   readonly client: FakeClient;
   readonly spawns: PiRpcSpawnOptions[];
   readonly stateDir: string;
   readonly attachmentsDir: string;
   readonly makeClient: PiRpcClientFactory;
+  readonly supervisor: FakeManagedSupervisor;
 }
 
 const collectThroughSentinel = Effect.fn("PiAdapterTest.collectThroughSentinel")(function* (
@@ -217,7 +280,14 @@ const makeHarness = (harnessOptions: { readonly failStart?: boolean } = {}): Har
       client.state = { sessionFile, sessionId };
       return client;
     });
-  return { client, spawns, stateDir, attachmentsDir, makeClient };
+  return {
+    client,
+    spawns,
+    stateDir,
+    attachmentsDir,
+    makeClient,
+    supervisor: new FakeManagedSupervisor(),
+  };
 };
 
 const withAdapter = <A>(
@@ -232,8 +302,18 @@ const withAdapter = <A>(
         stateDir: harness.stateDir,
         attachmentsDir: harness.attachmentsDir,
         makeRpcClient: harness.makeClient,
+        supervisor: harness.supervisor,
       });
-      return yield* use(adapter);
+      let nextOperation = 0;
+      return yield* use({
+        ...adapter,
+        sendTurn: (input) =>
+          adapter.sendTurn({
+            ...input,
+            operationId:
+              input.operationId ?? CommandId.make(`pi-adapter-test-${String(++nextOperation)}`),
+          }),
+      });
     }),
   ).pipe(Effect.provide(NodeServices.layer));
 
@@ -322,6 +402,218 @@ describe("PiAdapter", () => {
           },
         ]);
         yield* Queue.offer(h.client.input, { type: "agent_settled" });
+      }),
+    );
+  });
+
+  it.effect("returns a completed managed claim without prompting Pi twice", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const operationId = CommandId.make("managed-duplicate");
+        const first = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          input: "deliver once",
+          modelSelection,
+          interactionMode: "plan",
+        });
+        const duplicate = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          input: "deliver once",
+          modelSelection,
+          interactionMode: "plan",
+        });
+
+        assert.equal(h.client.calls.prompt, 1);
+        assert.equal(duplicate.turnId, first.turnId);
+        assert.equal(h.supervisor.claims.length, 2);
+        assert.deepEqual(h.supervisor.claims[0]?.payload, {
+          type: "managed-pi.turn-start",
+          providerInstanceId: instanceId,
+          threadId: ThreadId.make("thread"),
+          session: {
+            schemaVersion: 1,
+            sessionFile: h.client.state.sessionFile,
+            sessionId: "pi-generated-session-id",
+          },
+          message: "deliver once",
+          attachments: [],
+          model: { provider: "openai", modelId: "gpt-5" },
+          thinkingLevel: "max",
+          interactionMode: "plan",
+        });
+        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+      }),
+    );
+  });
+
+  it.effect("does not claim or prompt an absent recovered operation", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const recovered = yield* adapter
+          .sendTurn({
+            threadId: ThreadId.make("thread"),
+            operationId: CommandId.make("managed-legacy-absent"),
+            input: "possibly admitted before the fence",
+            modelSelection,
+            admissionMode: "recover-durable",
+          })
+          .pipe(Effect.result);
+
+        assert.equal(recovered._tag, "Failure");
+        assert.equal(h.client.calls.prompt, 0);
+        assert.equal(h.supervisor.entries.size, 0);
+      }),
+    );
+  });
+
+  it.effect("reconciles a completed attachment claim after its file is gone", () => {
+    const h = makeHarness();
+    const attachmentId = "thread-managed-image";
+    const attachmentPath = path.join(h.attachmentsDir, `${attachmentId}.png`);
+    fs.writeFileSync(attachmentPath, Buffer.from("image"));
+    const attachment = {
+      type: "image" as const,
+      id: attachmentId,
+      name: "managed.png",
+      mimeType: "image/png",
+      sizeBytes: 5,
+    };
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const operationId = CommandId.make("managed-completed-attachment");
+        const first = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          attachments: [attachment],
+          modelSelection,
+        });
+        fs.rmSync(attachmentPath);
+
+        const duplicate = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          attachments: [attachment],
+          modelSelection,
+        });
+
+        assert.equal(duplicate.turnId, first.turnId);
+        assert.equal(h.client.calls.prompt, 1);
+        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+      }),
+    );
+  });
+
+  it.effect("reconciles a completed managed claim after session recovery without prompting", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        const session = yield* start(adapter);
+        const operationId = CommandId.make("managed-completed-recovery");
+        const first = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          input: "already admitted",
+          modelSelection,
+        });
+        yield* adapter.stopSession(ThreadId.make("thread"));
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("pi"),
+          providerInstanceId: instanceId,
+          threadId: ThreadId.make("thread"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          resumeCursor: session.resumeCursor,
+        });
+
+        const recovered = yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          input: "already admitted",
+          modelSelection,
+          admissionMode: "recover-durable",
+        });
+
+        assert.equal(h.client.calls.prompt, 1);
+        assert.equal(recovered.turnId, first.turnId);
+        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+      }),
+    );
+  });
+
+  it.effect("rejects a managed payload conflict without a second prompt", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const operationId = CommandId.make("managed-conflict");
+        yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          operationId,
+          input: "original",
+          modelSelection,
+        });
+        const conflict = yield* adapter
+          .sendTurn({
+            threadId: ThreadId.make("thread"),
+            operationId,
+            input: "changed",
+            modelSelection,
+          })
+          .pipe(Effect.result);
+
+        assert.equal(conflict._tag, "Failure");
+        assert.equal(h.client.calls.prompt, 1);
+        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+      }),
+    );
+  });
+
+  it.effect("never resends a command-failed managed prompt after session recovery", () => {
+    const h = makeHarness();
+    h.client.failPrompt = true;
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        const session = yield* start(adapter);
+        const operationId = CommandId.make("managed-indeterminate");
+        const first = yield* adapter
+          .sendTurn({
+            threadId: ThreadId.make("thread"),
+            operationId,
+            input: "ambiguous",
+            modelSelection,
+          })
+          .pipe(Effect.result);
+        assert.equal(first._tag, "Failure");
+        assert.equal(h.client.calls.prompt, 1);
+
+        h.client.failPrompt = false;
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("pi"),
+          providerInstanceId: instanceId,
+          threadId: ThreadId.make("thread"),
+          cwd: process.cwd(),
+          runtimeMode: "full-access",
+          resumeCursor: session.resumeCursor,
+        });
+        const recovered = yield* adapter
+          .sendTurn({
+            threadId: ThreadId.make("thread"),
+            operationId,
+            input: "ambiguous",
+            modelSelection,
+            admissionMode: "recover-durable",
+          })
+          .pipe(Effect.result);
+
+        assert.equal(recovered._tag, "Failure");
+        assert.equal(h.client.calls.prompt, 1);
       }),
     );
   });
@@ -1018,7 +1310,7 @@ describe("PiAdapter", () => {
     }),
   );
 
-  it.effect("leaves the active turn running when a steering prompt fails", () => {
+  it.effect("marks a failed steering prompt indeterminate and retires the session", () => {
     const h = makeHarness();
     return withAdapter(h, (adapter) =>
       Effect.gen(function* () {
@@ -1038,15 +1330,48 @@ describe("PiAdapter", () => {
           })
           .pipe(Effect.result);
         assert.equal(failed._tag, "Failure");
-        const running = (yield* adapter.listSessions())[0];
-        assert.equal(running?.status, "running");
-        assert.equal(running?.activeTurnId, first.turnId);
-
-        h.client.failPrompt = false;
-        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+        assert.equal(yield* adapter.hasSession(ThreadId.make("thread")), false);
+        assert.equal(h.client.calls.close, 1);
+        assert.equal(h.client.calls.prompt, 2);
+        assert.equal(
+          h.supervisor.entries.get(h.supervisor.claims[1]!.operationKey)?.operation.status,
+          "indeterminate",
+        );
+        assert.equal(first.threadId, ThreadId.make("thread"));
       }),
     );
   });
+
+  for (const finalizationFailure of ["effect-failure", "stale-lease"] as const) {
+    it.effect(`retires the session when steering ${finalizationFailure} cannot finalize`, () => {
+      const h = makeHarness();
+      return withAdapter(h, (adapter) =>
+        Effect.gen(function* () {
+          yield* start(adapter);
+          yield* adapter.sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "first",
+            modelSelection,
+          });
+          h.supervisor.failFinalization = finalizationFailure === "effect-failure";
+          h.supervisor.staleFinalization = finalizationFailure === "stale-lease";
+
+          const failed = yield* adapter
+            .sendTurn({
+              threadId: ThreadId.make("thread"),
+              input: "steer",
+              modelSelection,
+            })
+            .pipe(Effect.result);
+
+          assert.equal(failed._tag, "Failure");
+          assert.equal(yield* adapter.hasSession(ThreadId.make("thread")), false);
+          assert.equal(h.client.calls.close, 1);
+          assert.equal(h.client.calls.prompt, 2);
+        }),
+      );
+    });
+  }
 
   it.effect("resumes only an exact persisted cursor", () => {
     const h = makeHarness();
@@ -1152,6 +1477,7 @@ describe("PiAdapter", () => {
             stateDir: h.stateDir,
             attachmentsDir: h.attachmentsDir,
             makeRpcClient: h.makeClient,
+            supervisor: h.supervisor,
             onSessionPublished: () =>
               blockPublication
                 ? Deferred.succeed(published, undefined).pipe(
@@ -1213,7 +1539,7 @@ describe("PiAdapter", () => {
     );
   });
 
-  it.effect("fails a rejected prompt and allows the next turn", () => {
+  it.effect("marks a failed prompt indeterminate and retires the session", () => {
     const h = makeHarness();
     h.client.failPrompt = true;
     return withAdapter(h, (adapter) =>
@@ -1235,18 +1561,52 @@ describe("PiAdapter", () => {
           Array.from(yield* Fiber.join(collected)).map((event) => event.type),
           ["turn.started", "runtime.error", "turn.completed"],
         );
+        assert.equal(yield* adapter.hasSession(ThreadId.make("thread")), false);
+        assert.equal(h.client.calls.close, 1);
+        assert.equal(h.client.calls.prompt, 1);
+        assert.equal(
+          h.supervisor.entries.get(h.supervisor.claims[0]!.operationKey)?.operation.status,
+          "indeterminate",
+        );
 
-        h.client.failPrompt = false;
-        const next = yield* adapter.sendTurn({
-          threadId: ThreadId.make("thread"),
-          input: "second",
-          modelSelection,
-        });
-        assert.equal(next.threadId, ThreadId.make("thread"));
-        yield* Queue.offer(h.client.input, { type: "agent_settled" });
+        const next = yield* adapter
+          .sendTurn({
+            threadId: ThreadId.make("thread"),
+            input: "second",
+            modelSelection,
+          })
+          .pipe(Effect.result);
+        assert.equal(next._tag, "Failure");
+        assert.equal(h.client.calls.prompt, 1);
       }),
     );
   });
+
+  for (const finalizationFailure of ["effect-failure", "stale-lease"] as const) {
+    it.effect(`retires the session when prompt ${finalizationFailure} cannot finalize`, () => {
+      const h = makeHarness();
+      h.client.failPrompt = true;
+      h.supervisor.failFinalization = finalizationFailure === "effect-failure";
+      h.supervisor.staleFinalization = finalizationFailure === "stale-lease";
+      return withAdapter(h, (adapter) =>
+        Effect.gen(function* () {
+          yield* start(adapter);
+          const failed = yield* adapter
+            .sendTurn({
+              threadId: ThreadId.make("thread"),
+              input: "ambiguous",
+              modelSelection,
+            })
+            .pipe(Effect.result);
+
+          assert.equal(failed._tag, "Failure");
+          assert.equal(yield* adapter.hasSession(ThreadId.make("thread")), false);
+          assert.equal(h.client.calls.close, 1);
+          assert.equal(h.client.calls.prompt, 1);
+        }),
+      );
+    });
+  }
 
   it.effect("closes the session after an ambiguous prompt transport failure", () => {
     const h = makeHarness();

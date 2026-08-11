@@ -126,6 +126,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           pending_model_selection_json,
           pending_title_seed,
           pending_interaction_mode,
+          pending_admission_protocol,
           source_proposed_plan_thread_id,
           source_proposed_plan_id,
           assistant_message_id,
@@ -146,6 +147,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           ${row.modelSelection === null ? null : JSON.stringify(row.modelSelection)},
           ${row.titleSeed},
           ${row.interactionMode},
+          ${row.admissionProtocol},
           ${row.sourceProposedPlanThreadId},
           ${row.sourceProposedPlanId},
           NULL,
@@ -173,6 +175,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           pending_model_selection_json AS "modelSelection",
           pending_title_seed AS "titleSeed",
           pending_interaction_mode AS "interactionMode",
+          pending_admission_protocol AS "admissionProtocol",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
           requested_at AS "requestedAt"
@@ -199,6 +202,7 @@ const makeProjectionTurnRepository = Effect.gen(function* () {
           pending_model_selection_json AS "modelSelection",
           pending_title_seed AS "titleSeed",
           pending_interaction_mode AS "interactionMode",
+          pending_admission_protocol AS "admissionProtocol",
           source_proposed_plan_thread_id AS "sourceProposedPlanThreadId",
           source_proposed_plan_id AS "sourceProposedPlanId",
           requested_at AS "requestedAt"

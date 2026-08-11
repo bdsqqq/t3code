@@ -1,4 +1,5 @@
 import {
+  DEFAULT_PROVIDER_INTERACTION_MODE,
   EventId,
   ProviderDriverKind,
   type ProviderInstanceId,
@@ -26,6 +27,8 @@ import * as SynchronizedRef from "effect/SynchronizedRef";
 import { ChildProcessSpawner } from "effect/unstable/process";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
+import type { SupervisorClient } from "../../piNative/SupervisorClient.ts";
+import { MANAGED_ADMISSION_PROTOCOL } from "../../piNative/SupervisorProtocol.ts";
 import {
   ProviderAdapterRequestError,
   ProviderAdapterSessionNotFoundError,
@@ -35,7 +38,6 @@ import {
 import { decodePiModelSlug } from "../pi/PiModel.ts";
 import {
   makePiRpcClient,
-  PiRpcCommandError,
   type PiRpcClient,
   type PiRpcError,
   type PiRpcSpawnOptions,
@@ -52,7 +54,6 @@ import {
 import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 
 const PROVIDER = ProviderDriverKind.make("pi");
-const isPiRpcCommandError = Schema.is(PiRpcCommandError);
 const DETERMINISTIC_ARGS = ["--offline"] as const;
 
 export type PiRpcClientFactory = (
@@ -68,6 +69,7 @@ export interface PiAdapterOptions {
   readonly environment?: Readonly<Record<string, string | undefined>>;
   readonly makeRpcClient?: PiRpcClientFactory;
   readonly onSessionPublished?: () => Effect.Effect<void>;
+  readonly supervisor: Pick<SupervisorClient["Service"], "claimManaged">;
 }
 
 interface ActiveTurn {
@@ -91,6 +93,7 @@ interface SessionContext {
   readonly scope: Scope.Closeable;
   eventFiber: Fiber.Fiber<void>;
   activeTurn: ActiveTurn | undefined;
+  readonly managedOperations: Map<string, TurnId>;
   steeringPromptsInFlight: number;
   steeringGeneration: number;
   deferredSettlement: PiRpcEvent | undefined;
@@ -726,6 +729,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
             scope,
             eventFiber: undefined as never,
             activeTurn: undefined,
+            managedOperations: new Map(),
             steeringPromptsInFlight: 0,
             steeringGeneration: 0,
             deferredSettlement: undefined,
@@ -760,147 +764,335 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
       ),
     );
 
+  const makeActiveTurn = (turnId: TurnId): ActiveTurn => ({
+    id: turnId,
+    assistantItemId: RuntimeItemId.make(`pi-assistant:${turnId}`),
+    reasoningItemId: RuntimeItemId.make(`pi-reasoning:${turnId}`),
+    toolItemIds: new Map(),
+    toolArgs: new Map(),
+    assistantText: "",
+    assistantStarted: false,
+    reasoningStarted: false,
+    interruptRequested: false,
+    terminal: false,
+  });
+
   const sendTurn: ProviderAdapterShape<ProviderAdapterError>["sendTurn"] = (input) => {
     let createdTurn: ActiveTurn | undefined;
-    return withThreadLock(
-      input.threadId,
-      Effect.gen(function* () {
-        const ctx = yield* requireSession(input.threadId);
-        const steeringTurn = ctx.activeTurn?.terminal === false ? ctx.activeTurn : undefined;
-        if (!steeringTurn && ctx.session.status !== "ready")
-          return yield* validation("sendTurn", "Pi session must be idle before prompting.");
-        if (!input.input && (!input.attachments || input.attachments.length === 0))
-          return yield* validation("sendTurn", "Pi requires non-empty text or attachments.");
-        const images = yield* Effect.forEach(
-          input.attachments ?? [],
-          (attachment) => {
-            const attachmentPath = resolveAttachmentPath({
-              attachmentsDir: options.attachmentsDir,
-              attachment,
-            });
-            if (!attachmentPath)
-              return Effect.fail(request("prompt", `Invalid attachment id '${attachment.id}'.`));
-            return provideFiles(fs.readFile(attachmentPath)).pipe(
-              Effect.map((bytes) => ({
-                type: "image" as const,
-                data: Buffer.from(bytes).toString("base64"),
-                mimeType: attachment.mimeType,
-              })),
-              Effect.mapError((cause) => request("prompt", cause)),
+    return Effect.scoped(
+      withThreadLock(
+        input.threadId,
+        Effect.gen(function* () {
+          const ctx = yield* requireSession(input.threadId);
+          const steeringTurn = ctx.activeTurn?.terminal === false ? ctx.activeTurn : undefined;
+          if (!steeringTurn && ctx.session.status !== "ready")
+            return yield* validation("sendTurn", "Pi session must be idle before prompting.");
+          if (!input.operationId)
+            return yield* validation("sendTurn", "Managed Pi turns require a stable operation id.");
+          if (!input.input && (!input.attachments || input.attachments.length === 0))
+            return yield* validation("sendTurn", "Pi requires non-empty text or attachments.");
+          const selection = input.modelSelection;
+          if (selection && selection.instanceId !== options.providerInstanceId)
+            return yield* validation(
+              "sendTurn",
+              "Model selection belongs to another provider instance.",
             );
-          },
-          { concurrency: 1 },
-        );
-        const selection = input.modelSelection;
-        if (selection && selection.instanceId !== options.providerInstanceId)
-          return yield* validation(
-            "sendTurn",
-            "Model selection belongs to another provider instance.",
-          );
-        const parsed = selection ? decodePiModelSlug(selection.model) : undefined;
-        if (!parsed)
-          return yield* validation("sendTurn", "A valid Pi model selection is required.");
-        if (steeringTurn && ctx.activeTurn === steeringTurn) {
-          ctx.steeringPromptsInFlight += 1;
-          ctx.steeringGeneration += 1;
-          return {
-            _tag: "Steer" as const,
-            effect: ctx.client.prompt(input.input ?? "", images, "steer").pipe(
-              Effect.mapError((cause) => request("prompt", cause)),
-              Effect.tap(() =>
-                steeringTurn.interruptRequested
-                  ? ctx.client.abort().pipe(Effect.mapError((cause) => request("abort", cause)))
-                  : Effect.void,
-              ),
-              Effect.ensuring(
-                Effect.gen(function* () {
-                  ctx.steeringPromptsInFlight -= 1;
-                  const deferredSettlement = ctx.deferredSettlement;
-                  ctx.deferredSettlement = undefined;
-                  if (deferredSettlement)
-                    yield* handleEvent(ctx, deferredSettlement).pipe(Effect.orDie);
-                }),
-              ),
-              Effect.uninterruptible,
-              Effect.as({
+          const parsed = selection ? decodePiModelSlug(selection.model) : undefined;
+          if (!parsed)
+            return yield* validation("sendTurn", "A valid Pi model selection is required.");
+          const rawThinking = getModelSelectionStringOptionValue(selection, "thinkingLevel");
+          const thinking =
+            rawThinking === undefined
+              ? undefined
+              : yield* Schema.decodeUnknownEffect(PiThinkingLevel)(rawThinking).pipe(
+                  Effect.mapError((cause) =>
+                    validation("sendTurn", "Invalid Pi thinking level.", cause),
+                  ),
+                );
+          if (
+            ctx.closing ||
+            ctx.stopped ||
+            sessions.get(input.threadId) !== ctx ||
+            (!steeringTurn && ctx.session.status !== "ready")
+          )
+            return yield* new ProviderAdapterSessionNotFoundError({
+              provider: PROVIDER,
+              threadId: input.threadId,
+            });
+
+          const operationKey = `managed-pi:turn-start:${input.operationId}`;
+          const managedClaim = yield* options.supervisor
+            .claimManaged({
+              protocol: MANAGED_ADMISSION_PROTOCOL,
+              intent: input.admissionMode === "recover-durable" ? "recover-existing" : "execute",
+              operationKey,
+              payload: {
+                type: "managed-pi.turn-start",
+                providerInstanceId: options.providerInstanceId,
                 threadId: input.threadId,
-                turnId: steeringTurn.id,
-                resumeCursor: ctx.cursor,
-              }),
-            ),
-          };
-        }
-        const available = yield* ctx.client
-          .getAvailableModels()
-          .pipe(Effect.mapError((cause) => request("get_available_models", cause)));
-        if (
-          !available.models.some((m) => m.provider === parsed.provider && m.id === parsed.modelId)
-        )
-          return yield* validation("sendTurn", "Selected Pi model is not currently available.");
-        yield* ctx.client
-          .setModel(parsed.provider, parsed.modelId)
-          .pipe(Effect.mapError((cause) => request("set_model", cause)));
-        const thinking = getModelSelectionStringOptionValue(selection, "thinkingLevel");
-        if (thinking !== undefined) {
-          const level = yield* Schema.decodeUnknownEffect(PiThinkingLevel)(thinking).pipe(
-            Effect.mapError((cause) => validation("sendTurn", "Invalid Pi thinking level.", cause)),
+                session: ctx.cursor,
+                message: input.input ?? "",
+                attachments: input.attachments ?? [],
+                model: { provider: parsed.provider, modelId: parsed.modelId },
+                thinkingLevel: thinking ?? null,
+                interactionMode: input.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE,
+              },
+            })
+            .pipe(Effect.mapError((cause) => request("supervisor.claimManaged", cause)));
+
+          if (managedClaim.status === "completed") {
+            const turnId = TurnId.make(managedClaim.receipt.turnId);
+            const knownTurnId = ctx.managedOperations.get(operationKey);
+            if (knownTurnId && knownTurnId !== turnId)
+              return yield* validation(
+                "sendTurn",
+                "Managed Pi admission receipt changed its provider turn id.",
+              );
+            // The durable receipt reconciles prompt admission only. PiAdapter still owns
+            // provider events, and does not synthesize tool, model, or terminal events here.
+            if (!knownTurnId && !ctx.activeTurn && ctx.session.status === "ready") {
+              ctx.managedOperations.set(operationKey, turnId);
+              const reconciled = makeActiveTurn(turnId);
+              createdTurn = reconciled;
+              ctx.activeTurn = reconciled;
+              ctx.session = {
+                ...ctx.session,
+                status: "running",
+                activeTurnId: turnId,
+                updatedAt: yield* now,
+              };
+              yield* offer({
+                type: "turn.started",
+                ...(yield* base(ctx, reconciled)),
+                payload: {
+                  model: selection!.model,
+                  ...(thinking ? { effort: thinking } : {}),
+                },
+              });
+            }
+            return {
+              _tag: "Result" as const,
+              result: { threadId: input.threadId, turnId, resumeCursor: ctx.cursor },
+            };
+          }
+          if (managedClaim.status === "conflict")
+            return yield* validation("sendTurn", managedClaim.error);
+          if (managedClaim.status === "absent")
+            return yield* request(
+              "supervisor.claimManaged",
+              "Recovered Pi admission has no durable managed claim. It may predate the admission fence, so the prompt was not resent.",
+            );
+          if (managedClaim.status === "rejected")
+            return yield* request("supervisor.claimManaged", managedClaim.error);
+          if (managedClaim.status === "delivering")
+            return yield* request(
+              "supervisor.claimManaged",
+              "Managed Pi admission is already delivering; the prompt was not resent.",
+            );
+          if (managedClaim.status === "indeterminate")
+            return yield* request(
+              "supervisor.claimManaged",
+              `${managedClaim.error} The prompt was not resent.`,
+            );
+
+          const finalize = (finalization: Parameters<typeof managedClaim.finalize>[0]) =>
+            managedClaim.finalize(finalization).pipe(
+              Effect.mapError((cause) => request("supervisor.finalizeManaged", cause)),
+              Effect.flatMap((result) =>
+                result.status === "finalized"
+                  ? Effect.void
+                  : Effect.fail(
+                      request(
+                        "supervisor.finalizeManaged",
+                        `Managed Pi admission lease is stale (${result.operation.status}).`,
+                      ),
+                    ),
+              ),
+            );
+          const finalizeFailure = (cause: unknown, indeterminate: boolean) =>
+            finalize({
+              status: indeterminate ? "indeterminate" : "rejected",
+              error: cause instanceof Error ? cause.message : String(cause),
+            });
+
+          const materializedImages = yield* Effect.forEach(
+            input.attachments ?? [],
+            (attachment) => {
+              const attachmentPath = resolveAttachmentPath({
+                attachmentsDir: options.attachmentsDir,
+                attachment,
+              });
+              if (!attachmentPath)
+                return Effect.fail(request("prompt", `Invalid attachment id '${attachment.id}'.`));
+              return provideFiles(fs.readFile(attachmentPath)).pipe(
+                Effect.map((bytes) => ({
+                  type: "image" as const,
+                  data: Buffer.from(bytes).toString("base64"),
+                  mimeType: attachment.mimeType,
+                })),
+                Effect.mapError((cause) => request("prompt", cause)),
+              );
+            },
+            { concurrency: 1 },
+          ).pipe(Effect.result);
+          if (Result.isFailure(materializedImages)) {
+            yield* finalizeFailure(materializedImages.failure, false);
+            return yield* materializedImages.failure;
+          }
+          const images = materializedImages.success;
+
+          const available = yield* ctx.client.getAvailableModels().pipe(
+            Effect.mapError((cause) => request("get_available_models", cause)),
+            Effect.result,
           );
-          yield* ctx.client
-            .setThinkingLevel(level)
-            .pipe(Effect.mapError((cause) => request("set_thinking_level", cause)));
-        }
-        if (
-          ctx.closing ||
-          ctx.stopped ||
-          sessions.get(input.threadId) !== ctx ||
-          ctx.session.status !== "ready"
-        )
-          return yield* new ProviderAdapterSessionNotFoundError({
-            provider: PROVIDER,
-            threadId: input.threadId,
+          if (Result.isFailure(available)) {
+            yield* finalizeFailure(available.failure, false);
+            return yield* available.failure;
+          }
+          if (
+            !available.success.models.some(
+              (model) => model.provider === parsed.provider && model.id === parsed.modelId,
+            )
+          ) {
+            const unavailable = validation(
+              "sendTurn",
+              "Selected Pi model is not currently available.",
+            );
+            yield* finalizeFailure(unavailable, false);
+            return yield* unavailable;
+          }
+
+          if (steeringTurn && ctx.activeTurn === steeringTurn) {
+            ctx.steeringPromptsInFlight += 1;
+            ctx.steeringGeneration += 1;
+            return {
+              _tag: "Steer" as const,
+              effect: Effect.gen(function* () {
+                const prompted = yield* ctx.client
+                  .prompt(input.input ?? "", images, "steer")
+                  .pipe(Effect.result);
+                if (Result.isFailure(prompted))
+                  return yield* Effect.gen(function* () {
+                    const finalized = yield* finalizeFailure(prompted.failure, true).pipe(
+                      Effect.result,
+                    );
+                    if (Result.isFailure(finalized)) return yield* finalized.failure;
+                    return yield* request("prompt", prompted.failure);
+                  }).pipe(Effect.ensuring(close(ctx).pipe(Effect.orDie)));
+                const finalized = yield* finalize({
+                  status: "completed",
+                  receipt: { turnId: steeringTurn.id },
+                }).pipe(Effect.result);
+                if (Result.isFailure(finalized)) {
+                  yield* close(ctx);
+                  return yield* finalized.failure;
+                }
+                ctx.managedOperations.set(operationKey, steeringTurn.id);
+                if (steeringTurn.interruptRequested)
+                  yield* ctx.client
+                    .abort()
+                    .pipe(Effect.mapError((cause) => request("abort", cause)));
+                return {
+                  threadId: input.threadId,
+                  turnId: steeringTurn.id,
+                  resumeCursor: ctx.cursor,
+                };
+              }).pipe(
+                Effect.ensuring(
+                  Effect.gen(function* () {
+                    ctx.steeringPromptsInFlight -= 1;
+                    const deferredSettlement = ctx.deferredSettlement;
+                    ctx.deferredSettlement = undefined;
+                    if (deferredSettlement)
+                      yield* handleEvent(ctx, deferredSettlement).pipe(Effect.orDie);
+                  }),
+                ),
+                Effect.uninterruptible,
+              ),
+            };
+          }
+
+          const configured = yield* Effect.gen(function* () {
+            if (
+              ctx.closing ||
+              ctx.stopped ||
+              sessions.get(input.threadId) !== ctx ||
+              ctx.session.status !== "ready"
+            )
+              return yield* new ProviderAdapterSessionNotFoundError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+              });
+            yield* ctx.client
+              .setModel(parsed.provider, parsed.modelId)
+              .pipe(Effect.mapError((cause) => request("set_model", cause)));
+            if (thinking !== undefined)
+              yield* ctx.client
+                .setThinkingLevel(thinking)
+                .pipe(Effect.mapError((cause) => request("set_thinking_level", cause)));
+            if (
+              ctx.closing ||
+              ctx.stopped ||
+              sessions.get(input.threadId) !== ctx ||
+              ctx.session.status !== "ready"
+            )
+              return yield* new ProviderAdapterSessionNotFoundError({
+                provider: PROVIDER,
+                threadId: input.threadId,
+              });
+          }).pipe(Effect.result);
+          if (Result.isFailure(configured)) {
+            yield* finalizeFailure(configured.failure, false);
+            return yield* configured.failure;
+          }
+
+          const turnId = TurnId.make(yield* uuid);
+          const turn = makeActiveTurn(turnId);
+          createdTurn = turn;
+          ctx.activeTurn = turn;
+          ctx.session = {
+            ...ctx.session,
+            status: "running",
+            activeTurnId: turnId,
+            updatedAt: yield* now,
+          };
+          yield* offer({
+            type: "turn.started",
+            ...(yield* base(ctx, turn)),
+            payload: {
+              model: selection!.model,
+              ...(thinking ? { effort: thinking } : {}),
+            },
           });
-        const turnId = TurnId.make(yield* uuid);
-        const turn: ActiveTurn = {
-          id: turnId,
-          assistantItemId: RuntimeItemId.make(`pi-assistant:${turnId}`),
-          reasoningItemId: RuntimeItemId.make(`pi-reasoning:${turnId}`),
-          toolItemIds: new Map(),
-          toolArgs: new Map(),
-          assistantText: "",
-          assistantStarted: false,
-          reasoningStarted: false,
-          interruptRequested: false,
-          terminal: false,
-        };
-        createdTurn = turn;
-        ctx.activeTurn = turn;
-        ctx.session = {
-          ...ctx.session,
-          status: "running",
-          activeTurnId: turnId,
-          updatedAt: yield* now,
-        };
-        yield* offer({
-          type: "turn.started",
-          ...(yield* base(ctx, turn)),
-          payload: { model: selection!.model, ...(thinking ? { effort: thinking } : {}) },
-        });
-        const prompted = yield* ctx.client.prompt(input.input ?? "", images).pipe(Effect.result);
-        if (Result.isFailure(prompted)) {
-          const reusable = isPiRpcCommandError(prompted.failure);
-          yield* failActive(ctx, "Pi prompt failed.", undefined, !reusable);
-          if (!reusable) yield* close(ctx);
-          return yield* request("prompt", prompted.failure);
-        }
-        return {
-          _tag: "Started" as const,
-          result: { threadId: input.threadId, turnId, resumeCursor: ctx.cursor },
-        };
-      }),
-    ).pipe(
-      Effect.flatMap((action) =>
-        action._tag === "Steer" ? action.effect : Effect.succeed(action.result),
+          const prompted = yield* ctx.client.prompt(input.input ?? "", images).pipe(Effect.result);
+          if (Result.isFailure(prompted))
+            return yield* Effect.gen(function* () {
+              const finalized = yield* finalizeFailure(prompted.failure, true).pipe(Effect.result);
+              yield* failActive(ctx, "Pi prompt failed.");
+              if (Result.isFailure(finalized)) return yield* finalized.failure;
+              return yield* request("prompt", prompted.failure);
+            }).pipe(Effect.ensuring(close(ctx).pipe(Effect.orDie)));
+          const finalized = yield* finalize({
+            status: "completed",
+            receipt: { turnId },
+          }).pipe(Effect.result);
+          if (Result.isFailure(finalized)) {
+            yield* failActive(ctx, "Pi prompt admission finalization failed.", undefined, true);
+            yield* close(ctx);
+            return yield* finalized.failure;
+          }
+          ctx.managedOperations.set(operationKey, turnId);
+          return {
+            _tag: "Result" as const,
+            result: { threadId: input.threadId, turnId, resumeCursor: ctx.cursor },
+          };
+        }),
+      ).pipe(
+        Effect.flatMap((action) =>
+          action._tag === "Steer" ? action.effect : Effect.succeed(action.result),
+        ),
       ),
+    ).pipe(
       Effect.onInterrupt(() =>
         Effect.suspend(() => {
           const ctx = sessions.get(input.threadId);
