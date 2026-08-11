@@ -115,9 +115,10 @@ describe("ProviderSessionStartInput", () => {
 });
 
 describe("ProviderSendTurnInput", () => {
-  it("accepts codex modelSelection", () => {
+  it("preserves a stable operation id with codex modelSelection", () => {
     const parsed = decodeProviderSendTurnInput({
       threadId: "thread-1",
+      operationId: "command-turn-start-1",
       modelSelection: {
         provider: "codex",
         model: "gpt-5.3-codex",
@@ -128,6 +129,7 @@ describe("ProviderSendTurnInput", () => {
       },
     });
 
+    expect(parsed.operationId).toBe("command-turn-start-1");
     expect(parsed.modelSelection?.instanceId).toBe("codex");
     expect(parsed.modelSelection?.model).toBe("gpt-5.3-codex");
     expect(getOptionValue(parsed.modelSelection?.options, "reasoningEffort")).toBe("xhigh");

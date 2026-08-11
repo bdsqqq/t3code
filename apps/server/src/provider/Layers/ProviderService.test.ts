@@ -12,6 +12,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   ApprovalRequestId,
+  CommandId,
   EnvironmentId,
   EventId,
   ProviderDriverKind,
@@ -1924,10 +1925,15 @@ routing.layer("ProviderServiceLive routing", (it) => {
 
       yield* provider.sendTurn({
         threadId: session.threadId,
+        operationId: CommandId.make("command-turn-1"),
         input: "hello",
         attachments: [],
       });
       assert.equal(routing.codex.sendTurn.mock.calls.length, 1);
+      assert.equal(
+        routing.codex.sendTurn.mock.calls[0]?.[0].operationId,
+        CommandId.make("command-turn-1"),
+      );
 
       yield* provider.interruptTurn({ threadId: session.threadId });
       assert.deepEqual(routing.codex.interruptTurn.mock.calls, [[session.threadId, undefined]]);

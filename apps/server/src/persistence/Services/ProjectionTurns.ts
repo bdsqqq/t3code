@@ -8,6 +8,7 @@
  */
 import {
   CheckpointRef,
+  CommandId,
   IsoDateTime,
   MessageId,
   ModelSelection,
@@ -74,6 +75,7 @@ export type ProjectionTurnById = typeof ProjectionTurnById.Type;
 export const ProjectionPendingTurnStart = Schema.Struct({
   threadId: ThreadId,
   messageId: MessageId,
+  operationId: Schema.NullOr(CommandId),
   modelSelection: Schema.NullOr(ModelSelection),
   titleSeed: Schema.NullOr(Schema.String),
   interactionMode: Schema.NullOr(ProviderInteractionMode),

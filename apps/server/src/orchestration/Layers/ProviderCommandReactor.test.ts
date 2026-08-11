@@ -149,6 +149,7 @@ describe("ProviderCommandReactor", () => {
     readonly titleRegenerationCompletionDispatchFailures?: number;
     readonly titleRegenerationBeforeStart?: "one" | "two";
     readonly pendingTurnBeforeStart?: boolean;
+    readonly pendingTurnModelSelection?: ModelSelection;
     readonly runningSessionBeforeStart?: boolean;
     readonly startSessionEffect?: (
       session: ProviderSession,
@@ -520,7 +521,7 @@ describe("ProviderCommandReactor", () => {
             text: "resume after restart",
             attachments: [],
           },
-          modelSelection: {
+          modelSelection: input.pendingTurnModelSelection ?? {
             instanceId: ProviderInstanceId.make("codex_work"),
             model: "gpt-5-codex",
           },
@@ -620,6 +621,9 @@ describe("ProviderCommandReactor", () => {
       },
       runtimeMode: "approval-required",
     });
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      operationId: CommandId.make("cmd-turn-start-1"),
+    });
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
@@ -647,10 +651,41 @@ describe("ProviderCommandReactor", () => {
     });
     expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
       threadId: ThreadId.make("thread-1"),
+      operationId: CommandId.make("cmd-turn-start-before-reactor-start"),
       input: "resume after restart",
       interactionMode: "plan",
     });
     expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports recovered managed Pi admission as indeterminate without resending", async () => {
+    const piModelSelection = {
+      instanceId: ProviderInstanceId.make("pi"),
+      model: "openai/gpt-5",
+    };
+    const harness = await createHarness({
+      threadModelSelection: piModelSelection,
+      pendingTurnBeforeStart: true,
+      pendingTurnModelSelection: piModelSelection,
+    });
+
+    await harness.drain();
+
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn).not.toHaveBeenCalled();
+    const readModel = await harness.readModel();
+    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
+    expect(thread?.session?.status).toBe("stopped");
+    expect(thread?.session?.lastError).toBe(
+      "Pi turn admission is indeterminate because managed Pi prompts do not yet use the durable supervisor command ledger. The previous process may have accepted the prompt, so it was not resent.",
+    );
+    expect(thread?.activities.at(-1)).toMatchObject({
+      summary: "Pi turn admission is indeterminate",
+      payload: {
+        detail:
+          "Pi turn admission is indeterminate because managed Pi prompts do not yet use the durable supervisor command ledger. The previous process may have accepted the prompt, so it was not resent.",
+      },
+    });
   });
 
   it("resumes a projected running session before accepting new work", async () => {

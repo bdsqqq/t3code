@@ -71,6 +71,8 @@ type TurnStartRequest = {
     OrchestrationEvent,
     { type: "thread.turn-start-requested" }
   >["payload"]["messageId"];
+  readonly operationId: CommandId | null;
+  readonly recovered: boolean;
   readonly modelSelection?: ModelSelection;
   readonly titleSeed?: string;
   readonly interactionMode?: ProviderInteractionMode;
@@ -701,6 +703,7 @@ const make = Effect.gen(function* () {
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
+    readonly operationId: CommandId;
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
@@ -752,6 +755,7 @@ const make = Effect.gen(function* () {
 
     return {
       threadId: input.threadId,
+      operationId: input.operationId,
       ...(normalizedInput ? { input: normalizedInput } : {}),
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
@@ -1062,6 +1066,48 @@ const make = Effect.gen(function* () {
       return;
     }
 
+    if (request.operationId === null) {
+      const detail =
+        "Turn admission is indeterminate because its accepted operation identity could not be recovered. The provider request was not resent.";
+      yield* setThreadSessionErrorOnTurnStartFailure({
+        threadId: request.threadId,
+        detail,
+        createdAt: request.createdAt,
+      });
+      yield* appendProviderFailureActivity({
+        threadId: request.threadId,
+        kind: "provider.turn.start.failed",
+        summary: "Provider turn admission is indeterminate",
+        detail,
+        turnId: null,
+        createdAt: request.createdAt,
+      });
+      return;
+    }
+
+    if (request.recovered) {
+      const modelSelection = request.modelSelection ?? thread.modelSelection;
+      const instanceInfo = yield* providerService.getInstanceInfo(modelSelection.instanceId);
+      if (instanceInfo.driverKind === ProviderDriverKind.make("pi")) {
+        const detail =
+          "Pi turn admission is indeterminate because managed Pi prompts do not yet use the durable supervisor command ledger. The previous process may have accepted the prompt, so it was not resent.";
+        yield* setThreadSessionErrorOnTurnStartFailure({
+          threadId: request.threadId,
+          detail,
+          createdAt: request.createdAt,
+        });
+        yield* appendProviderFailureActivity({
+          threadId: request.threadId,
+          kind: "provider.turn.start.failed",
+          summary: "Pi turn admission is indeterminate",
+          detail,
+          turnId: null,
+          createdAt: request.createdAt,
+        });
+        return;
+      }
+    }
+
     const isFirstUserMessageTurn =
       thread.messages.filter((entry) => entry.role === "user").length === 1;
     if (isFirstUserMessageTurn) {
@@ -1131,6 +1177,7 @@ const make = Effect.gen(function* () {
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
       threadId: request.threadId,
+      operationId: request.operationId,
       messageText: message.text,
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
       ...(request.modelSelection !== undefined ? { modelSelection: request.modelSelection } : {}),
@@ -1331,6 +1378,8 @@ const make = Effect.gen(function* () {
         yield* processTurnStartRequested({
           threadId: event.payload.threadId,
           messageId: event.payload.messageId,
+          operationId: event.commandId,
+          recovered: false,
           ...(event.payload.modelSelection !== undefined
             ? { modelSelection: event.payload.modelSelection }
             : {}),
@@ -1426,6 +1475,8 @@ const make = Effect.gen(function* () {
           payload: {
             threadId: pendingTurnStart.threadId,
             messageId: pendingTurnStart.messageId,
+            operationId: pendingTurnStart.operationId,
+            recovered: true,
             ...(pendingTurnStart.modelSelection !== null
               ? { modelSelection: pendingTurnStart.modelSelection }
               : {}),

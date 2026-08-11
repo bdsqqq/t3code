@@ -1093,6 +1093,7 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           yield* projectionTurnRepository.replacePendingTurnStart({
             threadId: event.payload.threadId,
             messageId: event.payload.messageId,
+            operationId: event.commandId,
             modelSelection: event.payload.modelSelection ?? null,
             titleSeed: event.payload.titleSeed ?? null,
             interactionMode: event.payload.interactionMode,
