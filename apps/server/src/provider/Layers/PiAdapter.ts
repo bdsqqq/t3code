@@ -123,6 +123,9 @@ const piToolText = (value: unknown): string | undefined => {
 const piToolPath = (args: Record<string, unknown>): string | undefined =>
   trimmedString(args.path) ?? trimmedString(args.file_path);
 
+const piToolCommand = (args: Record<string, unknown>): string | undefined =>
+  trimmedString(args.command) ?? trimmedString(args.cmd);
+
 /**
  * Pi's agent-backed extensions share `details.agent` and `details.task`.
  * Classifying that result metadata keeps new agents working without a T3 tool-name allowlist.
@@ -190,14 +193,14 @@ const piToolPresentation = (event: Record<string, unknown>) => {
   const invocationDetail = subagent
     ? subagent.detail
     : normalizedName === "grep"
-      ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? "."}`
+      ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? trimmedString(args.glob) ?? "."}`
       : normalizedName === "find"
-        ? `${trimmedString(args.pattern) ?? "files"} in ${path ?? "."}`
+        ? `${trimmedString(args.filePattern) ?? trimmedString(args.pattern) ?? "files"} in ${path ?? "."}`
         : normalizedName === "ls"
           ? (path ?? ".")
           : path;
   const detail = event.isError === true ? outputText?.split(/\r?\n/u)[0] : invocationDetail;
-  const command = normalizedName === "bash" ? trimmedString(args.command) : undefined;
+  const command = normalizedName === "bash" ? piToolCommand(args) : undefined;
   const changes =
     (normalizedName === "write" || normalizedName === "edit") && path ? [{ path }] : undefined;
 

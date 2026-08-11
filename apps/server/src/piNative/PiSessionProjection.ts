@@ -42,6 +42,28 @@ function contentText(value: unknown): string {
     )
     .join("");
 }
+
+const trimmedString = (value: unknown): string | undefined =>
+  typeof value === "string" ? value.trim() || undefined : undefined;
+
+function toolOutput(output: unknown): JsonRecord | undefined {
+  const record = isRecord(output) ? output : undefined;
+  if (!record) {
+    const content = trimmedString(output);
+    return content ? { content } : undefined;
+  }
+
+  const content = trimmedString(record.content) ?? trimmedString(contentText(record.content));
+  const stdout = trimmedString(record.stdout);
+  const details = isRecord(record.details) ? record.details : undefined;
+  if (!content && !stdout && !details) return undefined;
+  return {
+    ...(content ? { content } : {}),
+    ...(stdout ? { stdout } : {}),
+    ...details,
+  };
+}
+
 function activeBranch(entries: ReadonlyArray<JsonRecord>) {
   const treeEntries = entries.filter(
     (entry) => typeof entry.id === "string" && "parentId" in entry,
@@ -144,12 +166,9 @@ export function projectPiBacking(
 
 function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) {
   const normalized = toolName.toLowerCase();
-  const path =
-    typeof args.path === "string"
-      ? args.path
-      : typeof args.file_path === "string"
-        ? args.file_path
-        : undefined;
+  const path = trimmedString(args.path) ?? trimmedString(args.file_path);
+  const command = trimmedString(args.command) ?? trimmedString(args.cmd);
+  const rawOutput = toolOutput(output);
   const title =
     normalized === "bash"
       ? "Ran command"
@@ -166,6 +185,17 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
                 : normalized === "ls"
                   ? "Listed directory"
                   : toolName;
+  const detail =
+    normalized === "grep"
+      ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? trimmedString(args.glob) ?? "."}`
+      : normalized === "find"
+        ? `${trimmedString(args.filePattern) ?? trimmedString(args.pattern) ?? "files"} in ${path ?? "."}`
+        : normalized === "ls"
+          ? (path ?? ".")
+          : path;
+  const changes =
+    (normalized === "write" || normalized === "edit") && path ? [{ path }] : undefined;
+
   return {
     itemType:
       normalized === "bash"
@@ -174,7 +204,7 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
           ? "file_change"
           : "dynamic_tool_call",
     title,
-    ...(path ? { detail: path } : {}),
+    ...(detail ? { detail } : {}),
     data: {
       toolName,
       kind:
@@ -185,8 +215,13 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
             : normalized === "write" || normalized === "edit"
               ? "edit"
               : "other",
+      ...(command ? { command } : {}),
       rawInput: args,
-      ...(output === undefined ? {} : { rawOutput: output }),
+      ...(rawOutput ? { rawOutput } : {}),
+      item: {
+        input: args,
+        ...(changes ? { changes } : {}),
+      },
     },
   };
 }
@@ -363,7 +398,10 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
     ) {
       const index = toolActivityIndex.get(message.toolCallId);
       const prior = index === undefined ? undefined : activities[index];
-      const presentation = toolPresentation(message.toolName, {}, message);
+      const priorPayload = isRecord(prior?.payload) ? prior.payload : undefined;
+      const priorData = isRecord(priorPayload?.data) ? priorPayload.data : undefined;
+      const priorArgs = isRecord(priorData?.rawInput) ? priorData.rawInput : {};
+      const presentation = toolPresentation(message.toolName, priorArgs, message);
       const completed: OrchestrationThreadActivity = {
         id: prior?.id ?? activityId(record, `tool:${message.toolCallId}`),
         tone: message.isError === true ? "error" : "tool",

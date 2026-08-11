@@ -124,6 +124,106 @@ describe("PiSessionProjection", () => {
     expect(snapshot.thread.historyTruncation?.truncated).toBe(false);
   });
 
+  it("preserves Pi tool arguments and presentation in completed history", () => {
+    const toolEntries = [
+      {
+        type: "message",
+        id: "user",
+        parentId: null,
+        timestamp: "2026-07-30T00:00:01.000Z",
+        message: { role: "user", content: "inspect files" },
+      },
+      {
+        type: "message",
+        id: "assistant",
+        parentId: "user",
+        timestamp: "2026-07-30T00:00:02.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            { type: "toolCall", id: "bash", name: "bash", arguments: { cmd: "git status" } },
+            {
+              type: "toolCall",
+              id: "grep",
+              name: "grep",
+              arguments: { pattern: "needle", glob: "**/*.ts" },
+            },
+            {
+              type: "toolCall",
+              id: "find",
+              name: "find",
+              arguments: { filePattern: "*.md" },
+            },
+            {
+              type: "toolCall",
+              id: "write",
+              name: "write",
+              arguments: { path: "notes.md", content: "hello" },
+            },
+            {
+              type: "toolCall",
+              id: "edit",
+              name: "edit",
+              arguments: { file_path: "src/app.ts", oldText: "old", newText: "new" },
+            },
+          ],
+        },
+      },
+      ...["bash", "grep", "find", "write", "edit"].map((toolName, index) => ({
+        type: "message",
+        id: `${toolName}-result`,
+        parentId:
+          index === 0 ? "assistant" : `${["bash", "grep", "find", "write"][index - 1]}-result`,
+        timestamp: `2026-07-30T00:00:0${index + 3}.000Z`,
+        message: {
+          role: "toolResult",
+          toolCallId: toolName,
+          toolName,
+          content: [{ type: "text", text: "  completed  " }],
+          details: { truncation: null },
+          isError: false,
+        },
+      })),
+    ];
+
+    const snapshot = projectPiThread({
+      record,
+      entries: toolEntries,
+      projectId: ProjectId.make("project-1"),
+    });
+    const activities = new Map(
+      snapshot.thread.activities.map(
+        (activity) => [String(activity.id), activity.payload] as const,
+      ),
+    );
+
+    expect(activities.get("session-1:tool:bash")).toMatchObject({
+      itemType: "command_execution",
+      status: "completed",
+      data: {
+        command: "git status",
+        rawInput: { cmd: "git status" },
+        rawOutput: { content: "completed", truncation: null },
+      },
+    });
+    expect(activities.get("session-1:tool:grep")).toMatchObject({
+      detail: "/needle/ in **/*.ts",
+      data: { rawInput: { pattern: "needle", glob: "**/*.ts" } },
+    });
+    expect(activities.get("session-1:tool:find")).toMatchObject({
+      detail: "*.md in .",
+      data: { rawInput: { filePattern: "*.md" } },
+    });
+    expect(activities.get("session-1:tool:write")).toMatchObject({
+      itemType: "file_change",
+      data: { item: { changes: [{ path: "notes.md" }] } },
+    });
+    expect(activities.get("session-1:tool:edit")).toMatchObject({
+      itemType: "file_change",
+      data: { item: { changes: [{ path: "src/app.ts" }] } },
+    });
+  });
+
   it("projects every durable Pi message surface", () => {
     const surfaceEntries = [
       {

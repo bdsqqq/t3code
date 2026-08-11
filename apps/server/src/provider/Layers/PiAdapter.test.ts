@@ -346,13 +346,13 @@ describe("PiAdapter", () => {
             type: "tool_execution_start",
             toolCallId: "bash-1",
             toolName: "bash",
-            args: { command: "git status --short" },
+            args: { cmd: "git status --short" },
           },
           {
             type: "tool_execution_update",
             toolCallId: "bash-1",
             toolName: "bash",
-            args: { command: "git status --short" },
+            args: { cmd: "git status --short" },
             partialResult: {
               content: [{ type: "text", text: " M apps/server/src/provider/Layers/PiAdapter.ts" }],
               details: { truncation: null },
@@ -416,12 +416,12 @@ describe("PiAdapter", () => {
             toolName: "bash",
             kind: "execute",
             command: "git status --short",
-            rawInput: { command: "git status --short" },
+            rawInput: { cmd: "git status --short" },
             rawOutput: {
               content: "M apps/server/src/provider/Layers/PiAdapter.ts",
               truncation: null,
             },
-            item: { input: { command: "git status --short" } },
+            item: { input: { cmd: "git status --short" } },
           },
         });
         assert.deepEqual(editCompleted?.payload, {
