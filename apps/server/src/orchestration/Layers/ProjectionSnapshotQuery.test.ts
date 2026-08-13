@@ -1365,6 +1365,28 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
       assert.notEqual(nextCursor, null);
       if (nextCursor === null) return;
 
+      // Interior retention must expire a cursor even when its anchor and the
+      // oldest surviving row are unchanged.
+      yield* sql`
+        INSERT INTO projection_thread_activity_history (
+          thread_id, retention_floor_applied_sequence, history_revision, updated_at
+        ) VALUES (
+          'thread-pages', 5, 1, '2026-04-02T00:01:01.000Z'
+        )
+      `;
+      const revisionExpired = yield* snapshotQuery.getThreadActivityPage(
+        ThreadId.make("thread-pages"),
+        { cursor: nextCursor, pageSize: 2 },
+      );
+      assert.equal(revisionExpired._tag, "Some");
+      if (revisionExpired._tag === "Some") {
+        assert.equal(revisionExpired.value.kind, "cursor-expired");
+      }
+      yield* sql`
+        DELETE FROM projection_thread_activity_history
+        WHERE thread_id = 'thread-pages'
+      `;
+
       // These rows arrive after the initial watermark. Their provider ordering
       // sequences intentionally reset or remain absent; neither may move the
       // continuation window or duplicate/skip the original history.
@@ -1449,6 +1471,56 @@ projectionSnapshotLayer("ProjectionSnapshotQuery", (it) => {
           omittedPayloads: [],
         });
       }
+
+      yield* sql`
+        INSERT INTO projection_thread_activity_history (
+          thread_id, retention_floor_applied_sequence, history_revision, updated_at
+        ) VALUES (
+          'thread-empty', 6, 1, '2026-04-02T00:01:02.000Z'
+        )
+      `;
+      yield* sql`
+        INSERT INTO projection_thread_activities (
+          activity_id, thread_id, turn_id, tone, kind, summary,
+          payload_json, sequence, applied_sequence, created_at
+        ) VALUES (
+          'activity-empty-retained', 'thread-empty', NULL, 'info', 'runtime.note',
+          'retained at floor', '{"value":1}', 1, 5, '2026-04-02T00:00:01.000Z'
+        )
+      `;
+      const initialAtRetentionFloor = yield* snapshotQuery.getThreadActivityPage(
+        ThreadId.make("thread-empty"),
+        { cursor: { kind: "initial" }, pageSize: 10 },
+      );
+      assert.equal(initialAtRetentionFloor._tag, "Some");
+      if (initialAtRetentionFloor._tag === "Some") {
+        assert.equal(initialAtRetentionFloor.value.kind, "cursor-expired");
+      }
+
+      yield* sql`
+        UPDATE projection_state
+        SET last_applied_sequence = 6
+        WHERE last_applied_sequence < 6
+      `;
+      const initialAfterProjectorsCatchUp = yield* snapshotQuery.getThreadActivityPage(
+        ThreadId.make("thread-empty"),
+        { cursor: { kind: "initial" }, pageSize: 10 },
+      );
+      assert.equal(initialAfterProjectorsCatchUp._tag, "Some");
+      if (
+        initialAfterProjectorsCatchUp._tag === "Some" &&
+        initialAfterProjectorsCatchUp.value.kind === "page"
+      ) {
+        assert.equal(initialAfterProjectorsCatchUp.value.pageInfo.asOfSequence, 6);
+        assert.deepEqual(
+          initialAfterProjectorsCatchUp.value.activities.map((activity) => activity.id),
+          [asEventId("activity-empty-retained")],
+        );
+      }
+      yield* sql`
+        UPDATE projection_state
+        SET last_applied_sequence = 5
+      `;
 
       yield* sql`
         INSERT INTO projection_thread_activities (
