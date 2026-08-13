@@ -90,6 +90,42 @@ server may grow its WAL while any individual scan holds a read snapshot. If WAL 
 operational concern, analyze a consistent copy made with SQLite's online backup API instead. Do not
 copy only a live `state.sqlite` file while omitting its WAL.
 
+### Historical derived activity compaction
+
+Migration 041 adds semantic retention metadata for derived thread activities. Inspect an explicit
+database in strict read-only mode first:
+
+```bash
+node apps/server/scripts/t3-sqlite-activity-compact.ts --database /path/to/state.sqlite
+node apps/server/scripts/t3-sqlite-activity-compact.ts --database /path/to/state.sqlite --json
+```
+
+Policy `semantic-tool-updates-v1` operates independently per `(thread_id, turn_id)`. It preserves
+all rows except superseded, identified, non-error `tool.updated` snapshots. For those snapshots it
+keeps the newest row for every explicit `itemId`/`toolCallId`, plus a contiguous newest-first UX
+tail capped at 100 rows and 4,194,304 payload UTF-8 bytes. The newest row is retained alone when it
+exceeds the byte cap. Unknown identities, invalid JSON, lifecycle/turn/checkpoint rows,
+approvals/user input, errors, and task-title recovery rows are never candidates.
+
+To apply the report, stop or quiesce the server and provide the policy name exactly:
+
+```bash
+node apps/server/scripts/t3-sqlite-activity-compact.ts --database /path/to/state.sqlite \
+  --apply --confirm semantic-tool-updates-v1
+```
+
+The tool only updates/deletes `projection_thread_activities` and advances
+`projection_thread_activity_history`; it never changes canonical `orchestration_events`, runs
+migrations, checkpoints WAL, or vacuums. It preserves semantic, unknown-identity, and invalid-JSON
+rows conservatively, and reports exact row and UTF-8 payload-byte totals by thread, activity kind,
+and category at one captured `projection.thread-activities` sequence. Apply transactions are
+byte/row bounded and resumable; compare-and-swap mutations defer any concurrently changed row to
+the next run.
+
+Concurrent projection writes are safe but conservative: run a final quiesced dry-run and apply for
+exact convergence. Deletion creates SQLite freelist pages; shrinking the file (and any WAL
+checkpoint) is a separate operator action outside this tool.
+
 ## Desktop artifacts
 
 - `vp run dist:desktop:artifact --platform <mac|linux|win> --target <target> --arch <arch>`: Builds a desktop artifact for a specific platform/target/arch.

@@ -41,9 +41,19 @@ export type ListProjectionThreadActivitiesInput = typeof ListProjectionThreadAct
 
 export const DeleteProjectionThreadActivitiesInput = Schema.Struct({
   threadId: ThreadId,
+  appliedSequence: NonNegativeInt,
+  updatedAt: IsoDateTime,
 });
 export type DeleteProjectionThreadActivitiesInput =
   typeof DeleteProjectionThreadActivitiesInput.Type;
+
+export const AdvanceProjectionThreadActivityHistoryInput = Schema.Struct({
+  threadId: ThreadId,
+  appliedSequence: NonNegativeInt,
+  updatedAt: IsoDateTime,
+});
+export type AdvanceProjectionThreadActivityHistoryInput =
+  typeof AdvanceProjectionThreadActivityHistoryInput.Type;
 
 /**
  * ProjectionThreadActivityRepositoryShape - Service API for projected thread activity.
@@ -73,6 +83,14 @@ export interface ProjectionThreadActivityRepositoryShape {
    */
   readonly deleteByThreadId: (
     input: DeleteProjectionThreadActivitiesInput,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /**
+   * Expire activity cursors after derived history is removed by a caller that
+   * does not use `deleteByThreadId`.
+   */
+  readonly advanceHistory: (
+    input: AdvanceProjectionThreadActivityHistoryInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
 }
 

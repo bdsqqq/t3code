@@ -1056,6 +1056,8 @@ const makeOrchestrationProjectionPipeline = Effect.fn("makeOrchestrationProjecti
           }
           yield* projectionThreadActivityRepository.deleteByThreadId({
             threadId: event.payload.threadId,
+            appliedSequence: event.sequence,
+            updatedAt: event.occurredAt,
           });
           yield* Effect.forEach(keptRows, projectionThreadActivityRepository.upsert, {
             concurrency: 1,
