@@ -126,6 +126,29 @@ Concurrent projection writes are safe but conservative: run a final quiesced dry
 exact convergence. Deletion creates SQLite freelist pages; shrinking the file (and any WAL
 checkpoint) is a separate operator action outside this tool.
 
+#### Disk-space budget
+
+Let `D` be the current `state.sqlite` file size, rounded up; do not subtract expected compactor
+candidates before a replacement file has actually been produced. A conservative same-filesystem
+workflow may hold these additional files at once:
+
+- rollback backup: `1 × D`;
+- clean replay or compaction working copy: `1 × D`;
+- compacted replacement: `1 × D`;
+- SQLite WAL and temporary headroom: `1 × D`.
+
+That is `4 × D` additional space. Reserve `5 × D` free before starting to leave one more database
+size for growth and operator error. A copy-only dry run needs approximately `1 × D`, but retaining
+at least `2 × D` free avoids turning source-WAL growth or SQLite temporary work into a disk-full
+incident. Existing `state.sqlite-wal` bytes count separately when checking the source filesystem.
+
+For the measured 8,136,081,408-byte database (`8.14 GB` / `7.58 GiB`), the artifacts above total
+`32.54 GB` / `30.31 GiB`, and the recommended `5 × D` reserve is `40.68 GB` / `37.89 GiB`. A macOS
+filesystem reporting `90 GB` free therefore has about `49.32 GB` beyond this conservative reserve.
+Re-check free space and the database/WAL sizes immediately before the maintenance window; stop if
+free space is below the reserve. The replacement may be smaller after compaction, but that saving
+is not part of the preflight budget.
+
 ## Desktop artifacts
 
 - `vp run dist:desktop:artifact --platform <mac|linux|win> --target <target> --arch <arch>`: Builds a desktop artifact for a specific platform/target/arch.
