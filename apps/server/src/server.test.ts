@@ -802,8 +802,6 @@ const buildAppUnderTest = (options?: {
           getThreadShellById: () => Effect.succeed(Option.none()),
           getThreadDetailById: () => Effect.succeed(Option.none()),
           getThreadDetailSnapshot: () => Effect.succeed(Option.none()),
-          getThreadDetailPageSnapshot: () => Effect.succeed(Option.none()),
-          getThreadActivityPage: () => Effect.succeed(Option.none()),
           getCounts: () => Effect.succeed({ projectCount: 0, threadCount: 0 }),
           getActiveProjectByWorkspaceRoot: () => Effect.succeed(Option.none()),
           getFirstActiveThreadIdByProjectId: () => Effect.succeed(Option.none()),
@@ -6017,7 +6015,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
       yield* buildAppUnderTest({
         layers: {
           projectionSnapshotQuery: {
-            getThreadDetailPageSnapshot: () =>
+            getThreadDetailSnapshot: () =>
               Effect.succeed(Option.some({ snapshotSequence: 1, thread })),
           },
         },
@@ -6126,7 +6124,7 @@ it.layer(NodeServices.layer)("server router seam", (it) => {
             streamDomainEvents: Stream.fromPubSub(liveEvents),
           },
           projectionSnapshotQuery: {
-            getThreadDetailPageSnapshot: () =>
+            getThreadDetailSnapshot: () =>
               Effect.gen(function* () {
                 yield* Effect.sleep("25 millis");
                 yield* PubSub.publish(liveEvents, messageEvent);

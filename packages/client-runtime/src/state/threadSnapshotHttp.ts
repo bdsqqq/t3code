@@ -1,9 +1,4 @@
-import type {
-  OrchestrationActivityPageRequest,
-  OrchestrationActivityPageResult,
-  OrchestrationThreadDetailSnapshot,
-  ThreadId,
-} from "@t3tools/contracts";
+import type { OrchestrationThreadDetailSnapshot, ThreadId } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
@@ -52,7 +47,7 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
 }) {
   const requestUrl = environmentEndpointUrl(
     input.prepared.httpBaseUrl,
-    `/api/orchestration/threads/${input.threadId}/detail`,
+    `/api/orchestration/threads/${input.threadId}`,
   );
   const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
   const headers = yield* buildEnvironmentAuthHeaders(
@@ -80,40 +75,6 @@ export const fetchEnvironmentThreadSnapshot = Effect.fn(
   );
 });
 
-export const fetchEnvironmentThreadActivityPage = Effect.fn(
-  "clientRuntime.state.fetchEnvironmentThreadActivityPage",
-)(function* (input: {
-  readonly prepared: PreparedConnection;
-  readonly threadId: ThreadId;
-  readonly request: OrchestrationActivityPageRequest;
-  readonly signer: Option.Option<ManagedRelayDpopSigner["Service"]>;
-  readonly timeoutMs?: number;
-}) {
-  const requestUrl = environmentEndpointUrl(
-    input.prepared.httpBaseUrl,
-    `/api/orchestration/threads/${input.threadId}/activities/page`,
-  );
-  const client = yield* makeEnvironmentHttpApiClient(input.prepared.httpBaseUrl);
-  const headers = yield* buildEnvironmentAuthHeaders(
-    input.prepared.httpAuthorization,
-    "POST",
-    requestUrl,
-    input.signer,
-  );
-  return yield* executeEnvironmentHttpRequest(
-    requestUrl,
-    input.timeoutMs ?? DEFAULT_THREAD_SNAPSHOT_TIMEOUT_MS,
-    withEnvironmentCredentials(
-      input.prepared.httpAuthorization,
-      client.orchestration.threadActivitiesPage({
-        params: { threadId: input.threadId },
-        payload: input.request,
-        headers,
-      }),
-    ),
-  );
-});
-
 export type FetchEnvironmentThreadSnapshotError = RemoteEnvironmentRequestError;
 
 /**
@@ -130,11 +91,6 @@ export class ThreadSnapshotLoader extends Context.Service<
       threadId: ThreadId,
       window?: ThreadSnapshotWindow,
     ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>>;
-    readonly loadActivityPage?: (
-      prepared: PreparedConnection,
-      threadId: ThreadId,
-      request: OrchestrationActivityPageRequest,
-    ) => Effect.Effect<OrchestrationActivityPageResult, RemoteEnvironmentRequestError>;
   }
 >()("@t3tools/client-runtime/state/threadSnapshotHttp/ThreadSnapshotLoader") {}
 
@@ -181,14 +137,6 @@ export const threadSnapshotLoaderLayer: Layer.Layer<
               Effect.as(Option.none<OrchestrationThreadDetailSnapshot>()),
             ),
           ),
-        ),
-      loadActivityPage: (
-        prepared: PreparedConnection,
-        threadId: ThreadId,
-        request: OrchestrationActivityPageRequest,
-      ) =>
-        fetchEnvironmentThreadActivityPage({ prepared, threadId, request, signer }).pipe(
-          Effect.provideService(HttpClient.HttpClient, httpClient),
         ),
     });
   }),

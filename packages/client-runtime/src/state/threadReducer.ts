@@ -13,8 +13,6 @@ import type {
   TurnId,
 } from "@t3tools/contracts";
 
-import { compareThreadActivitiesByPosition } from "./threadActivityPagination.ts";
-
 export type ThreadDetailReducerResult =
   | { readonly kind: "updated"; readonly thread: OrchestrationThread }
   | { readonly kind: "deleted" }
@@ -31,10 +29,11 @@ const checkpointOrder = O.mapInput(
     cp.checkpointTurnCount ?? Number.MAX_SAFE_INTEGER,
 );
 
-const activityOrder = O.make((left: OrchestrationThreadActivity, right) => {
-  const comparison = compareThreadActivitiesByPosition(left, right);
-  return comparison < 0 ? -1 : comparison > 0 ? 1 : 0;
-});
+const activityOrder = O.combineAll<OrchestrationThreadActivity>([
+  O.mapInput(O.Number, (a) => a.sequence ?? Number.MAX_SAFE_INTEGER),
+  O.mapInput(O.String, (a) => a.createdAt),
+  O.mapInput(O.String, (a) => a.id),
+]);
 
 /**
  * Matches the validity rule in `deriveLatestContextWindowSnapshot` (and the

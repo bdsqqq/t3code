@@ -9,8 +9,6 @@
 import type {
   CheckpointRef,
   OrchestrationCheckpointSummary,
-  OrchestrationActivityPageRequest,
-  OrchestrationActivityPageResult,
   OrchestrationProject,
   OrchestrationProjectShell,
   OrchestrationReadModel,
@@ -172,11 +170,6 @@ export interface ProjectionSnapshotQueryShape {
     threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThread>, ProjectionRepositoryError>;
 
-  readonly getThreadActivityPage: (
-    threadId: ThreadId,
-    request: OrchestrationActivityPageRequest,
-  ) => Effect.Effect<Option.Option<OrchestrationActivityPageResult>, ProjectionRepositoryError>;
-
   /**
    * Read a single active thread detail together with the projection snapshot
    * sequence in one consistent transaction, so the returned `snapshotSequence`
@@ -192,13 +185,6 @@ export interface ProjectionSnapshotQueryShape {
   readonly getThreadDetailSnapshot: (
     threadId: ThreadId,
     window?: OrchestrationThreadDetailWindow,
-  ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, ProjectionRepositoryError>;
-
-  /**
-   * Read a client detail snapshot with only the bounded initial activity page.
-   */
-  readonly getThreadDetailPageSnapshot: (
-    threadId: ThreadId,
   ) => Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, ProjectionRepositoryError>;
 }
 

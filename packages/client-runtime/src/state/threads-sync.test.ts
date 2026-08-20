@@ -6,7 +6,6 @@ import {
   ProviderInstanceId,
   ThreadId,
   TurnId,
-  type OrchestrationActivityPageInfo,
   type OrchestrationThread,
   type OrchestrationThreadDetailSnapshot,
   type OrchestrationThreadStreamItem,
@@ -98,14 +97,6 @@ const ACTIVE_THREAD: OrchestrationThread = {
     lastError: null,
     updatedAt: "2026-04-01T00:01:00.000Z",
   },
-};
-const ACTIVITY_PAGE_INFO: OrchestrationActivityPageInfo = {
-  asOfSequence: 1,
-  nextCursor: null,
-  retentionFloor: { kind: "empty" },
-  limits: { pageSize: 50, payloadBytes: 4 * 1024 * 1024 },
-  payloadBytes: 0,
-  omittedPayloads: [],
 };
 
 type TestThreadInput = OrchestrationThreadStreamItem | Error;
@@ -272,16 +263,11 @@ const makeHarness = Effect.fn("TestEnvironmentThreads.makeHarness")(function* (o
   };
 });
 
-const snapshot = (
-  thread: OrchestrationThread,
-  pageInfo?: OrchestrationActivityPageInfo,
-  snapshotSequence = 1,
-): OrchestrationThreadStreamItem => ({
+const snapshot = (thread: OrchestrationThread): OrchestrationThreadStreamItem => ({
   kind: "snapshot",
   snapshot: {
-    snapshotSequence,
+    snapshotSequence: 1,
     thread,
-    ...(pageInfo === undefined ? {} : { pageInfo }),
   },
 });
 
@@ -325,23 +311,6 @@ const deleted = (): OrchestrationThreadStreamItem => ({
       threadId: THREAD_ID,
       deletedAt: "2026-04-01T02:00:00.000Z",
     },
-  },
-});
-
-const reverted = (): OrchestrationThreadStreamItem => ({
-  kind: "event",
-  event: {
-    eventId: EventId.make("event-reverted"),
-    sequence: 2,
-    occurredAt: "2026-04-01T02:00:00.000Z",
-    commandId: null,
-    causationEventId: null,
-    correlationId: null,
-    metadata: {},
-    aggregateKind: "thread",
-    aggregateId: THREAD_ID,
-    type: "thread.reverted",
-    payload: { threadId: THREAD_ID, turnCount: 0 },
   },
 });
 
@@ -397,57 +366,6 @@ describe("EnvironmentThreads", () => {
       expect(Option.getOrThrow(state.data).title).toBe("Live title");
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.thread.title).toBe("Live title");
       expect((yield* Ref.get(harness.savedThreads)).at(-1)?.snapshotSequence).toBe(2);
-    }),
-  );
-
-  it.effect("preserves page metadata for live events and replaces it with snapshots", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, ACTIVITY_PAGE_INFO));
-      yield* awaitThreadState(
-        harness.observed,
-        (value) => value.activityPageInfo === ACTIVITY_PAGE_INFO,
-      );
-
-      yield* Queue.offer(harness.inputs, titleUpdated("Live title"));
-      const live = yield* awaitThreadState(
-        harness.observed,
-        (value) =>
-          value.activityPageInfo === ACTIVITY_PAGE_INFO &&
-          Option.isSome(value.data) &&
-          value.data.value.title === "Live title",
-      );
-      expect(live.activityPageInfo).toBe(ACTIVITY_PAGE_INFO);
-      expect(live.activityHistoryVersion).toBe(1);
-
-      yield* Queue.offer(
-        harness.inputs,
-        snapshot({ ...BASE_THREAD, title: "Replacement snapshot" }, undefined, 3),
-      );
-      const replaced = yield* awaitThreadState(
-        harness.observed,
-        (value) =>
-          value.activityPageInfo === null &&
-          Option.isSome(value.data) &&
-          value.data.value.title === "Replacement snapshot",
-      );
-      expect(replaced.activityPageInfo).toBeNull();
-      expect(replaced.activityHistoryVersion).toBe(2);
-    }),
-  );
-
-  it.effect("invalidates separately loaded activity history after a revert", () =>
-    Effect.gen(function* () {
-      const harness = yield* makeHarness({ cached: BASE_THREAD });
-      yield* Queue.offer(harness.inputs, snapshot(BASE_THREAD, ACTIVITY_PAGE_INFO));
-      yield* awaitThreadState(harness.observed, (value) => value.activityHistoryVersion === 1);
-
-      yield* Queue.offer(harness.inputs, reverted());
-      const state = yield* awaitThreadState(
-        harness.observed,
-        (value) => value.activityHistoryVersion === 2,
-      );
-      expect(state.activityPageInfo).toBe(ACTIVITY_PAGE_INFO);
     }),
   );
 

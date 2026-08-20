@@ -1300,21 +1300,6 @@ function ChatViewContent(props: ChatViewProps) {
     [environmentId, threadId],
   );
   const routeThreadKey = useMemo(() => scopedThreadKey(routeThreadRef), [routeThreadRef]);
-  const activityHistory = useEnvironmentThreadActivityHistory(
-    routeKind === "server" ? environmentId : null,
-    routeKind === "server" ? threadId : null,
-  );
-  const loadOlderActivities = useAtomCommand(environmentThreads.loadOlderActivities, {
-    reportFailure: false,
-  });
-  const handleLoadOlderActivities = useCallback(() => {
-    if (
-      routeKind !== "server" ||
-      (activityHistory.status !== "idle" && activityHistory.status !== "error")
-    )
-      return;
-    void loadOlderActivities({ environmentId, input: { threadId } });
-  }, [activityHistory.status, environmentId, loadOlderActivities, routeKind, threadId]);
   const updateProject = useAtomCommand(projectEnvironment.update, { reportFailure: false });
   const upsertKeybinding = useAtomCommand(serverEnvironment.upsertKeybinding, {
     reportFailure: false,
@@ -6585,11 +6570,6 @@ function ChatViewContent(props: ChatViewProps) {
                 liveFollowEnabled={timelineLiveFollowEnabled}
                 onIsAtEndChange={onIsAtEndChange}
                 onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
-                hasOlderActivities={
-                  activityHistory.status === "idle" || activityHistory.status === "error"
-                }
-                isLoadingOlderActivities={activityHistory.status === "loading"}
-                onLoadOlderActivities={handleLoadOlderActivities}
                 hideEmptyPlaceholder={isDraftHeroState || threadDetailLoading}
                 topFadeEnabled={!hasTimelineTopBanner}
                 loadEarlier={loadEarlierTurns}

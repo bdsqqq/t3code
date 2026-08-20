@@ -1,8 +1,6 @@
 import {
-  ORCHESTRATION_ACTIVITY_PAGE_DEFAULT_SIZE,
   ORCHESTRATION_WS_METHODS,
   type EnvironmentId as EnvironmentIdType,
-  type OrchestrationActivityPageInfo,
   type OrchestrationThread,
   type OrchestrationThreadDetailPage,
   type OrchestrationThreadDetailSnapshot,
@@ -18,7 +16,7 @@ import * as Ref from "effect/Ref";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
-import { AsyncResult, Atom } from "effect/unstable/reactivity";
+import { Atom } from "effect/unstable/reactivity";
 
 import { EnvironmentRegistry } from "../connection/registry.ts";
 import { connectionProjectionPhase } from "../connection/model.ts";
@@ -30,13 +28,7 @@ import { ThreadSnapshotLoader, type ThreadSnapshotWindow } from "./threadSnapsho
 import { parseThreadKey, threadKey } from "./entities.ts";
 import { applyThreadDetailEvent } from "./threadReducer.ts";
 import { THREAD_STATE_IDLE_TTL_MS } from "./threadRetention.ts";
-import {
-  applyThreadActivityPageResult,
-  EMPTY_THREAD_ACTIVITY_HISTORY,
-  initialThreadActivityHistory,
-  type ThreadActivityHistoryState,
-} from "./threadActivityPagination.ts";
-import { createEnvironmentCommand, followStreamInEnvironment } from "./runtime.ts";
+import { followStreamInEnvironment } from "./runtime.ts";
 import {
   EMPTY_ENVIRONMENT_THREAD_STATE,
   type EnvironmentThreadPageState,
@@ -198,11 +190,6 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
   const cachedThread = Option.map(cached, (snapshot) => snapshot.thread);
   const state = yield* SubscriptionRef.make<EnvironmentThreadState>({
     data: cachedThread,
-    activityPageInfo: Option.match(cached, {
-      onNone: () => null,
-      onSome: (snapshot) => snapshot.pageInfo ?? null,
-    }),
-    activityHistoryVersion: 0,
     status: statusWithoutLiveData(cachedThread),
     error: Option.none(),
     // A cached windowed snapshot restores its page cursor so "load earlier"
@@ -353,8 +340,6 @@ export const makeEnvironmentThreadState = Effect.fn("EnvironmentThreadState.make
     yield* Ref.update(historyEpoch, (epoch) => epoch + 1);
     yield* SubscriptionRef.set(state, {
       data: Option.none(),
-      activityPageInfo: null,
-      activityHistoryVersion: (current.activityHistoryVersion ?? 0) + 1,
       status: "deleted",
       error: Option.none(),
       page: Option.none(),
@@ -765,7 +750,7 @@ export function createEnvironmentThreadStateAtoms<R, E>(
     E
   >,
 ) {
-  const stateFamily = Atom.family((key: string) => {
+  const family = Atom.family((key: string) => {
     const { environmentId, threadId } = parseThreadKey(key);
     return runtime
       .atom(threadStateChanges(environmentId, threadId), {
@@ -777,91 +762,9 @@ export function createEnvironmentThreadStateAtoms<R, E>(
       );
   });
 
-  const loadedHistoryFamily = Atom.family((key: string) =>
-    Atom.make<ThreadActivityHistoryState>(EMPTY_THREAD_ACTIVITY_HISTORY).pipe(
-      Atom.setIdleTTL(THREAD_STATE_IDLE_TTL_MS),
-      Atom.withLabel(`environment-thread-loaded-activity-history:${key}`),
-    ),
-  );
-
-  const historyFamily = Atom.family((key: string) =>
-    Atom.make((get): ThreadActivityHistoryState => {
-      const threadState = Option.getOrElse(
-        AsyncResult.value(get(stateFamily(key))),
-        () => EMPTY_ENVIRONMENT_THREAD_STATE,
-      );
-      const initial = initialThreadActivityHistory(
-        threadState.activityPageInfo ?? null,
-        threadState.activityHistoryVersion ?? 0,
-      );
-      const loaded = get(loadedHistoryFamily(key));
-      return loaded.sourceVersion === initial.sourceVersion ? loaded : initial;
-    }).pipe(
-      Atom.setIdleTTL(THREAD_STATE_IDLE_TTL_MS),
-      Atom.withLabel(`environment-thread-activity-history:${key}`),
-    ),
-  );
-
-  const loadOlderActivities = createEnvironmentCommand(runtime, {
-    label: "environment-thread-activity-history:load-older",
-    concurrency: {
-      mode: "singleFlight" as const,
-      key: ({
-        environmentId,
-        input,
-      }: {
-        readonly environmentId: EnvironmentIdType;
-        readonly input: { readonly threadId: ThreadIdType };
-      }) => threadKey({ environmentId, threadId: input.threadId }),
-    },
-    execute: (input: { readonly threadId: ThreadIdType }, registry, environmentId) => {
-      const key = threadKey({ environmentId, threadId: input.threadId });
-      return Effect.gen(function* () {
-        const supervisor = yield* EnvironmentSupervisor;
-        const loader = yield* ThreadSnapshotLoader;
-        if (loader.loadActivityPage === undefined) return;
-        const current = registry.get(historyFamily(key));
-        const cursor = current.pageInfo?.nextCursor;
-        if (cursor === undefined || cursor === null || current.status === "loading") {
-          return;
-        }
-
-        const preparedOption = yield* SubscriptionRef.get(supervisor.prepared);
-        if (Option.isNone(preparedOption)) return;
-
-        registry.set(loadedHistoryFamily(key), {
-          ...current,
-          status: "loading",
-          error: null,
-        });
-
-        const result = yield* loader.loadActivityPage(preparedOption.value, input.threadId, {
-          cursor,
-          pageSize: ORCHESTRATION_ACTIVITY_PAGE_DEFAULT_SIZE,
-        });
-
-        registry.set(loadedHistoryFamily(key), applyThreadActivityPageResult(current, result));
-      }).pipe(
-        Effect.tapError((error) =>
-          Effect.sync(() => {
-            const current = registry.get(loadedHistoryFamily(key));
-            registry.set(loadedHistoryFamily(key), {
-              ...current,
-              status: "error",
-              error: error instanceof Error ? error.message : "Could not load older activity.",
-            });
-          }),
-        ),
-      );
-    },
-  });
-
   return {
     stateAtom: (environmentId: EnvironmentIdType, threadId: ThreadIdType) =>
-      stateFamily(threadKey({ environmentId, threadId })),
-    activityHistoryAtom: (environmentId: EnvironmentIdType, threadId: ThreadIdType) =>
-      historyFamily(threadKey({ environmentId, threadId })),
-    loadOlderActivities,
+      family(threadKey({ environmentId, threadId })),
   };
 }
 
@@ -871,7 +774,6 @@ export * from "./threadSnapshotHttp.ts";
 export * from "./composerPathSearch.ts";
 export * from "./threadCommands.ts";
 export * from "./threadDetail.ts";
-export * from "./threadActivityPagination.ts";
 export * from "./threadReducer.ts";
 export * from "./threadShell.ts";
 export * from "./threadState.ts";

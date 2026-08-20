@@ -19,9 +19,7 @@ import { OrchestrationEngineService } from "./Services/OrchestrationEngine.ts";
 import { ProjectionSnapshotQuery } from "./Services/ProjectionSnapshotQuery.ts";
 import {
   getClientThreadDetailSnapshot,
-  getClientThreadActivityPage,
   getExternalThreadDispatch,
-  getLegacyClientThreadDetailSnapshot,
 } from "./Services/ClientThreadRouter.ts";
 import { PiExternalThreadSource } from "../piNative/PiExternalThreadSource.ts";
 
@@ -105,63 +103,6 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
             return yield* failEnvironmentNotFound("thread_not_found");
           }
           return snapshot.value;
-        }),
-      )
-      .handle(
-        "legacyThreadSnapshot",
-        Effect.fn("environment.orchestration.legacyThreadSnapshot")(function* (args) {
-          yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          const snapshot = yield* getLegacyClientThreadDetailSnapshot(
-            args.params.threadId,
-            piExternalSource,
-            projectionSnapshotQuery,
-          ).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                if (cause.code === "thread_not_found") {
-                  return yield* failEnvironmentNotFound("thread_not_found");
-                }
-                return yield* failEnvironmentInternal(
-                  "orchestration_thread_snapshot_failed",
-                  cause,
-                );
-              }),
-            ),
-          );
-          if (Option.isNone(snapshot)) {
-            return yield* failEnvironmentNotFound("thread_not_found");
-          }
-          return snapshot.value;
-        }),
-      )
-      .handle(
-        "threadActivitiesPage",
-        Effect.fn("environment.orchestration.threadActivitiesPage")(function* (args) {
-          yield* annotateEnvironmentRequest(args.endpoint.name);
-          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          const page = yield* getClientThreadActivityPage(
-            args.params.threadId,
-            args.payload,
-            piExternalSource,
-            projectionSnapshotQuery,
-          ).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                if (cause.code === "thread_not_found") {
-                  return yield* failEnvironmentNotFound("thread_not_found");
-                }
-                return yield* failEnvironmentInternal(
-                  "orchestration_thread_snapshot_failed",
-                  cause,
-                );
-              }),
-            ),
-          );
-          if (Option.isNone(page)) {
-            return yield* failEnvironmentNotFound("thread_not_found");
-          }
-          return page.value;
         }),
       )
       .handle(

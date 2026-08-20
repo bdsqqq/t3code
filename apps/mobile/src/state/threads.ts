@@ -4,8 +4,6 @@ import {
   createEnvironmentThreadShellAtoms,
   createEnvironmentThreadStateAtoms,
   EMPTY_ENVIRONMENT_THREAD_STATE,
-  EMPTY_THREAD_ACTIVITY_HISTORY,
-  type ThreadActivityHistoryState,
   type EnvironmentThreadState,
   createThreadEnvironmentAtoms,
 } from "@t3tools/client-runtime/state/threads";
@@ -21,7 +19,6 @@ export const threadEnvironment = createThreadEnvironmentAtoms(connectionAtomRunt
 export const environmentThreads = createEnvironmentThreadStateAtoms(connectionAtomRuntime);
 export const environmentThreadDetails = createEnvironmentThreadDetailAtoms(
   environmentThreads.stateAtom,
-  environmentThreads.activityHistoryAtom,
 );
 export const environmentThreadShells = createEnvironmentThreadShellAtoms({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
@@ -45,19 +42,4 @@ export function useEnvironmentThread(
     AsyncResult.value(result),
     () => EMPTY_ENVIRONMENT_THREAD_STATE,
   ) as EnvironmentThreadState;
-}
-
-const EMPTY_THREAD_ACTIVITY_HISTORY_ATOM = Atom.make(EMPTY_THREAD_ACTIVITY_HISTORY).pipe(
-  Atom.withLabel("mobile-environment-thread-activity-history:empty"),
-);
-
-export function useEnvironmentThreadActivityHistory(
-  environmentId: EnvironmentId | null,
-  threadId: ThreadId | null,
-): ThreadActivityHistoryState {
-  return useAtomValue(
-    environmentId !== null && threadId !== null
-      ? environmentThreads.activityHistoryAtom(environmentId, threadId)
-      : EMPTY_THREAD_ACTIVITY_HISTORY_ATOM,
-  );
 }

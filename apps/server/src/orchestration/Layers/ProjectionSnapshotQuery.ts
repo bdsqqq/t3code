@@ -1,22 +1,15 @@
 import {
   ChatAttachment,
   CheckpointRef,
-  EventId,
   IsoDateTime,
   MessageId,
   NonNegativeInt,
   OrchestrationCheckpointFile,
-  ORCHESTRATION_ACTIVITY_PAGE_DEFAULT_SIZE,
-  ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
-  type OrchestrationActivityPageRequest,
-  type OrchestrationActivityPageResult,
-  type OrchestrationActivityPosition,
   OrchestrationProposedPlanId,
   OrchestrationReadModel,
   OrchestrationThreadSearchSource,
   OrchestrationShellSnapshot,
   OrchestrationThread,
-  OrchestrationThreadActivityTone,
   OrchestrationThreadDetailSnapshot,
   ProjectScript,
   TurnId,
@@ -571,71 +564,22 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     Result: ProjectionThreadActivityDbRowSchema,
     execute: () =>
       sql`
-        WITH ranked_activity_ids AS (
-          SELECT
-            activity_id,
-            thread_id,
-            sequence,
-            created_at,
-            ROW_NUMBER() OVER (
-              PARTITION BY thread_id
-              ORDER BY
-                CASE WHEN sequence IS NULL THEN 0 ELSE 1 END DESC,
-                sequence DESC,
-                created_at DESC,
-                activity_id DESC
-            ) AS thread_retention_rank
-          FROM projection_thread_activities
-        ),
-        per_thread_count_retained AS (
-          SELECT *
-          FROM ranked_activity_ids
-          WHERE thread_retention_rank <= ${MAX_THREAD_ACTIVITY_COUNT}
-        ),
-        globally_counted AS (
-          SELECT
-            *,
-            ROW_NUMBER() OVER (
-              ORDER BY created_at DESC, activity_id DESC
-            ) AS snapshot_retention_rank
-          FROM per_thread_count_retained
-        ),
-        snapshot_count_retained AS (
-          SELECT *
-          FROM globally_counted
-          WHERE snapshot_retention_rank <= ${MAX_FULL_SNAPSHOT_ACTIVITY_COUNT}
-        ),
-        payload_ranked AS (
-          SELECT
-            retained.*,
-            SUM(length(CAST(activity.payload_json AS BLOB))) OVER (
-              ORDER BY retained.created_at DESC, retained.activity_id DESC
-            ) AS snapshot_payload_bytes
-          FROM snapshot_count_retained AS retained
-          INNER JOIN projection_thread_activities AS activity
-            ON activity.activity_id = retained.activity_id
-        )
         SELECT
-          activity.activity_id AS "activityId",
-          activity.thread_id AS "threadId",
-          activity.turn_id AS "turnId",
-          activity.tone,
-          activity.kind,
-          activity.summary,
-          activity.payload_json AS "payload",
-          activity.sequence,
-          activity.applied_sequence AS "appliedSequence",
-          activity.created_at AS "createdAt"
-        FROM payload_ranked AS retained
-        INNER JOIN projection_thread_activities AS activity
-          ON activity.activity_id = retained.activity_id
-        WHERE retained.snapshot_payload_bytes <= ${MAX_FULL_SNAPSHOT_ACTIVITY_PAYLOAD_BYTES}
+          activity_id AS "activityId",
+          thread_id AS "threadId",
+          turn_id AS "turnId",
+          tone,
+          kind,
+          summary,
+          payload_json AS "payload",
+          sequence,
+          created_at AS "createdAt"
+        FROM projection_thread_activities
         ORDER BY
-          activity.thread_id ASC,
-          CASE WHEN activity.sequence IS NULL THEN 0 ELSE 1 END ASC,
-          activity.sequence ASC,
-          activity.created_at ASC,
-          activity.activity_id ASC
+          thread_id ASC,
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
       `,
   });
 
@@ -1095,10 +1039,9 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
           LIMIT ${THREAD_DETAIL_ACTIVITY_LIMIT}
         ) AS recent_activities
         ORDER BY
-          CASE WHEN activity.sequence IS NULL THEN 0 ELSE 1 END ASC,
-          activity.sequence ASC,
-          activity.created_at ASC,
-          activity.activity_id ASC
+          sequence ASC,
+          created_at ASC,
+          activity_id ASC
       `,
   });
 
@@ -2868,209 +2811,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
         ),
       );
 
-  const readThreadActivityPage = (
-    threadId: ThreadId,
-    request: OrchestrationActivityPageRequest,
-    initialAsOfSequence?: number,
-  ): Effect.Effect<Option.Option<OrchestrationActivityPageResult>, ProjectionRepositoryError> =>
-    Effect.gen(function* () {
-      const thread = yield* getActiveThreadRowById({ threadId }).pipe(
-        Effect.mapError(
-          toPersistenceSqlOrDecodeError(
-            "ProjectionSnapshotQuery.getThreadActivityPage:getThread",
-            "ProjectionSnapshotQuery.getThreadActivityPage:decodeThread",
-          ),
-        ),
-      );
-      if (Option.isNone(thread)) return Option.none<OrchestrationActivityPageResult>();
-      const snapshot = yield* getSnapshotSequence();
-      const asOfSequence =
-        request.cursor.kind === "initial"
-          ? (initialAsOfSequence ?? snapshot.snapshotSequence)
-          : request.cursor.asOfSequence;
-      const anchor = request.cursor.kind === "before" ? request.cursor.position : null;
-
-      const floorRows = yield* sql<OrchestrationActivityPosition>`
-            SELECT sequence, created_at AS "createdAt", activity_id AS "activityId"
-            FROM projection_thread_activities
-            WHERE thread_id = ${threadId} AND applied_sequence <= ${asOfSequence}
-            ORDER BY sequence ASC, created_at ASC, activity_id ASC LIMIT 1
-          `.pipe(
-        Effect.mapError(
-          toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:floor"),
-        ),
-      );
-      const retentionFloor = floorRows[0]
-        ? { kind: "oldest-available" as const, position: floorRows[0] }
-        : { kind: "empty" as const };
-
-      if (anchor !== null) {
-        const exact = yield* sql<{ readonly present: number }>`
-              SELECT EXISTS(
-                SELECT 1 FROM projection_thread_activities
-                WHERE thread_id = ${threadId} AND activity_id = ${anchor.activityId}
-                  AND sequence IS ${anchor.sequence} AND created_at = ${anchor.createdAt}
-                  AND applied_sequence <= ${asOfSequence}
-              ) AS present
-            `.pipe(
-          Effect.mapError(
-            toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:anchor"),
-          ),
-        );
-        const cursorFloor =
-          request.cursor.kind === "before" ? request.cursor.retentionFloor : retentionFloor;
-        const retentionFloorChanged =
-          cursorFloor.kind !== retentionFloor.kind ||
-          (cursorFloor.kind === "oldest-available" &&
-            retentionFloor.kind === "oldest-available" &&
-            (cursorFloor.position.activityId !== retentionFloor.position.activityId ||
-              cursorFloor.position.sequence !== retentionFloor.position.sequence ||
-              cursorFloor.position.createdAt !== retentionFloor.position.createdAt));
-        if (
-          exact[0]?.present !== 1 ||
-          asOfSequence > snapshot.snapshotSequence ||
-          retentionFloorChanged
-        ) {
-          return Option.some({ kind: "cursor-expired", asOfSequence, retentionFloor });
-        }
-      }
-
-      const rows = yield* SqlSchema.findAll({
-        Request: Schema.Void,
-        Result: ActivityPageDbRow,
-        execute: () => sql`
-            WITH ranked_ids AS (
-              SELECT activity_id, sequence, created_at
-              FROM projection_thread_activities
-              WHERE thread_id = ${threadId}
-                AND applied_sequence <= ${asOfSequence}
-                AND (${anchor === null ? 1 : 0} = 1 OR
-                  CASE WHEN sequence IS NULL THEN 0 ELSE 1 END < ${anchor?.sequence === null ? 0 : 1}
-                  OR (CASE WHEN sequence IS NULL THEN 0 ELSE 1 END = ${anchor?.sequence === null ? 0 : 1}
-                    AND ((sequence IS NOT NULL AND sequence < ${anchor?.sequence ?? 0})
-                      OR ((sequence IS ${anchor?.sequence ?? null})
-                        AND (created_at < ${anchor?.createdAt ?? ""}
-                          OR (created_at = ${anchor?.createdAt ?? ""} AND activity_id < ${anchor?.activityId ?? ""}))))))
-              ORDER BY sequence DESC, created_at DESC, activity_id DESC
-              LIMIT ${request.pageSize + 1}
-            ), payload_sizes AS (
-              SELECT ids.*, length(CAST(a.payload_json AS BLOB)) AS payload_bytes,
-                SUM(length(CAST(a.payload_json AS BLOB))) OVER (
-                  ORDER BY ids.sequence DESC, ids.created_at DESC, ids.activity_id DESC
-                ) AS cumulative_bytes
-              FROM ranked_ids ids JOIN projection_thread_activities a USING (activity_id)
-            )
-            SELECT a.activity_id AS "activityId", a.thread_id AS "threadId",
-              a.turn_id AS "turnId", a.tone, a.kind, a.summary,
-              CASE WHEN sizes.cumulative_bytes <= ${ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES}
-                THEN a.payload_json ELSE NULL END AS "payloadJson",
-              sizes.payload_bytes AS "payloadBytes", a.sequence, a.created_at AS "createdAt"
-            FROM payload_sizes sizes JOIN projection_thread_activities a USING (activity_id)
-            WHERE sizes.cumulative_bytes - sizes.payload_bytes <= ${ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES}
-            ORDER BY a.sequence DESC, a.created_at DESC, a.activity_id DESC
-            LIMIT ${request.pageSize}
-          `,
-      })(undefined).pipe(
-        Effect.mapError(
-          toPersistenceSqlOrDecodeError(
-            "ProjectionSnapshotQuery.getThreadActivityPage:list",
-            "ProjectionSnapshotQuery.getThreadActivityPage:decode",
-          ),
-        ),
-      );
-      const omissions: Array<{
-        activityId: (typeof rows)[number]["activityId"];
-        originalPayloadBytes: number;
-        limitBytes: number;
-        reason: "page-payload-byte-limit";
-      }> = [];
-      const activities = rows
-        .map((row) => {
-          const payload =
-            row.payloadJson === null
-              ? {
-                  kind: "omitted" as const,
-                  reason: "page-payload-byte-limit" as const,
-                  originalPayloadBytes: row.payloadBytes,
-                  limitBytes: ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
-                }
-              : (JSON.parse(row.payloadJson) as unknown);
-          if (row.payloadJson === null)
-            omissions.push({
-              activityId: row.activityId,
-              originalPayloadBytes: row.payloadBytes,
-              limitBytes: ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
-              reason: "page-payload-byte-limit",
-            });
-          return {
-            id: row.activityId,
-            tone: row.tone,
-            kind: row.kind,
-            summary: row.summary,
-            payload,
-            turnId: row.turnId,
-            createdAt: row.createdAt,
-            ...(row.sequence === null ? {} : { sequence: row.sequence }),
-          };
-        })
-        .reverse();
-      const oldest = rows.at(-1);
-      const hasMore =
-        oldest !== undefined &&
-        retentionFloor.kind === "oldest-available" &&
-        (oldest.activityId !== retentionFloor.position.activityId ||
-          oldest.sequence !== retentionFloor.position.sequence ||
-          oldest.createdAt !== retentionFloor.position.createdAt);
-      const nextCursor =
-        hasMore && oldest
-          ? {
-              kind: "before" as const,
-              asOfSequence,
-              position: {
-                sequence: oldest.sequence,
-                createdAt: oldest.createdAt,
-                activityId: oldest.activityId,
-              },
-              retentionFloor,
-              historyRevision: null,
-            }
-          : null;
-      return Option.some({
-        kind: "page",
-        activities,
-        pageInfo: {
-          asOfSequence,
-          nextCursor,
-          retentionFloor,
-          limits: {
-            pageSize: request.pageSize,
-            payloadBytes: ORCHESTRATION_ACTIVITY_PAGE_MAX_PAYLOAD_BYTES,
-          },
-          payloadBytes: rows.reduce(
-            (n, row) => n + (row.payloadJson === null ? 0 : row.payloadBytes),
-            0,
-          ),
-          omittedPayloads: omissions,
-        },
-      });
-    });
-
-  const getThreadActivityPage: ProjectionSnapshotQueryShape["getThreadActivityPage"] = (
-    threadId,
-    request,
-  ) =>
-    sql
-      .withTransaction(readThreadActivityPage(threadId, request))
-      .pipe(
-        Effect.mapError((error) =>
-          isPersistenceError(error)
-            ? error
-            : toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:transaction")(
-                error,
-              ),
-        ),
-      );
-
   return {
     getCommandReadModel,
     getSnapshot,
@@ -3087,8 +2827,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
     getThreadShellById,
     getThreadDetailById,
     getThreadDetailSnapshot,
-    getThreadDetailPageSnapshot,
-    getThreadActivityPage,
   } satisfies ProjectionSnapshotQueryShape;
 });
 

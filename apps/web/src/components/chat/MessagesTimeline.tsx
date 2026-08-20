@@ -50,7 +50,6 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   EyeIcon,
-  GitBranchIcon,
   GlobeIcon,
   HammerIcon,
   MessageCircleIcon,
@@ -237,9 +236,6 @@ interface MessagesTimelineProps {
   liveFollowEnabled: boolean;
   onIsAtEndChange: (isAtEnd: boolean) => void;
   onManualNavigation: () => void;
-  hasOlderActivities?: boolean;
-  isLoadingOlderActivities?: boolean;
-  onLoadOlderActivities?: () => void;
   hideEmptyPlaceholder?: boolean;
   topFadeEnabled?: boolean;
   /** Non-null when older turns exist beyond the loaded window. */
@@ -279,9 +275,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   liveFollowEnabled,
   onIsAtEndChange,
   onManualNavigation,
-  hasOlderActivities,
-  isLoadingOlderActivities,
-  onLoadOlderActivities,
   hideEmptyPlaceholder = false,
   topFadeEnabled = false,
   loadEarlier = null,
@@ -430,8 +423,6 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   );
   const [minimapHasPersistentGutter, setMinimapHasPersistentGutter] = useState(false);
   const [minimapHitStripWidth, setMinimapHitStripWidth] = useState(0);
-  const previousScrollTopRef = useRef<number | null>(null);
-  const olderActivityLoadArmedRef = useRef(false);
   const handleAnchorReady = useCallback(
     (info: { anchorIndex: number | undefined }) => {
       if (anchorMessageId !== null && info.anchorIndex !== undefined) {
@@ -453,29 +444,12 @@ export const MessagesTimeline = memo(function MessagesTimeline({
     if (isAtEnd !== undefined) {
       onIsAtEndChange(isAtEnd);
     }
-    if (!state) {
+    if (!state || minimapItems.length === 0) {
       return;
     }
 
     const scrollTop = state.scroll ?? 0;
     const scrollBottom = scrollTop + (state.scrollLength ?? 0);
-    const previousScrollTop = previousScrollTopRef.current;
-    previousScrollTopRef.current = scrollTop;
-    if (previousScrollTop !== null && scrollTop < previousScrollTop) {
-      olderActivityLoadArmedRef.current = true;
-    }
-    if (
-      olderActivityLoadArmedRef.current &&
-      scrollTop < 600 &&
-      hasOlderActivities === true &&
-      isLoadingOlderActivities !== true
-    ) {
-      olderActivityLoadArmedRef.current = false;
-      onLoadOlderActivities?.();
-    }
-    if (minimapItems.length === 0) {
-      return;
-    }
 
     for (const item of minimapItems) {
       const strip = minimapStripMap.get(item.id);
@@ -594,16 +568,7 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   return (
     <TimelineRowCtx value={sharedState}>
       <TimelineRowActivityCtx value={activityState}>
-        <div
-          ref={setTimelineViewportElement}
-          className="relative h-full min-h-0"
-          onWheelCapture={(event) => {
-            if (event.deltaY < 0) {
-              olderActivityLoadArmedRef.current = true;
-              handleScroll();
-            }
-          }}
-        >
+        <div ref={setTimelineViewportElement} className="relative h-full min-h-0">
           <LegendList<MessagesTimelineRow>
             ref={listRef}
             data={rows}
@@ -986,11 +951,6 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       data-timeline-row-kind={row.kind}
       data-message-id={row.kind === "message" ? row.message.id : undefined}
       data-message-role={row.kind === "message" ? row.message.role : undefined}
-      data-message-surface={
-        row.kind === "message" && row.message.role === "system"
-          ? (row.message.surface?.kind ?? "provider")
-          : undefined
-      }
     >
       {row.kind === "work" ? (
         <WorkGroupSection
@@ -1004,9 +964,6 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       {row.kind === "message" && row.message.role === "user" ? <UserTimelineRow row={row} /> : null}
       {row.kind === "message" && row.message.role === "assistant" ? (
         <AssistantTimelineRow row={row} />
-      ) : null}
-      {row.kind === "message" && row.message.role === "system" ? (
-        <SystemTimelineRow row={row} />
       ) : null}
       {row.kind === "proposed-plan" ? <ProposedPlanTimelineRow row={row} /> : null}
       {row.kind === "turn-plan" ? <TurnPlanTimelineRow row={row} /> : null}
@@ -1204,40 +1161,6 @@ function AssistantTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "mess
         ) : null}
       </div>
     </>
-  );
-}
-
-function SystemTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" }> }) {
-  const ctx = use(TimelineRowCtx);
-  const surface = row.message.surface ?? { kind: "provider" as const, label: "System message" };
-  const Icon =
-    surface.kind === "compaction"
-      ? ZapIcon
-      : surface.kind === "branch-summary"
-        ? GitBranchIcon
-        : surface.kind === "custom"
-          ? MessageCircleIcon
-          : BotIcon;
-
-  return (
-    <section
-      className="mx-1 rounded-lg border border-border/60 bg-muted/25 px-3 py-2.5"
-      aria-label={surface.label}
-    >
-      <div className="mb-1.5 flex items-center gap-1.5 text-muted-foreground">
-        <Icon className="size-3.5 shrink-0" aria-hidden />
-        <p className="font-medium text-xs">{surface.label}</p>
-      </div>
-      {row.message.text.trim().length > 0 ? (
-        <ChatMarkdown
-          text={row.message.text}
-          cwd={ctx.markdownCwd}
-          threadRef={ctx.threadRef ?? undefined}
-          isStreaming={false}
-          skills={ctx.skills}
-        />
-      ) : null}
-    </section>
   );
 }
 

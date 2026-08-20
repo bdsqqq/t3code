@@ -3,7 +3,7 @@ import {
   AuthAdministrativeScopes,
   EnvironmentHttpApi,
   EnvironmentHttpCommonError,
-  type OrchestrationShellSnapshot,
+  type OrchestrationReadModel,
   ProjectId,
   type ClientOrchestrationCommand,
 } from "@t3tools/contracts";
@@ -256,7 +256,7 @@ const resolveProjectTitle = Effect.fn("resolveProjectTitle")(function* (
 });
 
 const findActiveProjectTarget = Effect.fn("findActiveProjectTarget")(function* (input: {
-  readonly snapshot: OrchestrationShellSnapshot;
+  readonly snapshot: OrchestrationReadModel;
   readonly identifier: string;
 }) {
   const trimmedIdentifier = input.identifier.trim();
@@ -267,7 +267,7 @@ const findActiveProjectTarget = Effect.fn("findActiveProjectTarget")(function* (
     });
   }
 
-  const activeProjects = input.snapshot.projects;
+  const activeProjects = input.snapshot.projects.filter((project) => project.deletedAt === null);
   const exactIdMatch = activeProjects.find((project) => project.id === trimmedIdentifier);
   if (exactIdMatch) {
     return {
@@ -311,7 +311,7 @@ const findActiveProjectTarget = Effect.fn("findActiveProjectTarget")(function* (
 const fetchLiveOrchestrationSnapshot = (origin: string, bearerToken: string) =>
   Effect.gen(function* () {
     const client = yield* makeLiveServerClient(origin);
-    return yield* client.orchestration.shellSnapshot({
+    return yield* client.orchestration.snapshot({
       headers: { authorization: `Bearer ${bearerToken}` },
     });
   }).pipe(
@@ -377,7 +377,7 @@ const tryResolveLiveProjectExecutionMode = Effect.fn("tryResolveLiveProjectExecu
 const runProjectMutation = Effect.fn("runProjectMutation")(function* (
   flags: CliAuthLocationFlags,
   run: (input: {
-    readonly snapshot: OrchestrationShellSnapshot;
+    readonly snapshot: OrchestrationReadModel;
     readonly dispatch: (
       command: ProjectCliDispatchCommand,
     ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
@@ -456,14 +456,14 @@ const projectAddCommand = Command.make("add", {
         snapshot,
         dispatch,
       }: {
-        readonly snapshot: OrchestrationShellSnapshot;
+        readonly snapshot: OrchestrationReadModel;
         readonly dispatch: (
           command: ProjectCliDispatchCommand,
         ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
       }) {
         const workspaceRoot = yield* normalizeWorkspaceRootForProjectCommand(flags.workspaceRoot);
         const existingProject = snapshot.projects.find(
-          (project) => project.workspaceRoot === workspaceRoot,
+          (project) => project.deletedAt === null && project.workspaceRoot === workspaceRoot,
         );
         if (existingProject) {
           return yield* new ProjectAlreadyExistsError({
@@ -508,7 +508,7 @@ const projectRemoveCommand = Command.make("remove", {
         snapshot,
         dispatch,
       }: {
-        readonly snapshot: OrchestrationShellSnapshot;
+        readonly snapshot: OrchestrationReadModel;
         readonly dispatch: (
           command: ProjectCliDispatchCommand,
         ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
@@ -544,7 +544,7 @@ const projectRenameCommand = Command.make("rename", {
         snapshot,
         dispatch,
       }: {
-        readonly snapshot: OrchestrationShellSnapshot;
+        readonly snapshot: OrchestrationReadModel;
         readonly dispatch: (
           command: ProjectCliDispatchCommand,
         ) => Effect.Effect<void, Error, FileSystem.FileSystem | HttpClient.HttpClient | Path.Path>;
