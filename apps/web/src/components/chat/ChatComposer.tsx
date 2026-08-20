@@ -440,10 +440,6 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
     isComplete: boolean;
   } | null;
   isRunning: boolean;
-  canSend: boolean;
-  canInterrupt: boolean;
-  canStop: boolean;
-  streamingBehaviors: ReadonlyArray<"steer" | "followUp">;
   showPlanFollowUpPrompt: boolean;
   promptHasText: boolean;
   isSendBusy: boolean;
@@ -455,8 +451,6 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   showSendWhileRunning?: boolean;
   onPreviousPendingQuestion: () => void;
   onInterrupt: () => void;
-  onStop: () => void;
-  onStreamingBehavior: (behavior: "steer" | "followUp") => void;
   onImplementPlanInNewThread: () => void;
 }) {
   return (
@@ -470,19 +464,10 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
       {props.isPreparingWorktree ? (
         <span className="text-secondary-label text-xs">Preparing worktree...</span>
       ) : null}
-      {props.pendingComposerIntentCount > 0 ? (
-        <span className="text-muted-foreground/70 text-xs">
-          {props.pendingComposerIntentCount} queued
-        </span>
-      ) : null}
       <ComposerPrimaryActions
         compact={props.compact}
         pendingAction={props.pendingAction}
         isRunning={props.isRunning}
-        canSend={props.canSend}
-        canInterrupt={props.canInterrupt}
-        canStop={props.canStop}
-        streamingBehaviors={props.streamingBehaviors}
         showPlanFollowUpPrompt={props.showPlanFollowUpPrompt}
         promptHasText={props.promptHasText}
         isSendBusy={props.isSendBusy}
@@ -495,8 +480,6 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         showSendWhileRunning={props.showSendWhileRunning ?? false}
         onPreviousPendingQuestion={props.onPreviousPendingQuestion}
         onInterrupt={props.onInterrupt}
-        onStop={props.onStop}
-        onStreamingBehavior={props.onStreamingBehavior}
         onImplementPlanInNewThread={props.onImplementPlanInNewThread}
       />
     </>
@@ -633,9 +616,7 @@ export interface ChatComposerProps {
 
   // Callbacks
   onSend: (e?: { preventDefault: () => void }) => void;
-  onSendWithStreamingBehavior: (behavior: "steer" | "followUp") => void;
   onInterrupt: () => void;
-  onStopSession: () => void;
   onImplementPlanInNewThread: () => void;
   onRespondToApproval: (
     requestId: ApprovalRequestId,
@@ -720,7 +701,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     composerElementContextsRef,
     onSend,
     onInterrupt,
-    onStopSession,
     onImplementPlanInNewThread,
     onRespondToApproval,
     onSelectActivePendingUserInputOption,
@@ -2964,10 +2944,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       compact
                       pendingAction={pendingPrimaryAction}
                       isRunning={false}
-                      canSend
-                      canInterrupt
-                      canStop={false}
-                      streamingBehaviors={[]}
                       showPlanFollowUpPrompt={false}
                       promptHasText={false}
                       isSendBusy={isSendBusy}
@@ -2983,8 +2959,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       preserveComposerFocusOnPointerDown
                       onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                       onInterrupt={handleInterruptPrimaryAction}
-                      onStop={() => undefined}
-                      onStreamingBehavior={() => undefined}
                       onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
                     />
                   ) : null}
@@ -3387,6 +3361,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     <CompactComposerControlsMenu
                       interactionMode={interactionMode}
                       runtimeMode={runtimeMode}
+                      showRuntimeMode={canChangeRuntimeMode}
                       showInteractionModeToggle={composerProviderControls.showInteractionModeToggle}
                       traitsMenuContent={providerTraitsMenuContent}
                       onToggleInteractionMode={toggleInteractionMode}
@@ -3404,6 +3379,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                         </>
                       ) : null}
                       <ComposerFooterModeControls
+                        allowChangeRuntimeMode={canChangeRuntimeMode}
                         showInteractionModeToggle={
                           composerProviderControls.showInteractionModeToggle
                         }
@@ -3450,8 +3426,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                     showSendWhileRunning={isMobileViewport}
                     onPreviousPendingQuestion={onPreviousActivePendingUserInputQuestion}
                     onInterrupt={handleInterruptPrimaryAction}
-                    onStop={() => undefined}
-                    onStreamingBehavior={() => undefined}
                     onImplementPlanInNewThread={handleImplementPlanInNewThreadPrimaryAction}
                   />
                 </div>

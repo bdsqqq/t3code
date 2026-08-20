@@ -2,6 +2,19 @@ diff --git a/dist/index.js b/dist/index.js
 index e7e087bcb6f29d0d8f36cd558e0183bc0f162fcb..7260cd8dafc749344c70bb8b09b494cff7d5736c 100644
 --- a/dist/index.js
 +++ b/dist/index.js
+@@ -164,10 +164,11 @@ function buildStyleBlock(font, hasMonoFont) {
+     --_group-hdr:     color-mix(in srgb, var(--fg) ${MIX.groupHeader}%, var(--bg));
+     --_inner-stroke:  color-mix(in srgb, var(--fg) ${MIX.innerStroke}%, var(--bg));
+     --_key-badge:     color-mix(in srgb, var(--fg) ${MIX.keyBadge}%, var(--bg));`;
++  const fontFamily = font.startsWith("var(") ? font : `'${font}'`;
+   return [
+     "<style>",
+     `  ${fontImports.join("\n  ")}`,
+-    `  text { font-family: '${font}', system-ui, sans-serif; }`,
++    `  text { font-family: ${fontFamily}, system-ui, sans-serif; }`,
+     ...hasMonoFont ? [`  .mono { font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', ui-monospace, monospace; }`] : [],
+     `  svg {${derivedVars}`,
+     `  }`,
 @@ -5940,22 +5940,55 @@ function ensureElk() {
    if (elk) return;
    const pending = [];
@@ -159,3 +172,16 @@ index 6406f3d38edf5bf4dbdf18237e704e9fe11ce7f5..5c8b06efc8b88bc4d4da28b933bc8830
    // Flush captured callbacks synchronously — registers layout algorithms
    pending.forEach(fn => fn())
  
+diff --git a/src/theme.ts b/src/theme.ts
+--- a/src/theme.ts
++++ b/src/theme.ts
+@@ -263,7 +263,8 @@ export function buildStyleBlock(font: string, hasMonoFont: boolean): string {
++  const fontFamily = font.startsWith('var(') ? font : `'${font}'`
+   return [
+     '<style>',
+     `  ${fontImports.join('\n  ')}`,
+-    `  text { font-family: '${font}', system-ui, sans-serif; }`,
++    `  text { font-family: ${fontFamily}, system-ui, sans-serif; }`,
+     ...(hasMonoFont ? [`  .mono { font-family: 'JetBrains Mono', 'SF Mono', 'Fira Code', ui-monospace, monospace; }`] : []),
+     `  svg {${derivedVars}`,
+     `  }`,

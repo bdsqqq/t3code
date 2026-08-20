@@ -154,7 +154,7 @@ export function renderSafeMermaidSvg(code: string, namespace: string): string {
   // source validated above is exactly the source its parser and renderer receive.
   const rendered = renderMermaidSVG(source.replaceAll("&", "&amp;"), {
     ...MERMAID_THEME,
-    font: "DM Sans Variable",
+    font: "var(--font-sans)",
     transparent: true,
     interactive: false,
   });

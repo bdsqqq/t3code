@@ -94,8 +94,9 @@ export const makePiRpcTransport = Effect.fn("PiRpcClient.makeTransport")(functio
   const writeLock = yield* Semaphore.make(1);
   const closed = yield* Ref.make(false);
   const scope = yield* Scope.Scope;
-  const decodeJson = Schema.decodeUnknownEffect(Schema.UnknownFromJsonString);
-  const encodeJson = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
+  const jsonString = Schema.fromJsonString(Schema.Unknown);
+  const decodeJson = Schema.decodeUnknownEffect(jsonString);
+  const encodeJson = Schema.encodeUnknownEffect(jsonString);
   const decodeState = (data: unknown) =>
     Schema.decodeUnknownEffect(PiRpcState)(data).pipe(
       Effect.mapError(

@@ -541,6 +541,8 @@ export const OrchestrationThreadShell = Schema.Struct({
       }),
     ),
   ),
+  backing: Schema.optional(ExternalThreadBacking),
+  pendingComposerIntentCount: Schema.optional(NonNegativeInt),
 });
 export type OrchestrationThreadShell = typeof OrchestrationThreadShell.Type;
 

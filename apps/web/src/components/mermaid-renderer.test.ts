@@ -15,6 +15,7 @@ describe("renderSafeMermaidSvg", () => {
     );
     expect(svg).toContain('id="diagram-one-arrowhead"');
     expect(svg).toContain('data-id="A"');
+    expect(svg).toContain("font-family: var(--font-sans)");
     expect(svg).not.toContain("fonts.googleapis.com");
   });
 

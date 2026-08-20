@@ -42,7 +42,6 @@ export interface ProviderServiceShape {
   readonly startSession: (
     threadId: ThreadId,
     input: ProviderSessionStartInput,
-    options?: { readonly activeSession: "reuse" | "replace" },
   ) => Effect.Effect<ProviderSession, ProviderServiceError>;
 
   /**

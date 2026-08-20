@@ -150,6 +150,8 @@ describe("ProviderCommandReactor", () => {
     readonly requiresNewThreadForModelChange?: boolean;
     readonly titleRegenerationCompletionDispatchFailures?: number;
     readonly titleRegenerationBeforeStart?: "one" | "two";
+    readonly pendingTurnBeforeStart?: boolean;
+    readonly pendingTurnModelSelection?: ModelSelection;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -414,6 +416,7 @@ describe("ProviderCommandReactor", () => {
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
+      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(NodeServices.layer),
     );
     runtime = ManagedRuntime.make(layer);
@@ -484,6 +487,44 @@ describe("ProviderCommandReactor", () => {
         }),
       );
     }
+    if (input?.pendingTurnBeforeStart === true) {
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("cmd-plan-mode-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          interactionMode: "plan",
+          createdAt: now,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-turn-start-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: asMessageId("user-message-before-reactor-start"),
+            role: "user",
+            text: "resume after restart",
+            attachments: [],
+          },
+          modelSelection: input.pendingTurnModelSelection ?? modelSelection,
+          titleSeed: "Thread",
+          interactionMode: "plan",
+          runtimeMode: "approval-required",
+          createdAt: now,
+        }),
+      );
+      await Effect.runPromise(
+        engine.dispatch({
+          type: "thread.interaction-mode.set",
+          commandId: CommandId.make("cmd-default-mode-before-reactor-start"),
+          threadId: ThreadId.make("thread-1"),
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          createdAt: now,
+        }),
+      );
+    }
 
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
@@ -544,12 +585,55 @@ describe("ProviderCommandReactor", () => {
       },
       runtimeMode: "approval-required",
     });
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      operationId: CommandId.make("cmd-turn-start-1"),
+    });
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.status).toBe("starting");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
+  });
+
+  it("replays a pending turn with its stable operation identity", async () => {
+    const harness = await createHarness({ pendingTurnBeforeStart: true });
+
+    await waitFor(() => harness.startSession.mock.calls.length === 1);
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+      operationId: CommandId.make("cmd-turn-start-before-reactor-start"),
+      input: "resume after restart",
+      interactionMode: "plan",
+    });
+  });
+
+  it("replays fenced managed Pi admission without opening a replacement session", async () => {
+    const piModelSelection = {
+      instanceId: ProviderInstanceId.make("pi"),
+      model: "openai/gpt-5",
+    };
+    const harness = await createHarness({
+      threadModelSelection: piModelSelection,
+      pendingTurnBeforeStart: true,
+      pendingTurnModelSelection: piModelSelection,
+    });
+
+    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
+    await harness.drain();
+
+    expect(harness.startSession).not.toHaveBeenCalled();
+    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
+      threadId: ThreadId.make("thread-1"),
+      operationId: CommandId.make("cmd-turn-start-before-reactor-start"),
+      input: "resume after restart",
+      modelSelection: piModelSelection,
+      interactionMode: "plan",
+    });
+    expect(harness.sendTurn.mock.calls[0]?.[0]).not.toHaveProperty("admissionMode");
   });
 
   effectIt.effect("projects starting before a slow provider session finishes", () =>

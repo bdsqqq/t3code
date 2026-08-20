@@ -2,6 +2,7 @@ import type {
   ClientOrchestrationCommand,
   DispatchResult,
   OrchestrationSubscribeThreadInput,
+  OrchestrationThreadDetailWindow,
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadStreamItem,
   ThreadId,
@@ -32,12 +33,14 @@ export function getClientThreadDetailSnapshot(
   threadId: ThreadId,
   external: ExternalSource,
   internal: ProjectionSnapshotQuery["Service"],
+  window?: OrchestrationThreadDetailWindow,
 ): Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, OrchestrationGetSnapshotError> {
   if (isPiExternalThreadId(threadId)) {
     return Option.match(external, {
       onNone: () => Effect.fail(missingExternalSource()),
       onSome: (source) =>
         source.threadSnapshot(threadId).pipe(
+          Effect.map(projectThreadDetailSnapshot),
           Effect.map(Option.some),
           Effect.mapError(
             (cause) =>
@@ -50,7 +53,7 @@ export function getClientThreadDetailSnapshot(
         ),
     });
   }
-  return internal.getThreadDetailSnapshot(threadId).pipe(
+  return internal.getThreadDetailSnapshot(threadId, window).pipe(
     Effect.map(Option.map(projectThreadDetailSnapshot)),
     Effect.mapError(
       (cause) =>

@@ -3,6 +3,7 @@ import {
   ProjectId,
   ThreadId,
   type ClientOrchestrationCommand,
+  type OrchestrationThreadDetailSnapshot,
 } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -24,8 +25,9 @@ const snapshot = {
   thread: {
     id: externalThreadId,
     projectId: ProjectId.make("project-1"),
+    activities: [],
   },
-} as never;
+} as unknown as OrchestrationThreadDetailSnapshot;
 
 const externalSource = {
   threadSnapshot: () => Effect.succeed(snapshot),
@@ -46,7 +48,10 @@ describe("ClientThreadRouter", () => {
         Option.some(externalSource),
         internal,
       );
-      expect(Option.getOrThrow(detail)).toBe(snapshot);
+      expect(Option.getOrThrow(detail)).toMatchObject({
+        snapshotSequence: snapshot.snapshotSequence,
+        thread: { id: externalThreadId, activities: [] },
+      });
 
       const subscription = getExternalThreadSubscription(
         { threadId: externalThreadId, requestCompletionMarker: true },

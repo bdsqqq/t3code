@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("039_ProjectionPendingTurnAdmissionProtocol", (it) => {
+layer("045_ProjectionPendingTurnAdmissionProtocol", (it) => {
   it.effect("marks only pending turns accepted by the managed admission build", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 38 });
+      yield* runMigrations({ toMigrationInclusive: 44 });
       yield* sql`
         INSERT INTO projection_turns (
           thread_id,
@@ -71,7 +71,7 @@ layer("039_ProjectionPendingTurnAdmissionProtocol", (it) => {
           )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 39 });
+      yield* runMigrations({ toMigrationInclusive: 45 });
 
       const pendingTurns = yield* sql<{
         readonly thread_id: string;

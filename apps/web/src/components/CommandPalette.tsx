@@ -140,7 +140,11 @@ import {
   ThreadCommandSubtitle,
 } from "./ThreadCommandSubtitle";
 import { ThreadRowLeadingStatus, ThreadRowTrailingStatus } from "./ThreadStatusIndicators";
-import { primaryServerKeybindingsAtom, primaryServerProvidersAtom } from "../state/server";
+import {
+  environmentServerConfigsAtom,
+  primaryServerKeybindingsAtom,
+  primaryServerProvidersAtom,
+} from "../state/server";
 import {
   deriveProviderInstanceEntries,
   resolveDefaultProviderModelSelection,
@@ -153,6 +157,31 @@ import { Kbd, KbdGroup } from "./ui/kbd";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "./ui/tooltip";
 import { ComposerHandleContext, useComposerHandleContext } from "../composerHandleContext";
+
+const NATIVE_PI_CREATE_COMMAND_PREFIX = "t3-native-pi-create:";
+function nativePiCreateCommandId(projectKey: string): CommandId | null {
+  const key = `${NATIVE_PI_CREATE_COMMAND_PREFIX}${projectKey}`;
+  try {
+    const existing = window.sessionStorage.getItem(key);
+    if (existing !== null) return CommandId.make(existing);
+    const created = randomUUID();
+    window.sessionStorage.setItem(key, created);
+    return CommandId.make(created);
+  } catch {
+    return null;
+  }
+}
+
+function clearNativePiCreateCommandId(projectKey: string, commandId: CommandId): boolean {
+  const key = `${NATIVE_PI_CREATE_COMMAND_PREFIX}${projectKey}`;
+  try {
+    if (window.sessionStorage.getItem(key) !== commandId) return false;
+    window.sessionStorage.removeItem(key);
+    return window.sessionStorage.getItem(key) === null;
+  } catch {
+    return false;
+  }
+}
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import { getProjectOrderKey, selectProjectGroupingSettings } from "../logicalProject";
 import { legacyProjectCwdPreferenceKey, useUiStateStore } from "../uiStateStore";

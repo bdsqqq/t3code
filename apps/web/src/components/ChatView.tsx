@@ -1,10 +1,9 @@
 import {
   type ApprovalRequestId,
-  CommandId,
   DEFAULT_MODEL,
   defaultInstanceIdForDriver,
   type EnvironmentId,
-  MessageId,
+  type MessageId,
   type ModelSelection,
   type ProjectScript,
   type ProjectId,
@@ -246,6 +245,7 @@ import { terminalEnvironment } from "../state/terminal";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import {
   requestOlderThreadTurns,
+  threadAllows,
   threadHasOlderTurns,
 } from "@t3tools/client-runtime/state/threads";
 import { vcsEnvironment } from "../state/vcs";
@@ -304,7 +304,6 @@ import {
 import {
   MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   branchMismatchKey,
-  buildScopedSendFingerprint,
   buildExpiredTerminalContextToastCopy,
   buildLocalDraftThread,
   buildLoadingThreadFromShell,
@@ -327,7 +326,6 @@ import {
   deriveLockedProvider,
   readFileAsDataUrl,
   reconcileMountedTerminalThreadIds,
-  retainOptimisticMessageAfterDispatch,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
@@ -371,80 +369,6 @@ const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
-interface FailedSendIdentity {
-  readonly fingerprint: string;
-  readonly commandId: CommandId;
-  readonly messageId: MessageId;
-  readonly createdAt: string;
-}
-const FAILED_EXTERNAL_SEND_IDENTITY_STORAGE_PREFIX = "t3-external-send-identity-v1:";
-const failedExternalSendIdentityStorageKey = (environmentId: EnvironmentId, threadId: ThreadId) =>
-  `${FAILED_EXTERNAL_SEND_IDENTITY_STORAGE_PREFIX}${encodeURIComponent(`${environmentId}:${threadId}`)}`;
-function readFailedExternalSendIdentity(
-  environmentId: EnvironmentId,
-  threadId: ThreadId,
-  fingerprint: string,
-): FailedSendIdentity | "blocked" | null {
-  const key = failedExternalSendIdentityStorageKey(environmentId, threadId);
-  try {
-    const parsed = JSON.parse(window.localStorage.getItem(key) ?? "null") as unknown;
-    if (
-      typeof parsed === "object" &&
-      parsed !== null &&
-      "status" in parsed &&
-      (parsed.status === "pending" || parsed.status === "completed") &&
-      "fingerprint" in parsed &&
-      parsed.fingerprint === fingerprint &&
-      "commandId" in parsed &&
-      typeof parsed.commandId === "string" &&
-      "messageId" in parsed &&
-      typeof parsed.messageId === "string" &&
-      "createdAt" in parsed &&
-      typeof parsed.createdAt === "string"
-    ) {
-      return {
-        fingerprint,
-        commandId: CommandId.make(parsed.commandId),
-        messageId: MessageId.make(parsed.messageId),
-        createdAt: parsed.createdAt,
-      };
-    }
-    window.localStorage.removeItem(key);
-    if (window.localStorage.getItem(key) !== null) return "blocked";
-  } catch {
-    return "blocked";
-  }
-  return null;
-}
-function persistFailedExternalSendIdentity(
-  environmentId: EnvironmentId,
-  threadId: ThreadId,
-  identity: FailedSendIdentity,
-): boolean {
-  try {
-    window.localStorage.setItem(
-      failedExternalSendIdentityStorageKey(environmentId, threadId),
-      JSON.stringify({ status: "pending", ...identity }),
-    );
-    return true;
-  } catch {
-    return false;
-  }
-}
-function clearFailedExternalSendIdentity(
-  environmentId: EnvironmentId,
-  threadId: ThreadId,
-  identity: FailedSendIdentity,
-): boolean {
-  const key = failedExternalSendIdentityStorageKey(environmentId, threadId);
-  try {
-    window.localStorage.setItem(key, JSON.stringify({ status: "completed", ...identity }));
-    window.localStorage.removeItem(key);
-    return window.localStorage.getItem(key) === null;
-  } catch {
-    return false;
-  }
-}
 function useDraftHeroLayoutTransition(isDraftHeroState: boolean) {
   const transitionGroupRef = useRef<HTMLDivElement | null>(null);
   const composerAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -5113,6 +5037,7 @@ function ChatViewContent(props: ChatViewProps) {
     };
     if (
       !activeThread ||
+      !threadAllows(activeThread, "send") ||
       isSendBusy ||
       isConnecting ||
       threadDetailLoading ||
@@ -5449,7 +5374,6 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     let turnStartSucceeded = false;
-    let deliveryIndeterminate = false;
     if (failure === null && turnAttachmentsResult._tag === "Success") {
       const bootstrap =
         isLocalDraftThread || baseBranchForWorktree
@@ -5486,7 +5410,6 @@ function ChatViewContent(props: ChatViewProps) {
         environmentId,
         input: {
           threadId: threadIdForSend,
-          commandId,
           message: {
             messageId: messageIdForSend,
             role: "user",
@@ -5498,35 +5421,23 @@ function ChatViewContent(props: ChatViewProps) {
           runtimeMode,
           interactionMode,
           ...(bootstrap ? { bootstrap } : {}),
-          ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
+          ...(phase === "running" && threadAllows(activeThread, "steer")
+            ? { streamingBehavior: "steer" as const }
+            : phase === "running" && threadAllows(activeThread, "followUp")
+              ? { streamingBehavior: "followUp" as const }
+              : {}),
           createdAt: messageCreatedAt,
         },
       });
       if (startResult._tag === "Failure") {
         failure = startResult;
-      } else if (startResult.value.deliveryStatus === "indeterminate") {
-        deliveryIndeterminate = true;
       } else {
         turnStartSucceeded = true;
         acknowledgeActiveThreadWoke();
       }
     }
 
-    if (failure !== null || deliveryIndeterminate) {
-      failedSendIdentityRef.current = {
-        fingerprint: sendFingerprint,
-        commandId,
-        messageId: messageIdForSend,
-        createdAt: messageCreatedAt,
-      };
-      if (activeThread.backing?.kind === "external") {
-        persistFailedExternalSendIdentity(environmentId, threadIdForSend, {
-          fingerprint: sendFingerprint,
-          commandId,
-          messageId: messageIdForSend,
-          createdAt: messageCreatedAt,
-        });
-      }
+    if (failure !== null) {
       if (
         promptRef.current.length === 0 &&
         composerImagesRef.current.length === 0 &&
@@ -5562,12 +5473,7 @@ function ChatViewContent(props: ChatViewProps) {
           detectTrigger: true,
         });
       }
-      if (deliveryIndeterminate) {
-        setThreadError(
-          threadIdForSend,
-          "Pi accepted the command, but its delivery outcome is unknown. The draft was restored and will not resend automatically.",
-        );
-      } else if (failure !== null && !isAtomCommandInterrupted(failure)) {
+      if (!isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         if (isLocalDraftThread && draftId && wasBootstrapThreadDeleted(error)) {
           const failedDraftSession = getDraftSession(draftId);
@@ -5599,7 +5505,11 @@ function ChatViewContent(props: ChatViewProps) {
   };
 
   const onInterrupt = async () => {
-    if (!activeThread || !threadAllows(activeThread, "interrupt")) return;
+    if (!activeThread) return;
+    if (!threadAllows(activeThread, "interrupt")) {
+      if (threadAllows(activeThread, "stop")) await onStopSession();
+      return;
+    }
     const result = await interruptThreadTurn({
       environmentId,
       input: buildThreadTurnInterruptInput(activeThread),
@@ -6705,11 +6615,7 @@ function ChatViewContent(props: ChatViewProps) {
                             composerTerminalContextsRef={composerTerminalContextsRef}
                             composerElementContextsRef={composerElementContextsRef}
                             onSend={onSend}
-                            onSendWithStreamingBehavior={(behavior) => {
-                              void onSend(undefined, behavior);
-                            }}
                             onInterrupt={onInterrupt}
-                            onStopSession={onStopSession}
                             onImplementPlanInNewThread={onImplementPlanInNewThread}
                             onRespondToApproval={onRespondToApproval}
                             onSelectActivePendingUserInputOption={

@@ -109,6 +109,7 @@ export interface ThreadComposerProps {
   readonly selectedThread: OrchestrationThread | OrchestrationThreadShell;
   readonly serverConfig: T3ServerConfig | null;
   readonly queueCount: number;
+  readonly indeterminateQueueCount: number;
   readonly environmentId: EnvironmentId;
   readonly projectCwd: string | null;
   readonly editorRef?: RefObject<ComposerEditorHandle | null>;

@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("037_ProjectionPendingTurnIntent", (it) => {
+layer("043_ProjectionPendingTurnIntent", (it) => {
   it.effect("adds accepted turn intent columns without replacing pending turns", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 36 });
+      yield* runMigrations({ toMigrationInclusive: 42 });
       yield* sql`
         INSERT INTO projection_turns (
           thread_id,
@@ -61,7 +61,7 @@ layer("037_ProjectionPendingTurnIntent", (it) => {
         )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 37 });
+      yield* runMigrations({ toMigrationInclusive: 43 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_turns)

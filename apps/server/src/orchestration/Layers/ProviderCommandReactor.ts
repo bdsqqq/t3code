@@ -2,11 +2,13 @@ import {
   type ChatAttachment,
   CommandId,
   EventId,
+  MANAGED_TURN_ADMISSION_PROTOCOL,
   type ModelSelection,
   type OrchestrationEvent,
   ProviderDriverKind,
   type ProjectId,
   type OrchestrationSession,
+  type ProviderInteractionMode,
   ThreadId,
   type ProviderSession,
   type RuntimeMode,
@@ -16,6 +18,7 @@ import { isTemporaryWorktreeBranch, WORKTREE_BRANCH_PREFIX } from "@t3tools/shar
 import * as Cache from "effect/Cache";
 import * as Cause from "effect/Cause";
 import * as Crypto from "effect/Crypto";
+import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Equal from "effect/Equal";
@@ -27,6 +30,8 @@ import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
 import { resolveThreadWorkspaceCwd } from "../../checkpointing/Utils.ts";
 import { increment, orchestrationEventsProcessedTotal } from "../../observability/Metrics.ts";
+import { ProjectionTurnRepositoryLive } from "../../persistence/Layers/ProjectionTurns.ts";
+import { ProjectionTurnRepository } from "../../persistence/Services/ProjectionTurns.ts";
 import { ProviderAdapterRequestError } from "../../provider/Errors.ts";
 import type { ProviderServiceError } from "../../provider/Errors.ts";
 import { TextGeneration } from "../../textGeneration/TextGeneration.ts";
@@ -63,6 +68,28 @@ type ProviderIntentEvent = Extract<
   }
 >;
 
+type TurnStartRequest = {
+  readonly threadId: ThreadId;
+  readonly messageId: Extract<
+    OrchestrationEvent,
+    { type: "thread.turn-start-requested" }
+  >["payload"]["messageId"];
+  readonly operationId: CommandId | null;
+  readonly recovered: boolean;
+  readonly admissionProtocol: typeof MANAGED_TURN_ADMISSION_PROTOCOL | null;
+  readonly modelSelection?: ModelSelection;
+  readonly titleSeed?: string;
+  readonly interactionMode?: ProviderInteractionMode;
+  readonly createdAt: string;
+};
+
+type RecoveredTurnStart = {
+  readonly type: "recovered.turn-start";
+  readonly payload: TurnStartRequest;
+};
+
+type ProviderCommandWork = ProviderIntentEvent | RecoveredTurnStart;
+
 function toNonEmptyProviderInput(value: string | undefined): string | undefined {
   const normalized = value?.trim();
   return normalized && normalized.length > 0 ? normalized : undefined;
@@ -86,8 +113,8 @@ function mapProviderSessionStatusToOrchestrationStatus(
   }
 }
 
-const turnStartKeyForEvent = (event: ProviderIntentEvent): string =>
-  event.commandId !== null ? `command:${event.commandId}` : `event:${event.eventId}`;
+const turnStartKey = (request: Pick<TurnStartRequest, "threadId" | "messageId">): string =>
+  `${request.threadId}:${request.messageId}`;
 
 const HANDLED_TURN_START_KEY_MAX = 10_000;
 const HANDLED_TURN_START_KEY_TTL = Duration.minutes(30);
@@ -302,6 +329,7 @@ const make = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const orchestrationEngine = yield* OrchestrationEngineService;
   const projectionSnapshotQuery = yield* ProjectionSnapshotQuery;
+  const projectionTurnRepository = yield* ProjectionTurnRepository;
   const providerService = yield* ProviderService;
   const providerRegistry = yield* ProviderRegistry;
   const gitWorkflow = yield* GitWorkflowService;
@@ -323,6 +351,8 @@ const make = Effect.gen(function* () {
         Cache.set(handledTurnStartKeys, key, true).pipe(Effect.as(Option.isSome(cached))),
       ),
     );
+  const startupRecoveryReady = yield* Deferred.make<void>();
+  const startupRecoveryClaims = new Map<string, boolean>();
 
   const threadModelSelections = new Map<string, ModelSelection>();
 
@@ -723,10 +753,12 @@ const make = Effect.gen(function* () {
 
   const buildSendTurnRequestForThread = Effect.fnUntraced(function* (input: {
     readonly threadId: ThreadId;
+    readonly operationId: CommandId;
     readonly messageText: string;
     readonly attachments?: ReadonlyArray<ChatAttachment>;
     readonly modelSelection?: ModelSelection;
     readonly interactionMode?: "default" | "plan";
+    readonly managedPiRecovery?: "claimable" | "durable-only";
     readonly createdAt: string;
   }) {
     const thread = yield* resolveThread(input.threadId);
@@ -735,10 +767,12 @@ const make = Effect.gen(function* () {
         new Error(`Thread '${input.threadId}' was not found in read model.`),
       );
     }
-    yield* ensureSessionForThread(input.threadId, input.createdAt, {
-      ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
-      pendingTurnStart: true,
-    });
+    if (input.managedPiRecovery === undefined) {
+      yield* ensureSessionForThread(input.threadId, input.createdAt, {
+        ...(input.modelSelection !== undefined ? { modelSelection: input.modelSelection } : {}),
+        pendingTurnStart: true,
+      });
+    }
     if (input.modelSelection !== undefined) {
       threadModelSelections.set(input.threadId, input.modelSelection);
     }
@@ -774,10 +808,14 @@ const make = Effect.gen(function* () {
 
     return {
       threadId: input.threadId,
+      operationId: input.operationId,
       ...(normalizedInput ? { input: normalizedInput } : {}),
       ...(normalizedAttachments.length > 0 ? { attachments: normalizedAttachments } : {}),
       ...(modelForTurn !== undefined ? { modelSelection: modelForTurn } : {}),
       ...(input.interactionMode !== undefined ? { interactionMode: input.interactionMode } : {}),
+      ...(input.managedPiRecovery === "durable-only"
+        ? { admissionMode: "recover-durable" as const }
+        : {}),
     };
   });
 
@@ -1058,30 +1096,66 @@ const make = Effect.gen(function* () {
   );
 
   const processTurnStartRequested = Effect.fn("processTurnStartRequested")(function* (
-    event: Extract<ProviderIntentEvent, { type: "thread.turn-start-requested" }>,
+    request: TurnStartRequest,
   ) {
-    const key = turnStartKeyForEvent(event);
-    if (yield* hasHandledTurnStartRecently(key)) {
+    yield* Deferred.await(startupRecoveryReady);
+    const key = turnStartKey(request);
+    const startupRecoveryClaimed = startupRecoveryClaims.get(key);
+    if (startupRecoveryClaimed !== undefined) {
+      if (startupRecoveryClaimed) {
+        return;
+      }
+      startupRecoveryClaims.set(key, true);
+    } else if (yield* hasHandledTurnStartRecently(key)) {
       return;
     }
 
-    const thread = yield* resolveThread(event.payload.threadId);
+    const thread = yield* resolveThread(request.threadId);
     if (!thread) {
       return;
     }
 
-    const message = thread.messages.find((entry) => entry.id === event.payload.messageId);
+    const message = thread.messages.find((entry) => entry.id === request.messageId);
     if (!message || message.role !== "user") {
       yield* appendProviderFailureActivity({
-        threadId: event.payload.threadId,
+        threadId: request.threadId,
         kind: "provider.turn.start.failed",
         summary: "Provider turn start failed",
-        detail: `User message '${event.payload.messageId}' was not found for turn start request.`,
+        detail: `User message '${request.messageId}' was not found for turn start request.`,
         turnId: null,
-        createdAt: event.payload.createdAt,
+        createdAt: request.createdAt,
       });
       return;
     }
+
+    if (request.operationId === null) {
+      const detail =
+        "Turn admission is indeterminate because its accepted operation identity could not be recovered. The provider request was not resent.";
+      yield* setThreadSessionErrorOnTurnStartFailure({
+        threadId: request.threadId,
+        detail,
+        createdAt: request.createdAt,
+      });
+      yield* appendProviderFailureActivity({
+        threadId: request.threadId,
+        kind: "provider.turn.start.failed",
+        summary: "Provider turn admission is indeterminate",
+        detail,
+        turnId: null,
+        createdAt: request.createdAt,
+      });
+      return;
+    }
+
+    const managedPiRecovery =
+      request.recovered &&
+      (yield* providerService.getInstanceInfo(
+        (request.modelSelection ?? thread.modelSelection).instanceId,
+      )).driverKind === ProviderDriverKind.make("pi")
+        ? request.admissionProtocol === MANAGED_TURN_ADMISSION_PROTOCOL
+          ? "claimable"
+          : "durable-only"
+        : undefined;
 
     const isFirstUserMessageTurn =
       thread.messages.filter((entry) => entry.role === "user").length === 1;
@@ -1095,19 +1169,19 @@ const make = Effect.gen(function* () {
       const generationInput = {
         messageText: message.text,
         ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-        ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+        ...(request.titleSeed !== undefined ? { titleSeed: request.titleSeed } : {}),
       };
 
       yield* maybeGenerateAndRenameWorktreeBranchForFirstTurn({
-        threadId: event.payload.threadId,
+        threadId: request.threadId,
         branch: thread.branch,
         worktreePath: thread.worktreePath,
         ...generationInput,
       }).pipe(Effect.forkScoped);
 
-      if (canReplaceThreadTitle(thread.title, event.payload.titleSeed)) {
+      if (canReplaceThreadTitle(thread.title, request.titleSeed)) {
         yield* maybeGenerateThreadTitleForFirstTurn({
-          threadId: event.payload.threadId,
+          threadId: request.threadId,
           cwd: generationCwd,
           ...generationInput,
         }).pipe(Effect.forkScoped);
@@ -1120,18 +1194,18 @@ const make = Effect.gen(function* () {
       }
       const detail = formatFailureDetail(cause);
       return setThreadSessionErrorOnTurnStartFailure({
-        threadId: event.payload.threadId,
+        threadId: request.threadId,
         detail,
-        createdAt: event.payload.createdAt,
+        createdAt: request.createdAt,
       }).pipe(
         Effect.flatMap(() =>
           appendProviderFailureActivity({
-            threadId: event.payload.threadId,
+            threadId: request.threadId,
             kind: "provider.turn.start.failed",
             summary: "Provider turn start failed",
             detail,
             turnId: null,
-            createdAt: event.payload.createdAt,
+            createdAt: request.createdAt,
           }),
         ),
         Effect.asVoid,
@@ -1142,8 +1216,8 @@ const make = Effect.gen(function* () {
       handleTurnStartFailure(cause).pipe(
         Effect.catchCause((recoveryCause) =>
           Effect.logWarning("provider command reactor failed to recover turn start failure", {
-            eventType: event.type,
-            threadId: event.payload.threadId,
+            eventType: "thread.turn-start-requested",
+            threadId: request.threadId,
             cause: Cause.pretty(recoveryCause),
             originalCause: Cause.pretty(cause),
           }),
@@ -1151,14 +1225,14 @@ const make = Effect.gen(function* () {
       );
 
     const sendTurnRequest = yield* buildSendTurnRequestForThread({
-      threadId: event.payload.threadId,
+      threadId: request.threadId,
+      operationId: request.operationId,
       messageText: message.text,
       ...(message.attachments !== undefined ? { attachments: message.attachments } : {}),
-      ...(event.payload.modelSelection !== undefined
-        ? { modelSelection: event.payload.modelSelection }
-        : {}),
-      interactionMode: event.payload.interactionMode,
-      createdAt: event.payload.createdAt,
+      ...(request.modelSelection !== undefined ? { modelSelection: request.modelSelection } : {}),
+      interactionMode: request.interactionMode ?? thread.interactionMode,
+      ...(managedPiRecovery ? { managedPiRecovery } : {}),
+      createdAt: request.createdAt,
     }).pipe(
       Effect.map(Option.some),
       Effect.catchCause((cause) => handleTurnStartFailure(cause).pipe(Effect.as(Option.none()))),
@@ -1316,17 +1390,24 @@ const make = Effect.gen(function* () {
   });
 
   const processDomainEvent = Effect.fn("processDomainEvent")(function* (
-    event: ProviderIntentEvent,
+    event: ProviderCommandWork,
   ) {
+    const eventType =
+      event.type === "recovered.turn-start" ? "thread.turn-start-requested" : event.type;
     yield* Effect.annotateCurrentSpan({
-      "orchestration.event_type": event.type,
+      "orchestration.event_type": eventType,
       "orchestration.thread_id": event.payload.threadId,
-      ...(event.commandId ? { "orchestration.command_id": event.commandId } : {}),
+      ...(event.type !== "recovered.turn-start" && event.commandId
+        ? { "orchestration.command_id": event.commandId }
+        : {}),
     });
     yield* increment(orchestrationEventsProcessedTotal, {
-      eventType: event.type,
+      eventType,
     });
     switch (event.type) {
+      case "recovered.turn-start":
+        yield* processTurnStartRequested(event.payload);
+        return;
       case "thread.meta-updated":
         yield* threadTitleRegenerationWorker.enqueue(event);
         return;
@@ -1344,7 +1425,19 @@ const make = Effect.gen(function* () {
         return;
       }
       case "thread.turn-start-requested":
-        yield* processTurnStartRequested(event);
+        yield* processTurnStartRequested({
+          threadId: event.payload.threadId,
+          messageId: event.payload.messageId,
+          operationId: event.commandId,
+          recovered: false,
+          admissionProtocol: event.payload.admissionProtocol ?? null,
+          ...(event.payload.modelSelection !== undefined
+            ? { modelSelection: event.payload.modelSelection }
+            : {}),
+          ...(event.payload.titleSeed !== undefined ? { titleSeed: event.payload.titleSeed } : {}),
+          interactionMode: event.payload.interactionMode,
+          createdAt: event.payload.createdAt,
+        });
         return;
       case "thread.turn-interrupt-requested":
         yield* processTurnInterruptRequested(event);
@@ -1361,11 +1454,11 @@ const make = Effect.gen(function* () {
     }
   });
 
-  const processDomainEventSafely = (event: ProviderIntentEvent) =>
+  const processDomainEventSafely = (event: ProviderCommandWork) =>
     processDomainEvent(event).pipe(
       Effect.catchCause((cause) => {
         if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.interrupt;
+          return Effect.failCause(cause);
         }
         return Effect.logWarning("provider command reactor failed to process event", {
           eventType: event.type,
@@ -1404,29 +1497,62 @@ const make = Effect.gen(function* () {
 
     yield* forkParked(Stream.runForEach(orchestrationEngine.streamDomainEvents, processEvent));
 
-    // The domain event stream is hot, so work pending before this reactor
-    // starts cannot be resumed. Correlated completions only clear the request
-    // captured here, leaving any newer request untouched.
-    const clearInterrupted = clearInterruptedThreadTitleRegenerations(
-      interruptedTitleRegenerations,
-    ).pipe(
-      Effect.catchCause((cause) => {
-        if (Cause.hasInterruptsOnly(cause)) {
-          return Effect.interrupt;
-        }
-        return Effect.logWarning(
-          "provider command reactor failed to clear interrupted title regenerations",
-          {
-            cause: Cause.pretty(cause),
-          },
-        );
-      }),
-    );
+    const pendingTurnStarts = yield* projectionTurnRepository
+      .listPendingTurnStarts()
+      .pipe(Effect.orDie);
+    for (const pendingTurnStart of pendingTurnStarts) {
+      startupRecoveryClaims.set(turnStartKey(pendingTurnStart), false);
+    }
+
+    const activate = Effect.gen(function* () {
+      yield* Effect.forEach(
+        pendingTurnStarts,
+        (pendingTurnStart) =>
+          worker.enqueue({
+            type: "recovered.turn-start",
+            payload: {
+              threadId: pendingTurnStart.threadId,
+              messageId: pendingTurnStart.messageId,
+              operationId: pendingTurnStart.operationId,
+              recovered: true,
+              admissionProtocol: pendingTurnStart.admissionProtocol,
+              ...(pendingTurnStart.modelSelection !== null
+                ? { modelSelection: pendingTurnStart.modelSelection }
+                : {}),
+              ...(pendingTurnStart.titleSeed !== null
+                ? { titleSeed: pendingTurnStart.titleSeed }
+                : {}),
+              ...(pendingTurnStart.interactionMode !== null
+                ? { interactionMode: pendingTurnStart.interactionMode }
+                : {}),
+              createdAt: pendingTurnStart.requestedAt,
+            },
+          }),
+        { concurrency: 1 },
+      );
+      yield* Deferred.succeed(startupRecoveryReady, undefined);
+
+      // Title generation has no durable work projection. Correlated completions
+      // only clear the request captured here, leaving newer requests untouched.
+      yield* clearInterruptedThreadTitleRegenerations(interruptedTitleRegenerations).pipe(
+        Effect.catchCause((cause) => {
+          if (Cause.hasInterruptsOnly(cause)) {
+            return Effect.interrupt;
+          }
+          return Effect.logWarning(
+            "provider command reactor failed to clear interrupted title regenerations",
+            {
+              cause: Cause.pretty(cause),
+            },
+          );
+        }),
+      );
+    });
     const activation = yield* ServerActivation;
     if (activation === undefined) {
-      yield* clearInterrupted;
+      yield* activate;
     } else {
-      yield* forkParked(clearInterrupted);
+      yield* forkParked(activate);
     }
   });
 
@@ -1439,4 +1565,6 @@ const make = Effect.gen(function* () {
   } satisfies ProviderCommandReactorShape;
 });
 
-export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make);
+export const ProviderCommandReactorLive = Layer.effect(ProviderCommandReactor, make).pipe(
+  Layer.provide(ProjectionTurnRepositoryLive),
+);

@@ -8,12 +8,12 @@ import * as NodeSqliteClient from "../NodeSqliteClient.ts";
 
 const layer = it.layer(Layer.mergeAll(NodeSqliteClient.layerMemory()));
 
-layer("038_ProjectionPendingTurnOperationId", (it) => {
+layer("044_ProjectionPendingTurnOperationId", (it) => {
   it.effect("backfills the accepted command id without inventing one for unmatched turns", () =>
     Effect.gen(function* () {
       const sql = yield* SqlClient.SqlClient;
 
-      yield* runMigrations({ toMigrationInclusive: 37 });
+      yield* runMigrations({ toMigrationInclusive: 43 });
       yield* sql`
         INSERT INTO projection_turns (
           thread_id,
@@ -99,7 +99,7 @@ layer("038_ProjectionPendingTurnOperationId", (it) => {
           )
       `;
 
-      yield* runMigrations({ toMigrationInclusive: 38 });
+      yield* runMigrations({ toMigrationInclusive: 44 });
 
       const columns = yield* sql<{ readonly name: string }>`
         PRAGMA table_info(projection_turns)

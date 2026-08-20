@@ -57,6 +57,7 @@ import {
   scopeThreadRef,
 } from "@t3tools/client-runtime/environment";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
+import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import {
   isAtomCommandInterrupted,
   settlePromise,
@@ -1795,9 +1796,20 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       const hasRunningThread = selectedThreadEntries.some(
         ({ thread }) => thread.session?.status === "running" && thread.session.activeTurnId != null,
       );
+      const canArchiveSelection = selectedThreadEntries.every(({ thread }) =>
+        threadAllows(thread, "archive"),
+      );
+      const canDeleteSelection = selectedThreadEntries.every(({ thread }) =>
+        threadAllows(thread, "delete"),
+      );
 
       const clicked = await api.contextMenu.show(
-        buildMultiSelectThreadContextMenuItems({ count, hasRunningThread }),
+        buildMultiSelectThreadContextMenuItems({
+          count,
+          hasRunningThread,
+          canArchiveSelection,
+          canDeleteSelection,
+        }),
         position,
       );
 

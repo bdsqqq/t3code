@@ -1099,6 +1099,8 @@ const makeWsRpcLayer = (
           observeRpcEffect(
             ORCHESTRATION_WS_METHODS.dispatchCommand,
             Effect.gen(function* () {
+              const externalDispatch = getExternalThreadDispatch(command, piExternalSource);
+              if (externalDispatch !== null) return yield* externalDispatch;
               const normalizedCommand = yield* normalizeDispatchCommand(command);
               // Archive and settle both mean "done with this thread", so a
               // live provider session must not keep running background work
@@ -1468,6 +1470,30 @@ const makeWsRpcLayer = (
                         }),
                     ),
                   );
+
+                if (Option.isNone(snapshot)) {
+                  return yield* new OrchestrationGetSnapshotError({
+                    message: `Thread ${input.threadId} was not found`,
+                    cause: input.threadId,
+                  });
+                }
+
+                const afterSnapshot =
+                  input.requestCompletionMarker === true
+                    ? Stream.concat(
+                        Stream.fromEffect(
+                          Queue.offer(liveBuffer, { kind: "synchronized" as const }),
+                        ).pipe(Stream.drain),
+                        bufferedLiveStream,
+                      )
+                    : bufferedLiveStream;
+                return Stream.concat(
+                  Stream.make({
+                    kind: "snapshot" as const,
+                    snapshot: projectThreadDetailSnapshot(snapshot.value),
+                  }),
+                  afterSnapshot,
+                );
               });
             })(),
             { "rpc.aggregate": "orchestration" },

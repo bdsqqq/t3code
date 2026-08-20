@@ -26,4 +26,13 @@ describe("ExecutionEnvironmentDescriptor", () => {
       }).capabilities.pullRequests,
     ).toBe(true);
   });
+
+  it("preserves the native Pi external-thread capability", () => {
+    expect(
+      decodeDescriptor({
+        ...descriptor,
+        capabilities: { ...descriptor.capabilities, piExternalThreads: true },
+      }).capabilities.piExternalThreads,
+    ).toBe(true);
+  });
 });

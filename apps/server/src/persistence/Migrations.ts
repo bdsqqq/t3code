@@ -53,6 +53,10 @@ import Migration0037 from "./Migrations/037_ProjectionTurnsKeysetIndex.ts";
 import Migration0038 from "./Migrations/038_ProjectionThreadsPinOrderKey.ts";
 import Migration0039 from "./Migrations/039_ProjectionProjectsDefaultThreadEnvMode.ts";
 import Migration0040 from "./Migrations/040_ProjectionProjectFaviconPath.ts";
+import Migration0042 from "./Migrations/042_PiExternalLifecycleOverrides.ts";
+import Migration0043 from "./Migrations/043_ProjectionPendingTurnIntent.ts";
+import Migration0044 from "./Migrations/044_ProjectionPendingTurnOperationId.ts";
+import Migration0045 from "./Migrations/045_ProjectionPendingTurnAdmissionProtocol.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -105,6 +109,10 @@ export const migrationEntries = [
   [38, "ProjectionThreadsPinOrderKey", Migration0038],
   [39, "ProjectionProjectsDefaultThreadEnvMode", Migration0039],
   [40, "ProjectionProjectFaviconPath", Migration0040],
+  [42, "PiExternalLifecycleOverrides", Migration0042],
+  [43, "ProjectionPendingTurnIntent", Migration0043],
+  [44, "ProjectionPendingTurnOperationId", Migration0044],
+  [45, "ProjectionPendingTurnAdmissionProtocol", Migration0045],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

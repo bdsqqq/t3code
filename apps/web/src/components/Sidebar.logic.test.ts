@@ -26,6 +26,9 @@ import {
   resolveThreadStatusPill,
   resolveWorkingStartedAt,
   searchSidebarThreadsByTitle,
+  sidebarThreadTreeSubtreeContainingThread,
+  sidebarTreeAncestorKeysForThread,
+  sidebarTreeParentKeysContainingHiddenThread,
   formatWorkingDurationLabel,
   shouldNavigateAfterProjectRemoval,
   shouldClearThreadSelectionOnMouseDown,
@@ -808,6 +811,264 @@ describe("sortThreadsForSidebar", () => {
     ]);
 
     expect(sorted.map((thread) => thread.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("buildSidebarThreadTree", () => {
+  const thread = (id: string, parentThreadId?: string, environmentId = "environment-1") => ({
+    id,
+    environmentId,
+    backing: {
+      source: "pi" as const,
+      ...(parentThreadId === undefined ? {} : { parentThreadId }),
+    },
+  });
+
+  it("places descendants after their root with tree metadata", () => {
+    const entries = buildSidebarThreadTree([
+      thread("new-root"),
+      thread("child-b", "root"),
+      thread("root"),
+      thread("grandchild", "child-a"),
+      thread("child-a", "root"),
+    ]);
+
+    expect(
+      entries.map(({ thread, depth, isLast, ancestorContinues }) => ({
+        id: thread.id,
+        depth,
+        isLast,
+        ancestorContinues,
+      })),
+    ).toEqual([
+      { id: "new-root", depth: 0, isLast: false, ancestorContinues: [] },
+      { id: "root", depth: 0, isLast: true, ancestorContinues: [] },
+      { id: "child-b", depth: 1, isLast: false, ancestorContinues: [false] },
+      { id: "child-a", depth: 1, isLast: true, ancestorContinues: [false] },
+      { id: "grandchild", depth: 2, isLast: true, ancestorContinues: [false, false] },
+    ]);
+  });
+
+  it("promotes a child whose parent is not in the visible list", () => {
+    expect(buildSidebarThreadTree([thread("orphan", "missing")])).toMatchObject([
+      { thread: { id: "orphan" }, depth: 0 },
+    ]);
+  });
+
+  it("does not attach to a parent with the same id in another environment", () => {
+    const entries = buildSidebarThreadTree([
+      thread("parent", undefined, "environment-1"),
+      thread("child", "parent", "environment-2"),
+    ]);
+
+    expect(entries.map(({ thread, depth }) => ({ id: thread.id, depth }))).toEqual([
+      { id: "parent", depth: 0 },
+      { id: "child", depth: 0 },
+    ]);
+  });
+
+  it("treats a self-parenting thread as a root", () => {
+    expect(buildSidebarThreadTree([thread("self", "self")])).toMatchObject([
+      { thread: { id: "self" }, depth: 0 },
+    ]);
+  });
+
+  it("moves external Pi children below an internal T3 parent", () => {
+    const parent = {
+      id: "internal-parent",
+      environmentId: "environment-1",
+      backing: undefined,
+    };
+    const entries = buildSidebarThreadTree([thread("child", parent.id), parent]);
+
+    expect(entries.map(({ thread, depth }) => ({ id: thread.id, depth }))).toEqual([
+      { id: "internal-parent", depth: 0 },
+      { id: "child", depth: 1 },
+    ]);
+  });
+
+  it("raises notified children above siblings without reordering roots", () => {
+    const entries = buildSidebarThreadTree(
+      [thread("root-a"), thread("quiet", "root-a"), thread("notified", "root-a"), thread("root-b")],
+      (candidate) => candidate.id === "notified",
+    );
+
+    expect(entries.map((entry) => entry.thread.id)).toEqual([
+      "root-a",
+      "notified",
+      "quiet",
+      "root-b",
+    ]);
+  });
+
+  it("moves the whole tree with its settled parent", () => {
+    const parent = {
+      id: "internal-parent",
+      environmentId: "environment-1",
+      backing: undefined,
+    };
+    const child = thread("child", parent.id);
+    const partitioned = partitionSidebarThreadTrees([child, parent], (candidate) =>
+      candidate.id === child.id ? "active" : "settled",
+    );
+
+    expect(partitioned.settled.map((candidate) => candidate.id)).toEqual([
+      "internal-parent",
+      "child",
+    ]);
+    expect(partitioned.active).toEqual([]);
+  });
+
+  it("collapses the middle of large child lists and preserves the last connector", () => {
+    const children = Array.from({ length: 8 }, (_, index) => thread(`child-${index}`, "root"));
+    const display = buildCollapsibleSidebarThreadTree(
+      buildSidebarThreadTree([thread("root"), ...children]),
+      new Set(),
+    );
+
+    expect(
+      display.map((item) =>
+        item.kind === "thread"
+          ? item.entry.thread.id
+          : `${item.action}:${item.hiddenCount}:${item.isLast}`,
+      ),
+    ).toEqual(["root", "child-0", "child-1", "expand:5:false", "child-7"]);
+    expect(display.at(-1)).toMatchObject({
+      kind: "thread",
+      entry: { thread: { id: "child-7" }, isLast: true },
+    });
+  });
+
+  it("expands and re-collapses a large child list from the middle control", () => {
+    const children = Array.from({ length: 6 }, (_, index) => thread(`child-${index}`, "root"));
+    const entries = buildSidebarThreadTree([thread("root"), ...children]);
+    const display = buildCollapsibleSidebarThreadTree(entries, new Set(["environment-1:root"]));
+
+    expect(
+      display.map((item) =>
+        item.kind === "thread" ? item.entry.thread.id : `${item.action}:${item.parentKey}`,
+      ),
+    ).toEqual([
+      "root",
+      "child-0",
+      "child-1",
+      "collapse:environment-1:root",
+      "child-2",
+      "child-3",
+      "child-4",
+      "child-5",
+    ]);
+  });
+
+  it("promotes a routed descendant when its ancestors are outside the visible page", () => {
+    const fullTree = buildSidebarThreadTree([
+      thread("root"),
+      thread("child", "root"),
+      thread("grandchild", "child"),
+    ]);
+    const display = buildCollapsibleSidebarThreadTree([fullTree[2]!], new Set());
+
+    expect(display).toMatchObject([
+      {
+        kind: "thread",
+        entry: {
+          thread: { id: "grandchild" },
+          depth: 0,
+          isLast: true,
+          ancestorContinues: [],
+          childCount: 0,
+        },
+      },
+    ]);
+  });
+
+  it("forces expansion only when the routed child is in the collapsed middle", () => {
+    const children = Array.from({ length: 7 }, (_, index) => thread(`child-${index}`, "root"));
+    const entries = buildSidebarThreadTree([thread("root"), ...children]);
+
+    expect([
+      ...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:child-3"),
+    ]).toEqual(["environment-1:root"]);
+    expect([
+      ...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:child-0"),
+    ]).toEqual([]);
+    expect([
+      ...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:child-6"),
+    ]).toEqual([]);
+  });
+
+  it("stops route ancestor traversal when hand-edited metadata contains a cycle", () => {
+    const entries = buildSidebarThreadTree([thread("a", "b"), thread("b", "a")]);
+
+    expect([...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:a")]).toEqual(
+      [],
+    );
+  });
+
+  it("fully collapses a parent without losing its own row", () => {
+    const entries = buildSidebarThreadTree([
+      thread("root"),
+      thread("child-0", "root"),
+      thread("child-1", "root"),
+    ]);
+    const display = buildCollapsibleSidebarThreadTree(
+      entries,
+      new Set(),
+      new Set(["environment-1:root"]),
+    );
+
+    expect(display).toMatchObject([
+      { kind: "thread", entry: { thread: { id: "root" }, childCount: 2 } },
+    ]);
+  });
+
+  it("finds every visible ancestor needed to reveal a routed descendant", () => {
+    const entries = buildSidebarThreadTree([
+      thread("root"),
+      thread("child", "root"),
+      thread("grandchild", "child"),
+    ]);
+
+    expect([...sidebarTreeAncestorKeysForThread(entries, "environment-1:grandchild")]).toEqual([
+      "environment-1:child",
+      "environment-1:root",
+    ]);
+  });
+
+  it("folds settled parents by default while respecting reveal overrides", () => {
+    const entries = buildSidebarThreadTree([thread("root"), thread("child", "root")]);
+    const defaultCollapsed = resolveCollapsedSidebarTreeParentKeys({
+      active: [],
+      snoozed: [],
+      settled: entries,
+      visibilityOverrides: new Map(),
+      forcedVisibleParentKeys: new Set(),
+    });
+    const explicitlyVisible = resolveCollapsedSidebarTreeParentKeys({
+      active: [],
+      snoozed: [],
+      settled: entries,
+      visibilityOverrides: new Map([["environment-1:root", true]]),
+      forcedVisibleParentKeys: new Set(),
+    });
+
+    expect([...defaultCollapsed]).toEqual(["environment-1:root"]);
+    expect([...explicitlyVisible]).toEqual([]);
+  });
+
+  it("restores the complete owning subtree for a routed paginated child", () => {
+    const entries = buildSidebarThreadTree([
+      thread("other-root"),
+      thread("root"),
+      thread("child-0", "root"),
+      thread("child-1", "root"),
+    ]);
+
+    expect(
+      sidebarThreadTreeSubtreeContainingThread(entries, "environment-1:child-0").map(
+        (entry) => entry.thread.id,
+      ),
+    ).toEqual(["root", "child-0", "child-1"]);
   });
 });
 

@@ -2170,6 +2170,33 @@ code {
   padding: 0;
 }
 
+.chat-markdown .chat-markdown-mermaid {
+  max-width: 100%;
+  max-height: min(32rem, 70vh);
+  margin: 0.65rem 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 0.75rem;
+  background: var(--muted);
+  padding: 0.8rem 0.9rem;
+  color: var(--foreground);
+  scrollbar-width: thin;
+  scrollbar-color: color-mix(in srgb, var(--border) 78%, transparent) transparent;
+}
+
+.chat-markdown .chat-markdown-mermaid-canvas {
+  display: flex;
+  width: max-content;
+  min-width: 100%;
+  justify-content: center;
+}
+
+.chat-markdown .chat-markdown-mermaid-canvas svg {
+  display: block;
+  max-width: none;
+  flex: none;
+}
+
 .chat-markdown pre::-webkit-scrollbar {
   height: 7px;
 }
