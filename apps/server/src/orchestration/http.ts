@@ -47,6 +47,25 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
 
     return handlers
       .handle(
+        "snapshot",
+        Effect.fn("environment.orchestration.snapshot")(function* (args) {
+          yield* annotateEnvironmentRequest(args.endpoint.name);
+          yield* requireEnvironmentScope(AuthOrchestrationReadScope);
+          // Serve the lightweight command read model (thread bodies empty)
+          // instead of the fully hydrated snapshot. Hydrating every message
+          // and activity payload in the database has OOM-killed servers, and
+          // the route's only consumer (the project CLI) reads projects alone —
+          // UI clients load the shell and per-thread snapshots instead.
+          return yield* projectionSnapshotQuery
+            .getCommandReadModel()
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_snapshot_failed", cause),
+              ),
+            );
+        }),
+      )
+      .handle(
         "shellSnapshot",
         Effect.fn("environment.orchestration.shellSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
@@ -65,23 +84,23 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
         Effect.fn("environment.orchestration.threadSnapshot")(function* (args) {
           yield* annotateEnvironmentRequest(args.endpoint.name);
           yield* requireEnvironmentScope(AuthOrchestrationReadScope);
-          const snapshot = yield* getClientThreadDetailSnapshot(
-            args.params.threadId,
-            piExternalSource,
-            projectionSnapshotQuery,
-          ).pipe(
-            Effect.catch((cause) =>
-              Effect.gen(function* () {
-                if (cause.code === "thread_not_found") {
-                  return yield* failEnvironmentNotFound("thread_not_found");
-                }
-                return yield* failEnvironmentInternal(
-                  "orchestration_thread_snapshot_failed",
-                  cause,
-                );
-              }),
-            ),
-          );
+          const snapshot = yield* projectionSnapshotQuery
+            .getThreadDetailSnapshot(
+              args.params.threadId,
+              args.payload.turnLimit === undefined
+                ? undefined
+                : {
+                    turnLimit: args.payload.turnLimit,
+                    ...(args.payload.beforeCursor !== undefined
+                      ? { beforeCursor: args.payload.beforeCursor }
+                      : {}),
+                  },
+            )
+            .pipe(
+              Effect.catch((cause) =>
+                failEnvironmentInternal("orchestration_thread_snapshot_failed", cause),
+              ),
+            );
           if (Option.isNone(snapshot)) {
             return yield* failEnvironmentNotFound("thread_not_found");
           }

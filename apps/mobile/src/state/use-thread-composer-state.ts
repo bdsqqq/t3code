@@ -153,65 +153,58 @@ export function useThreadComposerState() {
     );
   }, [selectedThreadDetail, selectedThreadSessionActivity, selectedThreadShell]);
 
-  const activeThreadBusy =
-    !!selectedThread &&
-    (selectedThread.session?.status === "running" || selectedThread.session?.status === "starting");
+  const onSendMessage = useCallback(async () => {
+    if (!selectedThreadShell) {
+      return null;
+    }
 
-  const onSendMessage = useCallback(
-    async (requestedBehavior?: "steer" | "followUp") => {
-      if (!selectedThreadShell) {
-        return null;
-      }
+    const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+    const draft = getComposerDraftSnapshot(threadKey);
+    const thread = selectedThreadDetail ?? selectedThreadShell;
+    if (!threadAllows(thread, "send")) {
+      return null;
+    }
+    const text = draft.text.trim();
+    const attachments = draft.attachments;
+    if (text.length === 0 && attachments.length === 0) {
+      return null;
+    }
+    if (attachments.length > 0 && !threadAllows(thread, "attachments")) {
+      return null;
+    }
 
-      const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
-      const draft = getComposerDraftSnapshot(threadKey);
-      const thread = selectedThreadDetail ?? selectedThreadShell;
-      if (!threadAllows(thread, "send")) {
-        return null;
-      }
-      const text = draft.text.trim();
-      const attachments = draft.attachments;
-      if (text.length === 0 && attachments.length === 0) {
-        return null;
-      }
-      if (attachments.length > 0 && !threadAllows(thread, "attachments")) {
-        return null;
-      }
-
-      const metadata = makeQueuedMessageMetadata();
-      const messageId = MessageId.make(metadata.messageId);
-      const streamingBehavior =
-        thread.backing?.kind === "external" && thread.session?.status === "running"
-          ? (requestedBehavior ?? "steer")
-          : undefined;
-      if (streamingBehavior !== undefined && !threadAllows(thread, streamingBehavior)) {
-        return null;
-      }
-      const enqueuePromise = enqueueThreadOutboxMessage({
-        environmentId: selectedThreadShell.environmentId,
-        threadId: selectedThreadShell.id,
-        messageId,
-        commandId: CommandId.make(metadata.commandId),
-        text,
-        attachments,
-        modelSelection: draft.modelSelection ?? thread.modelSelection,
-        runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-        interactionMode: draft.interactionMode ?? thread.interactionMode,
-        ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
-        createdAt: metadata.createdAt,
-      });
-      clearComposerDraftContent(threadKey);
-      enqueuePromise.catch((error: unknown) => {
-        void mergeComposerDraftContent(threadKey, { text, attachments: [] });
-        appendComposerDraftAttachments(threadKey, attachments);
-        setPendingConnectionError(
-          error instanceof Error ? error.message : "Failed to save the queued message.",
-        );
-      });
-      return messageId;
-    },
-    [selectedThreadDetail, selectedThreadShell],
-  );
+    const metadata = makeQueuedMessageMetadata();
+    const messageId = MessageId.make(metadata.messageId);
+    const streamingBehavior =
+      thread.backing?.kind === "external" && thread.session?.status === "running"
+        ? (requestedBehavior ?? "steer")
+        : undefined;
+    if (streamingBehavior !== undefined && !threadAllows(thread, streamingBehavior)) {
+      return null;
+    }
+    const enqueuePromise = enqueueThreadOutboxMessage({
+      environmentId: selectedThreadShell.environmentId,
+      threadId: selectedThreadShell.id,
+      messageId,
+      commandId: CommandId.make(metadata.commandId),
+      text,
+      attachments,
+      modelSelection: draft.modelSelection ?? thread.modelSelection,
+      runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
+      interactionMode: draft.interactionMode ?? thread.interactionMode,
+      ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
+      createdAt: metadata.createdAt,
+    });
+    clearComposerDraftContent(threadKey);
+    enqueuePromise.catch((error: unknown) => {
+      void mergeComposerDraftContent(threadKey, { text, attachments: [] });
+      appendComposerDraftAttachments(threadKey, attachments);
+      setPendingConnectionError(
+        error instanceof Error ? error.message : "Failed to save the queued message.",
+      );
+    });
+    return messageId;
+  }, [selectedThreadDetail, selectedThreadShell]);
 
   const onChangeDraftMessage = useCallback(
     (value: string) => {
@@ -349,7 +342,6 @@ export function useThreadComposerState() {
     modelSelection,
     runtimeMode,
     interactionMode,
-    activeThreadBusy,
     onChangeDraftMessage,
     onPickDraftImages,
     onPasteIntoDraft,

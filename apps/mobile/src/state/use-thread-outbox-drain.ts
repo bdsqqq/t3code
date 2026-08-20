@@ -4,7 +4,6 @@ import type {
   EnvironmentThreadShell,
 } from "@t3tools/client-runtime/state/shell";
 import type { AtomCommandResult } from "@t3tools/client-runtime/state/runtime";
-import { threadAllows } from "@t3tools/client-runtime/state/threads";
 import {
   CommandId,
   DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -25,9 +24,7 @@ import { useProjects, useThreadShells } from "./entities";
 import {
   confirmThreadOutboxMessageQueued,
   ensureThreadOutboxLoaded,
-  markThreadOutboxMessageIndeterminateInMemory,
   removeThreadOutboxMessage,
-  updateThreadOutboxMessage,
 } from "./thread-outbox";
 import {
   isQueuedThreadCreationSendable,
@@ -36,29 +33,23 @@ import {
   resolveThreadOutboxFailureAction,
   resolveQueuedThreadSettings,
   threadOutboxRetryDelayMs,
-  queuedMessageBlockedByCapabilities,
-  waitsForQueuedThreadVisibility,
   type QueuedThreadCreation,
   type QueuedThreadMessage,
   type ThreadOutboxCommandStage,
 } from "./thread-outbox-model";
-import { environmentThreadShells, threadEnvironment } from "./threads";
+import { threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
 import {
   editingQueuedMessageIdsAtom,
   useThreadOutboxMessages,
   useThreadOutboxShellStatuses,
 } from "./use-thread-outbox";
-import {
-  setPendingConnectionError,
-  useRemoteConnectionStatus,
-} from "./use-remote-environment-registry";
+import { useRemoteConnectionStatus } from "./use-remote-environment-registry";
 
 export const dispatchingQueuedMessageIdAtom = Atom.make<MessageId | null>(null).pipe(
   Atom.keepAlive,
   Atom.withLabel("mobile:thread-outbox:dispatching-message-id"),
 );
-const THREAD_OUTBOX_MAX_AUTOMATIC_RETRIES = 5;
 
 function beginDispatchingQueuedMessage(queuedMessageId: MessageId): void {
   appAtomRegistry.set(dispatchingQueuedMessageIdAtom, queuedMessageId);
@@ -116,8 +107,6 @@ export function useThreadOutboxDrain(): void {
   const retryAttemptRef = useRef(new Map<MessageId, number>());
   const retryNotBeforeRef = useRef(new Map<MessageId, number>());
   const retryTimersRef = useRef(new Map<MessageId, ReturnType<typeof setTimeout>>());
-  const indeterminatePersistenceRef = useRef(new Set<MessageId>());
-  const exhaustedRetryRef = useRef(new Set<MessageId>());
 
   useEffect(() => {
     ensureThreadOutboxLoaded();
@@ -159,31 +148,6 @@ export function useThreadOutboxDrain(): void {
       if (reportFailure(deliveryResult, "start-turn")) {
         return false;
       }
-      if (
-        deliveryResult._tag === "Success" &&
-        typeof deliveryResult.value === "object" &&
-        deliveryResult.value !== null &&
-        "deliveryStatus" in deliveryResult.value &&
-        deliveryResult.value.deliveryStatus === "indeterminate"
-      ) {
-        indeterminatePersistenceRef.current.add(queuedMessage.messageId);
-        try {
-          const updated = await updateThreadOutboxMessage({
-            ...queuedMessage,
-            deliveryStatus: "indeterminate",
-          });
-          if (updated) indeterminatePersistenceRef.current.delete(queuedMessage.messageId);
-          return updated;
-        } catch (error) {
-          console.warn("[thread-outbox] failed to persist indeterminate delivery", {
-            environmentId: queuedMessage.environmentId,
-            threadId: queuedMessage.threadId,
-            messageId: queuedMessage.messageId,
-            error,
-          });
-          return false;
-        }
-      }
 
       try {
         await removeThreadOutboxMessage(queuedMessage);
@@ -203,16 +167,10 @@ export function useThreadOutboxDrain(): void {
 
   const sendQueuedMessage = useCallback(
     async (queuedMessage: QueuedThreadMessage, thread: EnvironmentThreadShell) => {
-      if (queuedMessageBlockedByCapabilities(queuedMessage, thread)) {
-        return false;
-      }
       const settings = resolveQueuedThreadSettings(queuedMessage, thread);
       const { reportFailure, completeDelivery } = makeDeliveryHelpers(queuedMessage);
 
-      if (
-        threadAllows(thread, "changeModel") &&
-        !modelSelectionsEqual(settings.modelSelection, thread.modelSelection)
-      ) {
+      if (!modelSelectionsEqual(settings.modelSelection, thread.modelSelection)) {
         const updateResult = await updateThreadMetadata({
           environmentId: queuedMessage.environmentId,
           input: {
@@ -227,10 +185,7 @@ export function useThreadOutboxDrain(): void {
         }
       }
 
-      if (
-        threadAllows(thread, "changeRuntimeMode") &&
-        settings.runtimeMode !== thread.runtimeMode
-      ) {
+      if (settings.runtimeMode !== thread.runtimeMode) {
         const runtimeResult = await setThreadRuntimeMode({
           environmentId: queuedMessage.environmentId,
           input: {
@@ -246,10 +201,7 @@ export function useThreadOutboxDrain(): void {
         }
       }
 
-      if (
-        threadAllows(thread, "changeInteractionMode") &&
-        settings.interactionMode !== thread.interactionMode
-      ) {
+      if (settings.interactionMode !== thread.interactionMode) {
         const interactionResult = await setThreadInteractionMode({
           environmentId: queuedMessage.environmentId,
           input: {
@@ -279,9 +231,6 @@ export function useThreadOutboxDrain(): void {
           modelSelection: settings.modelSelection,
           runtimeMode: settings.runtimeMode,
           interactionMode: settings.interactionMode,
-          ...(queuedMessage.streamingBehavior === undefined
-            ? {}
-            : { streamingBehavior: queuedMessage.streamingBehavior }),
           createdAt: queuedMessage.createdAt,
         },
       });
@@ -346,31 +295,16 @@ export function useThreadOutboxDrain(): void {
       if (editingQueuedMessageIds[nextQueuedMessage.messageId]) {
         continue;
       }
-      if (nextQueuedMessage.deliveryStatus === "indeterminate") {
-        continue;
-      }
-      if (exhaustedRetryRef.current.has(nextQueuedMessage.messageId)) {
-        continue;
-      }
       if ((retryNotBeforeRef.current.get(nextQueuedMessage.messageId) ?? 0) > Date.now()) {
         continue;
       }
 
       const thread = findThread(threads, nextQueuedMessage);
-      if (waitsForQueuedThreadVisibility(nextQueuedMessage, thread !== undefined)) {
-        continue;
-      }
       if (thread && scopedThreadKey(thread.environmentId, thread.id) !== threadKey) {
         continue;
       }
 
       const creation = nextQueuedMessage.creation;
-      if (thread !== undefined && queuedMessageBlockedByCapabilities(nextQueuedMessage, thread)) {
-        if (thread.backing?.kind === "external" && thread.session?.status === "starting") {
-          continue;
-        }
-        indeterminatePersistenceRef.current.add(nextQueuedMessage.messageId);
-      }
       const environment = connectedEnvironments.find(
         (candidate) => candidate.environmentId === nextQueuedMessage.environmentId,
       );
@@ -380,13 +314,7 @@ export function useThreadOutboxDrain(): void {
         threadExists: thread !== undefined,
         shellStatus,
         environmentConnected: environment?.connectionState === "connected",
-        threadBusy:
-          thread?.session?.status === "starting" ||
-          (thread?.session?.status === "running" &&
-            !(
-              nextQueuedMessage.streamingBehavior !== undefined &&
-              threadAllows(thread, nextQueuedMessage.streamingBehavior)
-            )),
+        threadBusy: thread?.session?.status === "running" || thread?.session?.status === "starting",
       });
       if (deliveryAction === "wait") {
         continue;
@@ -425,29 +353,19 @@ export function useThreadOutboxDrain(): void {
             return false;
           },
         );
-      const deliverPersistedMessage = () => {
-        if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[nextQueuedMessage.messageId]) {
+      // Enqueues publish optimistically before their durable write settles.
+      // Confirm the write landed (and the message wasn't rolled back) before
+      // sending, so a failed write can never chase an already-delivered turn.
+      const delivery = confirmThreadOutboxMessageQueued(nextQueuedMessage).then((queued) => {
+        if (!queued) {
+          // Rolled back by a failed write; nothing to deliver or retry.
           return true;
         }
-        const freshThread = findThread(
-          appAtomRegistry.get(environmentThreadShells.threadShellsAtom),
-          nextQueuedMessage,
-        );
-        const freshThreadBusy =
-          freshThread?.session?.status === "starting" ||
-          (freshThread?.session?.status === "running" &&
-            !(
-              nextQueuedMessage.streamingBehavior !== undefined &&
-              threadAllows(freshThread, nextQueuedMessage.streamingBehavior)
-            ));
-        const freshThreadBlocked =
-          freshThread !== undefined &&
-          queuedMessageBlockedByCapabilities(nextQueuedMessage, freshThread);
-        if (
-          deliveryAction === "send" &&
-          creation === undefined &&
-          (freshThreadBusy || freshThreadBlocked)
-        ) {
+        // The guards evaluated before the confirmation await are stale by now:
+        // the user may have opened this message in the editor. Re-read that
+        // guard and defer to the next drain pass (returning true skips the
+        // failure/backoff path) rather than sending a payload being edited.
+        if (appAtomRegistry.get(editingQueuedMessageIdsAtom)[nextQueuedMessage.messageId]) {
           return true;
         }
         return deliveryAction === "remove"
@@ -456,33 +374,10 @@ export function useThreadOutboxDrain(): void {
             ? creationProjectCwd !== null
               ? sendQueuedCreation(nextQueuedMessage, creation, creationProjectCwd)
               : removeQueuedMessage("[thread-outbox] dropped pending task for a missing project")
-            : freshThread !== undefined
-              ? sendQueuedMessage(nextQueuedMessage, freshThread)
+            : thread !== undefined
+              ? sendQueuedMessage(nextQueuedMessage, thread)
               : Promise.resolve(false);
-      };
-      const delivery = indeterminatePersistenceRef.current.has(nextQueuedMessage.messageId)
-        ? updateThreadOutboxMessage({
-            ...nextQueuedMessage,
-            deliveryStatus: "indeterminate",
-          }).then(
-            (updated) => {
-              if (!updated) return false;
-              indeterminatePersistenceRef.current.delete(nextQueuedMessage.messageId);
-              return deliverPersistedMessage();
-            },
-            (error) => {
-              console.warn("[thread-outbox] failed to retry indeterminate persistence", {
-                environmentId: nextQueuedMessage.environmentId,
-                threadId: nextQueuedMessage.threadId,
-                messageId: nextQueuedMessage.messageId,
-                error,
-              });
-              return false;
-            },
-          )
-        : confirmThreadOutboxMessageQueued(nextQueuedMessage).then((queued) =>
-            queued ? deliverPersistedMessage() : true,
-          );
+      });
       void delivery
         .then((sent) => {
           if (sent) {
@@ -498,14 +393,6 @@ export function useThreadOutboxDrain(): void {
 
           const retryAttempt = (retryAttemptRef.current.get(nextQueuedMessage.messageId) ?? 0) + 1;
           retryAttemptRef.current.set(nextQueuedMessage.messageId, retryAttempt);
-          if (retryAttempt >= THREAD_OUTBOX_MAX_AUTOMATIC_RETRIES) {
-            exhaustedRetryRef.current.add(nextQueuedMessage.messageId);
-            markThreadOutboxMessageIndeterminateInMemory(nextQueuedMessage);
-            setPendingConnectionError(
-              "Queued message retry paused after repeated storage failures. Discard it from the configuration menu or reopen the app to retry.",
-            );
-            return;
-          }
           const retryDelayMs = threadOutboxRetryDelayMs(retryAttempt);
           retryNotBeforeRef.current.set(nextQueuedMessage.messageId, Date.now() + retryDelayMs);
           const pendingTimer = retryTimersRef.current.get(nextQueuedMessage.messageId);

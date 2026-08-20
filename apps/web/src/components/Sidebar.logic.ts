@@ -16,8 +16,12 @@ import { resolveServerBackedAppStageLabel } from "../branding.logic";
 export const THREAD_SELECTION_SAFE_SELECTOR = "[data-thread-item], [data-thread-selection-safe]";
 export const THREAD_JUMP_HINT_SHOW_DELAY_MS = 100;
 // Visible sidebar rows are prewarmed into the thread-detail cache so opening a
-// nearby thread usually reuses an already-hot subscription.
-export const SIDEBAR_THREAD_PREWARM_LIMIT = 10;
+// nearby thread usually reuses an already-hot subscription. Each prewarmed
+// thread holds a live, fully hydrated detail subscription (all messages and
+// activities, growing as agents work) for as long as the row stays visible,
+// so this limit is a direct renderer-heap and server-load multiplier — keep
+// it small; cold opens still render instantly from the cached snapshot.
+export const SIDEBAR_THREAD_PREWARM_LIMIT = 3;
 
 type SidebarProject = {
   id: string;
@@ -123,6 +127,7 @@ export function buildBulkTitleRegenerationContextMenuItem(input: {
 export interface ThreadStatusPill {
   label:
     | "Working"
+    | "Monitoring"
     | "Connecting"
     | "Completed"
     | "Pending Approval"
@@ -133,12 +138,16 @@ export interface ThreadStatusPill {
   pulse: boolean;
 }
 
+// Rollup order mirrors the per-thread resolver exactly: attention states,
+// then active work, then the actionable plan prompt, then passive
+// monitoring. A Monitoring sibling must never hide a Plan Ready thread.
 const THREAD_STATUS_PRIORITY: Record<ThreadStatusPill["label"], number> = {
-  "Pending Approval": 5,
-  "Awaiting Input": 4,
-  Working: 3,
-  Connecting: 3,
-  "Plan Ready": 2,
+  "Pending Approval": 6,
+  "Awaiting Input": 5,
+  Working: 4,
+  Connecting: 4,
+  "Plan Ready": 3,
+  Monitoring: 2,
   Completed: 1,
 };
 
@@ -150,6 +159,7 @@ type ThreadStatusInput = Pick<
   | "interactionMode"
   | "latestTurn"
   | "session"
+  | "backgroundLiveness"
 > & {
   lastVisitedAt?: string | undefined;
 };
@@ -269,6 +279,35 @@ export function shouldClearThreadSelectionOnMouseDown(target: HTMLElement | null
 // still count as a normal single activation.
 export function isTrailingDoubleClick(detail: number): boolean {
   return detail > 1;
+}
+
+function nodeClosest(node: object | null, selector: string): unknown {
+  if (node === null || !("closest" in node) || typeof node.closest !== "function") return null;
+  return node.closest(selector);
+}
+
+/** Clicks on a nested link keep the link's meaning. The row must not treat them as multi-select. */
+export function isSidebarNestedLinkClick(target: EventTarget | null): boolean {
+  if (target == null || typeof target !== "object") return false;
+  if (nodeClosest(target, "a[href]") !== null) return true;
+  const parent =
+    "parentElement" in target &&
+    target.parentElement !== null &&
+    typeof target.parentElement === "object"
+      ? target.parentElement
+      : null;
+  return nodeClosest(parent, "a[href]") !== null;
+}
+
+// Shift+click on the new thread button creates directly in the current
+// project, skipping the command palette's project picker. With a single
+// project there is nothing to pick, so a plain click already creates
+// immediately and the modifier changes nothing.
+export function shouldCreateNewThreadInCurrentProject(
+  shiftKey: boolean,
+  projectGroupCount: number,
+): boolean {
+  return shiftKey || projectGroupCount <= 1;
 }
 
 export function orderItemsByPreferredIds<TItem, TId>(input: {
@@ -420,21 +459,27 @@ export function resolveThreadRowClassName(input: {
   );
 }
 
-// ── Sidebar v2 status model ─────────────────────────────────────────
+// ── Sidebar thread status model ─────────────────────────────────────
 // Five visual states, three colors: color is reserved for "act now"
 // (approval), "in motion" (working), and "broken" (failed). Ready is the
 // unlabeled resting state — the agent stopped and is waiting on the user,
 // whether it finished, asked a question, or proposed a plan.
 // Unread completion is tracked separately: it describes whether a ready
 // thread needs attention, not what the thread is currently doing.
-export type SidebarV2Status = "approval" | "input" | "working" | "failed" | "ready";
+export type SidebarThreadStatus =
+  | "approval"
+  | "input"
+  | "working"
+  | "monitoring"
+  | "failed"
+  | "ready";
 
-type SidebarV2StatusInput = Pick<
+type SidebarThreadStatusInput = Pick<
   SidebarThreadSummary,
-  "hasPendingApprovals" | "hasPendingUserInput" | "session"
+  "hasPendingApprovals" | "hasPendingUserInput" | "session" | "backgroundLiveness"
 >;
 
-export function resolveSidebarV2Status(thread: SidebarV2StatusInput): SidebarV2Status {
+export function resolveSidebarThreadStatus(thread: SidebarThreadStatusInput): SidebarThreadStatus {
   if (thread.hasPendingApprovals) {
     return "approval";
   }
@@ -444,8 +489,18 @@ export function resolveSidebarV2Status(thread: SidebarV2StatusInput): SidebarV2S
   if (thread.session?.status === "running" || thread.session?.status === "starting") {
     return "working";
   }
+  // A failed session outranks lingering background liveness: the user must
+  // see the failure, not a stale Working (review finding).
   if (thread.session?.status === "error") {
     return "failed";
+  }
+  // Background work outlives the turn: fleets read as working; monitoring
+  // only when watch loops are the sole live work.
+  if (thread.backgroundLiveness === "working") {
+    return "working";
+  }
+  if (thread.backgroundLiveness === "monitoring") {
+    return "monitoring";
   }
   return "ready";
 }
@@ -483,11 +538,11 @@ export function firstValidTimestamp(
   return null;
 }
 
-// v2 sort: static creation order, newest thread on top. Activity NEVER
+// Sidebar sort: static creation order, newest thread on top. Activity NEVER
 // reorders the list — a row holds its position from open until settled, so
 // the screen only moves at lifecycle transitions. Status (including pending
 // approval) is carried by each card's edge strip, not by position.
-export function sortThreadsForSidebarV2<
+export function sortThreadsForSidebar<
   T extends { readonly id: string; readonly createdAt: string },
 >(threads: readonly T[]): T[] {
   return [...threads].toSorted(
@@ -497,386 +552,27 @@ export function sortThreadsForSidebarV2<
   );
 }
 
-export interface SidebarThreadTreeEntry<T> {
-  readonly thread: T;
-  readonly depth: number;
-  readonly isLast: boolean;
-  readonly ancestorContinues: readonly boolean[];
-  readonly childCount: number;
-}
-
-export type SidebarThreadTreeDisplayItem<T> =
-  | {
-      readonly kind: "thread";
-      readonly entry: SidebarThreadTreeEntry<T>;
-    }
-  | {
-      readonly kind: "control";
-      readonly action: "expand" | "collapse";
-      readonly parentKey: string;
-      readonly hiddenCount: number;
-      readonly depth: number;
-      readonly isLast: boolean;
-      readonly ancestorContinues: readonly boolean[];
-    };
+// Pinned-reorder key math and the keyed sort live in client-runtime
+// (state/thread-sort) so web and mobile compute identical pinned orders.
+export {
+  generateSpreadPinOrderKeys,
+  pinOrderKeyBetween,
+  planPinnedReorder,
+} from "@t3tools/client-runtime/state/thread-sort";
+export { sortPinnedThreadsByOrderKey as sortPinnedThreadsForSidebar } from "@t3tools/client-runtime/state/thread-sort";
 
 /**
- * Pi stores a sub-session's parent as another session file. The server
- * resolves that path to `parentThreadId`; this client-only projection keeps
- * descendants beside their root while preserving the caller's existing sort.
- * Missing parents are roots, matching Pi's session picker.
+ * Search the already-ordered sidebar thread collection by title only.
+ * Keeping the input order means lifecycle ordering (active, snoozed, settled)
+ * remains stable while the user narrows the list.
  */
-export function buildSidebarThreadTree<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-    readonly backing?:
-      | {
-          readonly parentThreadId?: string | undefined;
-        }
-      | undefined;
-  },
->(threads: readonly T[], hasNotification?: (thread: T) => boolean): SidebarThreadTreeEntry<T>[] {
-  type Node = { readonly thread: T; readonly children: Node[] };
-  const keyFor = (thread: Pick<T, "environmentId" | "id">) =>
-    `${thread.environmentId}:${thread.id}`;
-  const nodes = new Map<string, Node>();
-  for (const thread of threads) nodes.set(keyFor(thread), { thread, children: [] });
-  const roots: Node[] = [];
-
-  for (const thread of threads) {
-    const node = nodes.get(keyFor(thread))!;
-    const parentId = thread.backing?.parentThreadId;
-    const parent =
-      parentId === undefined ? undefined : nodes.get(`${thread.environmentId}:${parentId}`);
-    if (parent === undefined || parent === node) roots.push(node);
-    else parent.children.push(node);
-  }
-  if (hasNotification) {
-    const prioritizeChildren = (nodes: readonly Node[]) => {
-      for (const node of nodes) {
-        node.children.sort(
-          (left, right) =>
-            Number(hasNotification(right.thread)) - Number(hasNotification(left.thread)),
-        );
-        prioritizeChildren(node.children);
-      }
-    };
-    prioritizeChildren(roots);
-  }
-
-  const entries: SidebarThreadTreeEntry<T>[] = [];
-  const visited = new Set<Node>();
-  const walk = (
-    node: Node,
-    depth: number,
-    ancestorContinues: readonly boolean[],
-    isLast: boolean,
-  ) => {
-    if (visited.has(node)) return;
-    visited.add(node);
-    entries.push({
-      thread: node.thread,
-      depth,
-      isLast,
-      ancestorContinues,
-      childCount: node.children.length,
-    });
-    const children = node.children.filter((child) => !visited.has(child));
-    children.forEach((child, index) =>
-      walk(
-        child,
-        depth + 1,
-        [...ancestorContinues, depth > 0 && !isLast],
-        index === children.length - 1,
-      ),
-    );
-  };
-
-  roots.forEach((root, index) => walk(root, 0, [], index === roots.length - 1));
-  // Generated Pi metadata is acyclic. If a hand-edited header introduces a
-  // cycle, promote its first listed node rather than silently dropping rows.
-  for (const node of nodes.values()) if (!visited.has(node)) walk(node, 0, [], true);
-  return entries;
-}
-
-const COLLAPSED_TREE_LEADING_CHILDREN = 2;
-const COLLAPSED_TREE_TRAILING_CHILDREN = 1;
-const DEFAULT_TREE_CHILD_COLLAPSE_THRESHOLD = 5;
-const EMPTY_TREE_PARENT_KEYS: ReadonlySet<string> = new Set();
-
-export function sidebarTreeParentKeysContainingHiddenThread<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-    readonly backing?:
-      | {
-          readonly parentThreadId?: string | undefined;
-        }
-      | undefined;
-  },
->(
-  entries: readonly SidebarThreadTreeEntry<T>[],
-  targetKey: string,
-  collapseThreshold = DEFAULT_TREE_CHILD_COLLAPSE_THRESHOLD,
-): ReadonlySet<string> {
-  const entryByKey = new Map<string, SidebarThreadTreeEntry<T>>(
-    entries.map((entry) => [`${entry.thread.environmentId}:${entry.thread.id}`, entry] as const),
-  );
-  const childrenByParentKey = new Map<string, SidebarThreadTreeEntry<T>[]>();
-  for (const entry of entries) {
-    const parentId = entry.thread.backing?.parentThreadId;
-    if (parentId === undefined) continue;
-    const parentKey = `${entry.thread.environmentId}:${parentId}`;
-    const siblings = childrenByParentKey.get(parentKey);
-    if (siblings) siblings.push(entry);
-    else childrenByParentKey.set(parentKey, [entry]);
-  }
-
-  const parentKeys = new Set<string>();
-  const visitedKeys = new Set<string>();
-  let currentKey = targetKey;
-  let current = entryByKey.get(targetKey);
-  while (current && !visitedKeys.has(currentKey)) {
-    visitedKeys.add(currentKey);
-    const parentId = current.thread.backing?.parentThreadId;
-    if (parentId === undefined) break;
-    const parentKey = `${current.thread.environmentId}:${parentId}`;
-    const siblings = childrenByParentKey.get(parentKey) ?? [];
-    const index = siblings.indexOf(current);
-    if (
-      siblings.length > collapseThreshold &&
-      index >= COLLAPSED_TREE_LEADING_CHILDREN &&
-      index < siblings.length - COLLAPSED_TREE_TRAILING_CHILDREN
-    ) {
-      parentKeys.add(parentKey);
-    }
-    currentKey = parentKey;
-    current = entryByKey.get(parentKey);
-  }
-  return parentKeys;
-}
-
-export function sidebarTreeAncestorKeysForThread<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-    readonly backing?:
-      | {
-          readonly parentThreadId?: string | undefined;
-        }
-      | undefined;
-  },
->(entries: readonly SidebarThreadTreeEntry<T>[], targetKey: string): ReadonlySet<string> {
-  const entryByKey = new Map<string, SidebarThreadTreeEntry<T>>(
-    entries.map((entry) => [`${entry.thread.environmentId}:${entry.thread.id}`, entry] as const),
-  );
-  const ancestors = new Set<string>();
-  const visited = new Set<string>();
-  let currentKey = targetKey;
-  let current = entryByKey.get(currentKey);
-  while (current && !visited.has(currentKey)) {
-    visited.add(currentKey);
-    const parentId = current.thread.backing?.parentThreadId;
-    if (parentId === undefined) break;
-    const parentKey = `${current.thread.environmentId}:${parentId}`;
-    if (!entryByKey.has(parentKey)) break;
-    ancestors.add(parentKey);
-    currentKey = parentKey;
-    current = entryByKey.get(parentKey);
-  }
-  return ancestors;
-}
-
-export function sidebarThreadTreeSubtreeContainingThread<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-  },
->(
-  entries: readonly SidebarThreadTreeEntry<T>[],
-  targetKey: string,
-): readonly SidebarThreadTreeEntry<T>[] {
-  const targetIndex = entries.findIndex(
-    (entry) => `${entry.thread.environmentId}:${entry.thread.id}` === targetKey,
-  );
-  if (targetIndex < 0) return [];
-  let rootIndex = targetIndex;
-  while (rootIndex > 0 && entries[rootIndex]!.depth > 0) rootIndex -= 1;
-  let endIndex = rootIndex + 1;
-  while (endIndex < entries.length && entries[endIndex]!.depth > 0) endIndex += 1;
-  return entries.slice(rootIndex, endIndex);
-}
-
-export function resolveCollapsedSidebarTreeParentKeys<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-  },
->(input: {
-  readonly active: readonly SidebarThreadTreeEntry<T>[];
-  readonly snoozed: readonly SidebarThreadTreeEntry<T>[];
-  readonly settled: readonly SidebarThreadTreeEntry<T>[];
-  readonly visibilityOverrides: ReadonlyMap<string, boolean>;
-  readonly forcedVisibleParentKeys: ReadonlySet<string>;
-}): ReadonlySet<string> {
-  const collapsed = new Set<string>();
-  const collect = (entries: readonly SidebarThreadTreeEntry<T>[], defaultVisible: boolean) => {
-    for (const entry of entries) {
-      if (entry.childCount === 0) continue;
-      const key = `${entry.thread.environmentId}:${entry.thread.id}`;
-      const visible = input.visibilityOverrides.get(key) ?? defaultVisible;
-      if (!visible && !input.forcedVisibleParentKeys.has(key)) collapsed.add(key);
-    }
-  };
-  collect(input.active, true);
-  collect(input.snoozed, true);
-  collect(input.settled, false);
-  return collapsed;
-}
-
-/**
- * Dense subagent families keep their first and last children visible while
- * replacing the middle with one expandable row. Collapse happens per parent,
- * so nested trees retain their own hierarchy rather than being sliced flat.
- */
-export function buildCollapsibleSidebarThreadTree<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-    readonly backing?:
-      | {
-          readonly parentThreadId?: string | undefined;
-        }
-      | undefined;
-  },
->(
-  entries: readonly SidebarThreadTreeEntry<T>[],
-  expandedParentKeys: ReadonlySet<string>,
-  collapsedParentKeys: ReadonlySet<string> = EMPTY_TREE_PARENT_KEYS,
-  collapseThreshold = DEFAULT_TREE_CHILD_COLLAPSE_THRESHOLD,
-): SidebarThreadTreeDisplayItem<T>[] {
-  type Node = {
-    readonly entry: SidebarThreadTreeEntry<T>;
-    readonly children: Node[];
-  };
-  const roots: Node[] = [];
-  const stack: Node[] = [];
-  for (const entry of entries) {
-    const node: Node = { entry, children: [] };
-    const parent = entry.depth === 0 ? undefined : stack[entry.depth - 1];
-    const parentId = entry.thread.backing?.parentThreadId;
-    const parentMatches =
-      parent !== undefined &&
-      parentId === parent.entry.thread.id &&
-      entry.thread.environmentId === parent.entry.thread.environmentId;
-    if (parentMatches) parent.children.push(node);
-    else roots.push(node);
-    stack[entry.depth] = node;
-    stack.length = entry.depth + 1;
-  }
-
-  const countNodes = (node: Node): number =>
-    1 + node.children.reduce((total, child) => total + countNodes(child), 0);
-  const result: SidebarThreadTreeDisplayItem<T>[] = [];
-  const walk = (
-    node: Node,
-    depth: number,
-    ancestorContinues: readonly boolean[],
-    isLast: boolean,
-  ) => {
-    const entry = {
-      ...node.entry,
-      depth,
-      ancestorContinues,
-      isLast,
-      childCount: node.children.length,
-    };
-    result.push({ kind: "thread", entry });
-    const { children } = node;
-    const parentKey = `${entry.thread.environmentId}:${entry.thread.id}`;
-    if (collapsedParentKeys.has(parentKey)) return;
-    const childAncestorContinues = [...ancestorContinues, depth > 0 && !isLast];
-    const walkChild = (child: Node, index: number) =>
-      walk(child, depth + 1, childAncestorContinues, index === children.length - 1);
-    if (children.length <= collapseThreshold) {
-      children.forEach(walkChild);
-      return;
-    }
-
-    const expanded = expandedParentKeys.has(parentKey);
-    const leading = children.slice(0, COLLAPSED_TREE_LEADING_CHILDREN);
-    const trailing = children.slice(-COLLAPSED_TREE_TRAILING_CHILDREN);
-    leading.forEach(walkChild);
-    const middle = children.slice(
-      COLLAPSED_TREE_LEADING_CHILDREN,
-      expanded ? children.length : -COLLAPSED_TREE_TRAILING_CHILDREN,
-    );
-    result.push({
-      kind: "control",
-      action: expanded ? "collapse" : "expand",
-      parentKey,
-      hiddenCount: middle.reduce((total, child) => total + countNodes(child), 0),
-      depth: depth + 1,
-      isLast: false,
-      ancestorContinues: childAncestorContinues,
-    });
-    if (expanded) {
-      middle.forEach((child, index) => walkChild(child, index + COLLAPSED_TREE_LEADING_CHILDREN));
-    } else {
-      trailing.forEach((child, index) =>
-        walkChild(child, children.length - COLLAPSED_TREE_TRAILING_CHILDREN + index),
-      );
-    }
-  };
-
-  roots.forEach((root, index) => walk(root, 0, [], index === roots.length - 1));
-  return result;
-}
-
-export type SidebarThreadSection = "active" | "snoozed" | "settled";
-
-/**
- * A Pi session tree moves through lifecycle shelves with its root parent.
- * Otherwise a fresh child can pull a settled parent back into the inbox and
- * the hierarchy degrades into unrelated lifecycle states.
- */
-export function partitionSidebarThreadTrees<
-  T extends {
-    readonly id: string;
-    readonly environmentId: string;
-    readonly backing?:
-      | {
-          readonly parentThreadId?: string | undefined;
-        }
-      | undefined;
-  },
->(
+export function searchSidebarThreadsByTitle<T extends { readonly title: string }>(
   threads: readonly T[],
-  sectionFor: (thread: T) => SidebarThreadSection,
-): Record<SidebarThreadSection, T[]> {
-  const partitioned: Record<SidebarThreadSection, T[]> = {
-    active: [],
-    snoozed: [],
-    settled: [],
-  };
-  let subtree: T[] = [];
-  let subtreeSection: SidebarThreadSection = "active";
-  const flush = () => {
-    if (subtree.length === 0) return;
-    partitioned[subtreeSection].push(...subtree);
-    subtree = [];
-  };
-
-  for (const entry of buildSidebarThreadTree(threads)) {
-    if (entry.depth === 0) {
-      flush();
-      subtreeSection = sectionFor(entry.thread);
-    }
-    subtree.push(entry.thread);
-  }
-  flush();
-  return partitioned;
+  query: string,
+): T[] {
+  const normalizedQuery = query.trim().toLowerCase();
+  if (normalizedQuery.length === 0) return [];
+  return threads.filter((thread) => thread.title.toLowerCase().includes(normalizedQuery));
 }
 
 type SettledTimestampInput = Pick<
@@ -912,7 +608,7 @@ export function resolveSettledTimestamp(thread: SettledTimestampInput): string |
 
 // Settled rows are history, so they order by when the work ENDED, not when
 // the thread was created or last touched.
-export function sortSettledThreadsForSidebarV2<
+export function sortSettledThreadsForSidebar<
   T extends SettledTimestampInput & { readonly id: string },
 >(threads: readonly T[]): T[] {
   const timestampMs = (thread: T) => {
@@ -987,6 +683,8 @@ export function resolveThreadStatusPill(input: {
     };
   }
 
+  // An actionable plan prompt outranks lingering background work: it needs
+  // the user's decision, while liveness merely reports (review finding).
   const hasPlanReadyPrompt =
     !thread.hasPendingUserInput &&
     thread.interactionMode === "plan" &&
@@ -997,6 +695,28 @@ export function resolveThreadStatusPill(input: {
       label: "Plan Ready",
       colorClass: "text-violet-600 dark:text-violet-300/90",
       dotClass: "bg-violet-500 dark:bg-violet-300/90",
+      pulse: false,
+    };
+  }
+
+  // The turn can settle while native background work runs on. Subagent and
+  // workflow fleets read as plain Working; Monitoring is reserved for watch
+  // loops (a parent agent babysitting a PR, tailing checks) with no other
+  // live work. Same recede treatment as Working per inbox-zero.
+  if (thread.backgroundLiveness === "working") {
+    return {
+      label: "Working",
+      colorClass: "text-sky-600 dark:text-sky-300/80",
+      dotClass: "bg-sky-500 dark:bg-sky-300/80",
+      pulse: true,
+    };
+  }
+
+  if (thread.backgroundLiveness === "monitoring") {
+    return {
+      label: "Monitoring",
+      colorClass: "text-sky-600 dark:text-sky-300/80",
+      dotClass: "bg-sky-500 dark:bg-sky-300/80",
       pulse: false,
     };
   }

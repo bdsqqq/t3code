@@ -15,26 +15,29 @@ import {
   getProjectSortTimestamp,
   hasUnseenCompletion,
   isContextMenuPointerDown,
+  isSidebarNestedLinkClick,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
   partitionSidebarThreadTrees,
   resolveProjectStatusIndicator,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
-  resolveSidebarV2Status,
-  sidebarTreeAncestorKeysForThread,
-  sidebarTreeParentKeysContainingHiddenThread,
-  sidebarThreadTreeSubtreeContainingThread,
+  resolveSidebarThreadStatus,
   resolveThreadStatusPill,
   resolveWorkingStartedAt,
+  searchSidebarThreadsByTitle,
   formatWorkingDurationLabel,
   shouldNavigateAfterProjectRemoval,
   shouldClearThreadSelectionOnMouseDown,
   sortLogicalProjectsForSidebar,
-  sortSettledThreadsForSidebarV2,
-  sortThreadsForSidebarV2,
+  sortSettledThreadsForSidebar,
+  pinOrderKeyBetween,
+  planPinnedReorder,
+  sortPinnedThreadsForSidebar,
+  sortThreadsForSidebar,
   sortProjectsForSidebar,
   sortScopedProjectsForSidebar,
+  shouldCreateNewThreadInCurrentProject,
   THREAD_JUMP_HINT_SHOW_DELAY_MS,
 } from "./Sidebar.logic";
 import {
@@ -439,6 +442,42 @@ describe("isTrailingDoubleClick", () => {
   });
 });
 
+describe("isSidebarNestedLinkClick", () => {
+  const linkTarget = {
+    closest: (selector: string) => (selector === "a[href]" ? ({} as Element) : null),
+  } as unknown as EventTarget;
+
+  it("ignores row clicks that originated on a nested link", () => {
+    expect(isSidebarNestedLinkClick(linkTarget)).toBe(true);
+  });
+
+  it("walks up from a text node to the enclosing link", () => {
+    expect(isSidebarNestedLinkClick({ parentElement: linkTarget } as unknown as EventTarget)).toBe(
+      true,
+    );
+  });
+
+  it("leaves ordinary row clicks alone", () => {
+    expect(isSidebarNestedLinkClick({ closest: () => null } as unknown as EventTarget)).toBe(false);
+    expect(isSidebarNestedLinkClick(null)).toBe(false);
+  });
+});
+
+describe("shouldCreateNewThreadInCurrentProject", () => {
+  it("creates directly on shift+click in a multi-project setup", () => {
+    expect(shouldCreateNewThreadInCurrentProject(true, 2)).toBe(true);
+  });
+
+  it("opens the picker on a plain click in a multi-project setup", () => {
+    expect(shouldCreateNewThreadInCurrentProject(false, 2)).toBe(false);
+  });
+
+  it("creates directly on any click with a single project", () => {
+    expect(shouldCreateNewThreadInCurrentProject(false, 1)).toBe(true);
+    expect(shouldCreateNewThreadInCurrentProject(true, 1)).toBe(true);
+  });
+});
+
 describe("orderItemsByPreferredIds", () => {
   it("keeps preferred ids first, skips stale ids, and preserves the relative order of remaining items", () => {
     const ordered = orderItemsByPreferredIds({
@@ -656,7 +695,7 @@ describe("isContextMenuPointerDown", () => {
   });
 });
 
-describe("resolveSidebarV2Status", () => {
+describe("resolveSidebarThreadStatus", () => {
   const session = {
     threadId: ThreadId.make("thread-1"),
     status: "running" as const,
@@ -671,15 +710,17 @@ describe("resolveSidebarV2Status", () => {
   const idle = { hasPendingApprovals: false, hasPendingUserInput: false };
 
   it("prioritizes approval over a running session", () => {
-    expect(resolveSidebarV2Status({ ...idle, hasPendingApprovals: true, session })).toBe(
+    expect(resolveSidebarThreadStatus({ ...idle, hasPendingApprovals: true, session })).toBe(
       "approval",
     );
   });
 
   it("prioritizes awaiting input over a running session, below approval", () => {
-    expect(resolveSidebarV2Status({ ...idle, hasPendingUserInput: true, session })).toBe("input");
+    expect(resolveSidebarThreadStatus({ ...idle, hasPendingUserInput: true, session })).toBe(
+      "input",
+    );
     expect(
-      resolveSidebarV2Status({
+      resolveSidebarThreadStatus({
         ...idle,
         hasPendingApprovals: true,
         hasPendingUserInput: true,
@@ -689,9 +730,9 @@ describe("resolveSidebarV2Status", () => {
   });
 
   it("reports working for running and starting sessions", () => {
-    expect(resolveSidebarV2Status({ ...idle, session })).toBe("working");
+    expect(resolveSidebarThreadStatus({ ...idle, session })).toBe("working");
     expect(
-      resolveSidebarV2Status({
+      resolveSidebarThreadStatus({
         ...idle,
         session: { ...session, status: "starting" as const },
       }),
@@ -700,19 +741,19 @@ describe("resolveSidebarV2Status", () => {
 
   it("reports failed only while the session status is error", () => {
     expect(
-      resolveSidebarV2Status({
+      resolveSidebarThreadStatus({
         ...idle,
         session: { ...session, status: "error" as const, lastError: "boom" },
       }),
     ).toBe("failed");
     expect(
-      resolveSidebarV2Status({
+      resolveSidebarThreadStatus({
         ...idle,
         session: { ...session, status: "stopped" as const, lastError: "persisted" },
       }),
     ).toBe("ready");
     expect(
-      resolveSidebarV2Status({
+      resolveSidebarThreadStatus({
         ...idle,
         session: { ...session, status: "ready" as const, lastError: "persisted" },
       }),
@@ -720,18 +761,38 @@ describe("resolveSidebarV2Status", () => {
   });
 
   it("defaults to ready with no session", () => {
-    expect(resolveSidebarV2Status({ ...idle, session: null })).toBe("ready");
+    expect(resolveSidebarThreadStatus({ ...idle, session: null })).toBe("ready");
   });
 });
 
-describe("sortThreadsForSidebarV2", () => {
+describe("searchSidebarThreadsByTitle", () => {
+  const threads = [
+    { id: "thread-1", title: "Fix workspace search", project: "Alpha" },
+    { id: "thread-2", title: "Review providers", project: "Workspace" },
+    { id: "thread-3", title: "WORKTREE cleanup", project: "Beta" },
+  ];
+
+  it("matches thread titles case-insensitively and preserves their order", () => {
+    expect(searchSidebarThreadsByTitle(threads, "work")).toEqual([threads[0], threads[2]]);
+  });
+
+  it("does not match project metadata", () => {
+    expect(searchSidebarThreadsByTitle(threads, "workspace")).toEqual([threads[0]]);
+  });
+
+  it("returns no results for an empty query", () => {
+    expect(searchSidebarThreadsByTitle(threads, "   ")).toEqual([]);
+  });
+});
+
+describe("sortThreadsForSidebar", () => {
   const sortable = (input: { id: string; createdAt: string }) => ({
     id: input.id,
     createdAt: input.createdAt,
   });
 
   it("orders by creation time, newest first, ignoring activity", () => {
-    const sorted = sortThreadsForSidebarV2([
+    const sorted = sortThreadsForSidebar([
       sortable({ id: "oldest", createdAt: "2026-03-09T08:00:00.000Z" }),
       sortable({ id: "newest", createdAt: "2026-03-09T12:00:00.000Z" }),
       sortable({ id: "middle", createdAt: "2026-03-09T10:00:00.000Z" }),
@@ -741,7 +802,7 @@ describe("sortThreadsForSidebarV2", () => {
   });
 
   it("breaks creation-time ties by id so the order is stable", () => {
-    const sorted = sortThreadsForSidebarV2([
+    const sorted = sortThreadsForSidebar([
       sortable({ id: "b", createdAt: "2026-03-09T10:00:00.000Z" }),
       sortable({ id: "a", createdAt: "2026-03-09T10:00:00.000Z" }),
     ]);
@@ -750,247 +811,137 @@ describe("sortThreadsForSidebarV2", () => {
   });
 });
 
-describe("buildSidebarThreadTree", () => {
-  const thread = (id: string, parentThreadId?: string) => ({
-    id,
-    environmentId: "environment-1",
-    backing: {
-      source: "pi" as const,
-      ...(parentThreadId === undefined ? {} : { parentThreadId }),
-    },
+describe("pinOrderKeyBetween", () => {
+  it("produces keys that sort between their bounds", () => {
+    const middle = pinOrderKeyBetween(null, null)!;
+    const top = pinOrderKeyBetween(null, middle)!;
+    const bottom = pinOrderKeyBetween(middle, null)!;
+    expect(top < middle).toBe(true);
+    expect(middle < bottom).toBe(true);
+
+    const between = pinOrderKeyBetween(top, middle)!;
+    expect(top < between && between < middle).toBe(true);
   });
 
-  it("places descendants after their root with Pi tree metadata", () => {
-    const entries = buildSidebarThreadTree([
-      thread("new-root"),
-      thread("child-b", "root"),
-      thread("root"),
-      thread("grandchild", "child-a"),
-      thread("child-a", "root"),
-    ]);
-
-    expect(
-      entries.map(({ thread, depth, isLast, ancestorContinues }) => ({
-        id: thread.id,
-        depth,
-        isLast,
-        ancestorContinues,
-      })),
-    ).toEqual([
-      { id: "new-root", depth: 0, isLast: false, ancestorContinues: [] },
-      { id: "root", depth: 0, isLast: true, ancestorContinues: [] },
-      { id: "child-b", depth: 1, isLast: false, ancestorContinues: [false] },
-      { id: "child-a", depth: 1, isLast: true, ancestorContinues: [false] },
-      { id: "grandchild", depth: 2, isLast: true, ancestorContinues: [false, false] },
-    ]);
+  it("extends into new digits when bounds are adjacent", () => {
+    const key = pinOrderKeyBetween("g", "h")!;
+    expect("g" < key && key < "h").toBe(true);
   });
 
-  it("promotes a child whose parent is not in the visible list", () => {
-    expect(buildSidebarThreadTree([thread("orphan", "missing")])).toMatchObject([
-      { thread: { id: "orphan" }, depth: 0 },
-    ]);
+  it("stays strictly ordered under repeated top insertion", () => {
+    // Every new pin lands at the head of the arranged run; keys must keep
+    // sorting before the previous head without ever bottoming out.
+    let head: string | null = null;
+    const keys: string[] = [];
+    for (let i = 0; i < 100; i += 1) {
+      const key: string = pinOrderKeyBetween(null, head)!;
+      expect(key).not.toBeNull();
+      if (head !== null) expect(key < head).toBe(true);
+      keys.push(key);
+      head = key;
+    }
+    expect(new Set(keys).size).toBe(100);
   });
 
-  it("moves external Pi children below an internal T3 parent", () => {
-    const parent = {
-      id: "internal-parent",
-      environmentId: "environment-1",
-      backing: undefined,
-    };
-    const entries = buildSidebarThreadTree([thread("child", parent.id), parent]);
-
-    expect(entries.map(({ thread, depth }) => ({ id: thread.id, depth }))).toEqual([
-      { id: "internal-parent", depth: 0 },
-      { id: "child", depth: 1 },
-    ]);
+  it("stays strictly ordered under repeated middle insertion", () => {
+    let low = pinOrderKeyBetween(null, null)!;
+    let high = pinOrderKeyBetween(low, null)!;
+    for (let i = 0; i < 100; i += 1) {
+      const key: string = pinOrderKeyBetween(low, high)!;
+      expect(low < key && key < high).toBe(true);
+      if (i % 2 === 0) low = key;
+      else high = key;
+    }
   });
 
-  it("raises notified children above siblings without reordering roots", () => {
-    const entries = buildSidebarThreadTree(
-      [thread("root-a"), thread("quiet", "root-a"), thread("notified", "root-a"), thread("root-b")],
-      (candidate) => candidate.id === "notified",
-    );
-
-    expect(entries.map((entry) => entry.thread.id)).toEqual([
-      "root-a",
-      "notified",
-      "quiet",
-      "root-b",
-    ]);
-  });
-
-  it("moves the whole tree with its settled parent", () => {
-    const parent = {
-      id: "internal-parent",
-      environmentId: "environment-1",
-      backing: undefined,
-    };
-    const child = thread("child", parent.id);
-    const partitioned = partitionSidebarThreadTrees([child, parent], (candidate) =>
-      candidate.id === child.id ? "active" : "settled",
-    );
-
-    expect(partitioned.settled.map((candidate) => candidate.id)).toEqual([
-      "internal-parent",
-      "child",
-    ]);
-    expect(partitioned.active).toEqual([]);
-  });
-
-  it("collapses the middle of large child lists and preserves the last connector", () => {
-    const children = Array.from({ length: 8 }, (_, index) => thread(`child-${index}`, "root"));
-    const display = buildCollapsibleSidebarThreadTree(
-      buildSidebarThreadTree([thread("root"), ...children]),
-      new Set(),
-    );
-
-    expect(
-      display.map((item) =>
-        item.kind === "thread"
-          ? item.entry.thread.id
-          : `${item.action}:${item.hiddenCount}:${item.isLast}`,
-      ),
-    ).toEqual(["root", "child-0", "child-1", "expand:5:false", "child-7"]);
-    expect(display.at(-1)).toMatchObject({
-      kind: "thread",
-      entry: { thread: { id: "child-7" }, isLast: true },
-    });
-  });
-
-  it("expands and re-collapses a large child list from the middle control", () => {
-    const children = Array.from({ length: 6 }, (_, index) => thread(`child-${index}`, "root"));
-    const entries = buildSidebarThreadTree([thread("root"), ...children]);
-    const display = buildCollapsibleSidebarThreadTree(entries, new Set(["environment-1:root"]));
-
-    expect(
-      display.map((item) =>
-        item.kind === "thread" ? item.entry.thread.id : `${item.action}:${item.parentKey}`,
-      ),
-    ).toEqual([
-      "root",
-      "child-0",
-      "child-1",
-      "collapse:environment-1:root",
-      "child-2",
-      "child-3",
-      "child-4",
-      "child-5",
-    ]);
-  });
-
-  it("promotes a routed descendant when its ancestors are outside the visible page", () => {
-    const fullTree = buildSidebarThreadTree([
-      thread("root"),
-      thread("child", "root"),
-      thread("grandchild", "child"),
-    ]);
-    const display = buildCollapsibleSidebarThreadTree([fullTree[2]!], new Set());
-
-    expect(display).toMatchObject([
-      {
-        kind: "thread",
-        entry: {
-          thread: { id: "grandchild" },
-          depth: 0,
-          isLast: true,
-          ancestorContinues: [],
-          childCount: 0,
-        },
-      },
-    ]);
-  });
-
-  it("forces expansion only when the routed child is in the collapsed middle", () => {
-    const children = Array.from({ length: 7 }, (_, index) => thread(`child-${index}`, "root"));
-    const entries = buildSidebarThreadTree([thread("root"), ...children]);
-
-    expect([
-      ...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:child-3"),
-    ]).toEqual(["environment-1:root"]);
-    expect([
-      ...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:child-0"),
-    ]).toEqual([]);
-    expect([
-      ...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:child-6"),
-    ]).toEqual([]);
-  });
-
-  it("stops route ancestor traversal when hand-edited metadata contains a cycle", () => {
-    const entries = buildSidebarThreadTree([thread("a", "b"), thread("b", "a")]);
-
-    expect([...sidebarTreeParentKeysContainingHiddenThread(entries, "environment-1:a")]).toEqual(
-      [],
-    );
-  });
-
-  it("fully collapses a parent without losing its own row", () => {
-    const entries = buildSidebarThreadTree([
-      thread("root"),
-      thread("child-0", "root"),
-      thread("child-1", "root"),
-    ]);
-    const display = buildCollapsibleSidebarThreadTree(
-      entries,
-      new Set(),
-      new Set(["environment-1:root"]),
-    );
-
-    expect(display).toMatchObject([
-      { kind: "thread", entry: { thread: { id: "root" }, childCount: 2 } },
-    ]);
-  });
-
-  it("finds every visible ancestor needed to reveal a routed descendant", () => {
-    const entries = buildSidebarThreadTree([
-      thread("root"),
-      thread("child", "root"),
-      thread("grandchild", "child"),
-    ]);
-
-    expect([...sidebarTreeAncestorKeysForThread(entries, "environment-1:grandchild")]).toEqual([
-      "environment-1:child",
-      "environment-1:root",
-    ]);
-  });
-
-  it("folds settled parents by default while respecting reveal overrides", () => {
-    const entries = buildSidebarThreadTree([thread("root"), thread("child", "root")]);
-    const defaultCollapsed = resolveCollapsedSidebarTreeParentKeys({
-      active: [],
-      snoozed: [],
-      settled: entries,
-      visibilityOverrides: new Map(),
-      forcedVisibleParentKeys: new Set(),
-    });
-    const explicitlyVisible = resolveCollapsedSidebarTreeParentKeys({
-      active: [],
-      snoozed: [],
-      settled: entries,
-      visibilityOverrides: new Map([["environment-1:root", true]]),
-      forcedVisibleParentKeys: new Set(),
-    });
-
-    expect([...defaultCollapsed]).toEqual(["environment-1:root"]);
-    expect([...explicitlyVisible]).toEqual([]);
-  });
-
-  it("restores the complete owning subtree for a routed paginated child", () => {
-    const entries = buildSidebarThreadTree([
-      thread("other-root"),
-      thread("root"),
-      thread("child-0", "root"),
-      thread("child-1", "root"),
-    ]);
-
-    expect(
-      sidebarThreadTreeSubtreeContainingThread(entries, "environment-1:child-0").map(
-        (entry) => entry.thread.id,
-      ),
-    ).toEqual(["root", "child-0", "child-1"]);
+  it("returns null for corrupt or out-of-order bounds instead of throwing", () => {
+    expect(pinOrderKeyBetween("z", "a")).toBeNull();
+    expect(pinOrderKeyBetween("A!", null)).toBeNull();
+    expect(pinOrderKeyBetween(null, "ma")).toBeNull();
+    expect(pinOrderKeyBetween("m", "m")).toBeNull();
   });
 });
 
-describe("sortSettledThreadsForSidebarV2", () => {
+describe("planPinnedReorder", () => {
+  it("writes only the moved thread when neighbors are keyed", () => {
+    const assignments = planPinnedReorder({
+      orderedIds: ["a", "c", "b"],
+      keysById: new Map([
+        ["a", "f"],
+        ["b", "m"],
+        ["c", "t"],
+      ]),
+      movedId: "c",
+    });
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]!.id).toBe("c");
+    expect(assignments[0]!.orderKey > "f" && assignments[0]!.orderKey < "m").toBe(true);
+  });
+
+  it("treats list edges as open bounds", () => {
+    const assignments = planPinnedReorder({
+      orderedIds: ["b", "a"],
+      keysById: new Map([
+        ["a", "m"],
+        ["b", null],
+      ]),
+      movedId: "b",
+    });
+    expect(assignments).toHaveLength(1);
+    expect(assignments[0]!.orderKey < "m").toBe(true);
+  });
+
+  it("materializes keys for the whole section when a neighbor is keyless", () => {
+    const assignments = planPinnedReorder({
+      orderedIds: ["b", "a", "c"],
+      keysById: new Map([
+        ["a", null],
+        ["b", "m"],
+        ["c", null],
+      ]),
+      movedId: "b",
+    });
+    expect(assignments.map((entry) => entry.id)).toEqual(["b", "a", "c"]);
+    const keys = assignments.map((entry) => entry.orderKey);
+    expect([...keys].sort()).toEqual(keys);
+    expect(new Set(keys).size).toBe(keys.length);
+  });
+});
+
+describe("sortPinnedThreadsForSidebar", () => {
+  const pinnable = (input: { id: string; createdAt: string; pinOrderKey?: string | null }) => ({
+    id: input.id,
+    createdAt: input.createdAt,
+    pinOrderKey: input.pinOrderKey ?? null,
+  });
+
+  it("sorts keyed threads by key ahead of keyless threads in creation order", () => {
+    const sorted = sortPinnedThreadsForSidebar([
+      pinnable({ id: "keyless-old", createdAt: "2026-03-09T08:00:00.000Z" }),
+      pinnable({ id: "second", createdAt: "2026-03-09T09:00:00.000Z", pinOrderKey: "t" }),
+      pinnable({ id: "keyless-new", createdAt: "2026-03-09T12:00:00.000Z" }),
+      pinnable({ id: "first", createdAt: "2026-03-09T07:00:00.000Z", pinOrderKey: "g" }),
+    ]);
+
+    expect(sorted.map((thread) => thread.id)).toEqual([
+      "first",
+      "second",
+      "keyless-new",
+      "keyless-old",
+    ]);
+  });
+
+  it("breaks equal keys by id so raced writes render identically everywhere", () => {
+    const sorted = sortPinnedThreadsForSidebar([
+      pinnable({ id: "b", createdAt: "2026-03-09T10:00:00.000Z", pinOrderKey: "m" }),
+      pinnable({ id: "a", createdAt: "2026-03-09T11:00:00.000Z", pinOrderKey: "m" }),
+    ]);
+
+    expect(sorted.map((thread) => thread.id)).toEqual(["a", "b"]);
+  });
+});
+
+describe("sortSettledThreadsForSidebar", () => {
   const settled = (input: {
     id: string;
     settledAt?: string | null;
@@ -1006,7 +957,7 @@ describe("sortSettledThreadsForSidebarV2", () => {
   });
 
   it("orders by settle time, most recently settled first", () => {
-    const sorted = sortSettledThreadsForSidebarV2([
+    const sorted = sortSettledThreadsForSidebar([
       settled({
         id: "settled-first",
         settledAt: "2026-03-09T10:00:00.000Z",
@@ -1024,7 +975,7 @@ describe("sortSettledThreadsForSidebarV2", () => {
   });
 
   it("falls back to last activity for auto-settled threads without a settledAt stamp", () => {
-    const sorted = sortSettledThreadsForSidebarV2([
+    const sorted = sortSettledThreadsForSidebar([
       settled({ id: "auto-old", latestUserMessageAt: "2026-03-09T08:00:00.000Z" }),
       settled({ id: "explicit", settledAt: "2026-03-09T10:00:00.000Z" }),
       settled({ id: "auto-recent", latestUserMessageAt: "2026-03-09T11:00:00.000Z" }),
@@ -1036,7 +987,7 @@ describe("sortSettledThreadsForSidebarV2", () => {
   it("counts a turn completion as activity for auto-settled threads", () => {
     // The message came in before the other thread's, but its turn finished
     // after: completion time is the real "work ended" moment.
-    const sorted = sortSettledThreadsForSidebarV2([
+    const sorted = sortSettledThreadsForSidebar([
       settled({ id: "message-only", latestUserMessageAt: "2026-03-09T10:04:00.000Z" }),
       settled({
         id: "completed-later",
@@ -1049,7 +1000,7 @@ describe("sortSettledThreadsForSidebarV2", () => {
   });
 
   it("breaks timestamp ties by id so the order is stable", () => {
-    const sorted = sortSettledThreadsForSidebarV2([
+    const sorted = sortSettledThreadsForSidebar([
       settled({ id: "b", settledAt: "2026-03-09T10:00:00.000Z" }),
       settled({ id: "a", settledAt: "2026-03-09T10:00:00.000Z" }),
     ]);

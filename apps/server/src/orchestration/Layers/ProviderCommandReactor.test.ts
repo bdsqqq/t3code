@@ -48,6 +48,8 @@ import * as RepositoryIdentityResolver from "../../project/RepositoryIdentityRes
 import { OrchestrationEngineLive } from "./OrchestrationEngine.ts";
 import { OrchestrationProjectionPipelineLive } from "./ProjectionPipeline.ts";
 import { OrchestrationProjectionSnapshotQueryLive } from "./ProjectionSnapshotQuery.ts";
+import * as ThreadBackgroundLiveness from "../ThreadBackgroundLiveness.ts";
+import * as ThreadPlanProgress from "../ThreadPlanProgress.ts";
 import {
   providerErrorLabel,
   providerErrorLabelFromInstanceHint,
@@ -148,9 +150,6 @@ describe("ProviderCommandReactor", () => {
     readonly requiresNewThreadForModelChange?: boolean;
     readonly titleRegenerationCompletionDispatchFailures?: number;
     readonly titleRegenerationBeforeStart?: "one" | "two";
-    readonly pendingTurnBeforeStart?: boolean;
-    readonly pendingTurnModelSelection?: ModelSelection;
-    readonly runningSessionBeforeStart?: boolean;
     readonly startSessionEffect?: (
       session: ProviderSession,
     ) => Effect.Effect<ProviderSession, ProviderAdapterRequestError>;
@@ -348,6 +347,8 @@ describe("ProviderCommandReactor", () => {
 
     const orchestrationLayer = OrchestrationEngineLive.pipe(
       Layer.provide(OrchestrationProjectionSnapshotQueryLive),
+      Layer.provide(ThreadBackgroundLiveness.layer),
+      Layer.provide(ThreadPlanProgress.layer),
       Layer.provide(OrchestrationProjectionPipelineLive),
       Layer.provide(OrchestrationEventStoreLive),
       Layer.provide(OrchestrationCommandReceiptRepositoryLive),
@@ -355,6 +356,8 @@ describe("ProviderCommandReactor", () => {
       Layer.provide(SqlitePersistenceMemory),
     );
     const projectionSnapshotLayer = OrchestrationProjectionSnapshotQueryLive.pipe(
+      Layer.provide(ThreadBackgroundLiveness.layer),
+      Layer.provide(ThreadPlanProgress.layer),
       Layer.provide(RepositoryIdentityResolver.layer),
       Layer.provide(SqlitePersistenceMemory),
     );
@@ -411,7 +414,6 @@ describe("ProviderCommandReactor", () => {
       ),
       Layer.provideMerge(ServerSettingsService.layerTest()),
       Layer.provideMerge(ServerConfig.layerTest(process.cwd(), baseDir)),
-      Layer.provideMerge(SqlitePersistenceMemory),
       Layer.provideMerge(NodeServices.layer),
     );
     runtime = ManagedRuntime.make(layer);
@@ -482,85 +484,6 @@ describe("ProviderCommandReactor", () => {
         }),
       );
     }
-    if (input?.pendingTurnBeforeStart === true) {
-      await Effect.runPromise(
-        engine.dispatch({
-          type: "thread.session.set",
-          commandId: CommandId.make("cmd-session-stopped-before-reactor-start"),
-          threadId: ThreadId.make("thread-1"),
-          session: {
-            threadId: ThreadId.make("thread-1"),
-            status: "stopped",
-            providerName: "codex",
-            providerInstanceId: ProviderInstanceId.make("codex"),
-            runtimeMode: "approval-required",
-            activeTurnId: null,
-            lastError: null,
-            updatedAt: now,
-          },
-          createdAt: now,
-        }),
-      );
-      await Effect.runPromise(
-        engine.dispatch({
-          type: "thread.interaction-mode.set",
-          commandId: CommandId.make("cmd-plan-mode-before-reactor-start"),
-          threadId: ThreadId.make("thread-1"),
-          interactionMode: "plan",
-          createdAt: now,
-        }),
-      );
-      await Effect.runPromise(
-        engine.dispatch({
-          type: "thread.turn.start",
-          commandId: CommandId.make("cmd-turn-start-before-reactor-start"),
-          threadId: ThreadId.make("thread-1"),
-          message: {
-            messageId: asMessageId("user-message-before-reactor-start"),
-            role: "user",
-            text: "resume after restart",
-            attachments: [],
-          },
-          modelSelection: input.pendingTurnModelSelection ?? {
-            instanceId: ProviderInstanceId.make("codex_work"),
-            model: "gpt-5-codex",
-          },
-          titleSeed: "Thread",
-          interactionMode: "plan",
-          runtimeMode: "approval-required",
-          createdAt: now,
-        }),
-      );
-      await Effect.runPromise(
-        engine.dispatch({
-          type: "thread.interaction-mode.set",
-          commandId: CommandId.make("cmd-default-mode-before-reactor-start"),
-          threadId: ThreadId.make("thread-1"),
-          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          createdAt: now,
-        }),
-      );
-    }
-    if (input?.runningSessionBeforeStart === true) {
-      await Effect.runPromise(
-        engine.dispatch({
-          type: "thread.session.set",
-          commandId: CommandId.make("cmd-session-running-before-reactor-start"),
-          threadId: ThreadId.make("thread-1"),
-          session: {
-            threadId: ThreadId.make("thread-1"),
-            status: "running",
-            providerName: "codex",
-            providerInstanceId: ProviderInstanceId.make("codex"),
-            runtimeMode: "approval-required",
-            activeTurnId: asTurnId("turn-running-before-reactor-start"),
-            lastError: null,
-            updatedAt: now,
-          },
-          createdAt: now,
-        }),
-      );
-    }
 
     scope = await Effect.runPromise(Scope.make("sequential"));
     await Effect.runPromise(reactor.start().pipe(Scope.provide(scope)));
@@ -621,80 +544,12 @@ describe("ProviderCommandReactor", () => {
       },
       runtimeMode: "approval-required",
     });
-    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
-      operationId: CommandId.make("cmd-turn-start-1"),
-    });
 
     const readModel = await harness.readModel();
     const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
     expect(thread?.session?.threadId).toBe("thread-1");
     expect(thread?.session?.status).toBe("starting");
     expect(thread?.session?.runtimeMode).toBe("approval-required");
-  });
-
-  it("replays a pending turn accepted before reactor startup", async () => {
-    const harness = await createHarness({ pendingTurnBeforeStart: true });
-
-    await waitFor(() => harness.startSession.mock.calls.length === 1);
-    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
-    await harness.drain();
-
-    expect(harness.startSession).toHaveBeenCalledTimes(1);
-    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
-    expect(harness.startSession.mock.calls[0]?.[0]).toEqual(ThreadId.make("thread-1"));
-    expect(harness.startSession.mock.calls[0]?.[1]).toMatchObject({
-      providerInstanceId: ProviderInstanceId.make("codex_work"),
-      modelSelection: {
-        instanceId: ProviderInstanceId.make("codex_work"),
-        model: "gpt-5-codex",
-      },
-    });
-    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
-      threadId: ThreadId.make("thread-1"),
-      operationId: CommandId.make("cmd-turn-start-before-reactor-start"),
-      input: "resume after restart",
-      interactionMode: "plan",
-    });
-    expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
-  });
-
-  it("forwards marked managed Pi recovery as claimable with its stable identity", async () => {
-    const piModelSelection = {
-      instanceId: ProviderInstanceId.make("pi"),
-      model: "openai/gpt-5",
-    };
-    const harness = await createHarness({
-      threadModelSelection: piModelSelection,
-      pendingTurnBeforeStart: true,
-      pendingTurnModelSelection: piModelSelection,
-    });
-
-    await waitFor(() => harness.sendTurn.mock.calls.length === 1);
-    await harness.drain();
-
-    expect(harness.startSession).not.toHaveBeenCalled();
-    expect(harness.sendTurn).toHaveBeenCalledTimes(1);
-    expect(harness.sendTurn.mock.calls[0]?.[0]).toMatchObject({
-      threadId: ThreadId.make("thread-1"),
-      operationId: CommandId.make("cmd-turn-start-before-reactor-start"),
-      input: "resume after restart",
-      modelSelection: piModelSelection,
-      interactionMode: "plan",
-    });
-  });
-
-  it("resumes a projected running session before accepting new work", async () => {
-    const harness = await createHarness({ runningSessionBeforeStart: true });
-
-    await waitFor(() => harness.startSession.mock.calls.length === 1);
-    await harness.drain();
-
-    expect(harness.startSession).toHaveBeenCalledTimes(1);
-    expect(harness.sendTurn).not.toHaveBeenCalled();
-    const readModel = await harness.readModel();
-    const thread = readModel.threads.find((entry) => entry.id === ThreadId.make("thread-1"));
-    expect(thread?.session?.status).toBe("ready");
-    expect(thread?.session?.activeTurnId).toBeNull();
   });
 
   effectIt.effect("projects starting before a slow provider session finishes", () =>
@@ -936,6 +791,123 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.titleRegeneration).toBeNull();
   });
 
+  it("pins the first user message when regeneration context is truncated", async () => {
+    const harness = await createHarness();
+    const now = "2026-01-01T00:00:00.000Z";
+    const firstUserMessage = `Review subagent monitoring risks. ${"Opening context. ".repeat(200)}`;
+    const recentUserMessage = `LATEST FINDING: ${"implementation detail ".repeat(320)}`;
+    harness.generateThreadTitle.mockReturnValue(
+      Effect.succeed({ title: "Review subagent monitoring risks" }),
+    );
+
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-existing-long"),
+        threadId: ThreadId.make("thread-1"),
+        title: "Generic PR review",
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-turn-start-before-long-title-regeneration"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("user-message-before-long-title-regeneration"),
+          role: "user",
+          text: firstUserMessage,
+          attachments: [
+            {
+              type: "image",
+              id: "opening-context-image",
+              name: "image.png",
+              mimeType: "image/png",
+              sizeBytes: 5,
+            },
+          ],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: now,
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-middle-turn-before-long-title-regeneration"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("middle-message-before-long-title-regeneration"),
+          role: "user",
+          text: "Temporary handoff details.",
+          attachments: [
+            {
+              type: "image",
+              id: "middle-context-image",
+              name: "image.png",
+              mimeType: "image/png",
+              sizeBytes: 5,
+            },
+          ],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:01.000Z",
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.turn.start",
+        commandId: CommandId.make("cmd-recent-turn-before-long-title-regeneration"),
+        threadId: ThreadId.make("thread-1"),
+        message: {
+          messageId: asMessageId("recent-message-before-long-title-regeneration"),
+          role: "user",
+          text: recentUserMessage,
+          attachments: [
+            {
+              type: "image",
+              id: "recent-context-image",
+              name: "image.png",
+              mimeType: "image/png",
+              sizeBytes: 5,
+            },
+          ],
+        },
+        interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+        runtimeMode: "approval-required",
+        createdAt: "2026-01-01T00:00:02.000Z",
+      }),
+    );
+    await harness.runEffect(
+      harness.engine.dispatch({
+        type: "thread.meta.update",
+        commandId: CommandId.make("cmd-thread-title-regenerate-long"),
+        threadId: ThreadId.make("thread-1"),
+        regenerateTitle: true,
+      }),
+    );
+
+    await harness.drain();
+
+    expect(harness.generateThreadTitle).toHaveBeenCalledTimes(1);
+    const input = harness.generateThreadTitle.mock.calls[0]?.[0];
+    if (!input) {
+      throw new Error("Expected a title generation input");
+    }
+    const message = input.message;
+    expect(message.startsWith("USER:\nReview subagent monitoring risks.")).toBe(true);
+    expect(message).toContain("[First user message truncated]");
+    expect(message).toContain("[Earlier content truncated]");
+    expect(message).toContain("image.png");
+    expect(message).toHaveLength(8_000);
+    expect(input.attachments?.map((attachment) => attachment.id)).toEqual([
+      "opening-context-image",
+      "recent-context-image",
+    ]);
+  });
+
   it("clears title regeneration state left pending across reactor startup", async () => {
     const harness = await createHarness({
       titleRegenerationBeforeStart: "one",
@@ -1123,10 +1095,14 @@ describe("ProviderCommandReactor", () => {
     expect(thread?.titleRegeneration).toBeNull();
   });
 
-  it("keeps the full retained context and excludes attachments outside it", async () => {
+  it("pins the first user context and attachment before the retained tail", async () => {
     const harness = await createHarness();
     const now = "2026-01-01T00:00:00.000Z";
-    const retainedContext = "x".repeat(8_000);
+    const firstUserContext = "USER:\nOld visual issue\n[Attachments: old-issue.png]";
+    const truncationMarker = "[Earlier content truncated]\n\n";
+    const retainedContext = "x".repeat(
+      8_000 - firstUserContext.length - "\n\n".length - truncationMarker.length,
+    );
 
     await harness.runEffect(
       harness.engine.dispatch({
@@ -1191,9 +1167,14 @@ describe("ProviderCommandReactor", () => {
     await harness.drain();
 
     expect(harness.generateThreadTitle.mock.calls[0]?.[0].message).toBe(
-      `[Earlier content truncated]\n\n${retainedContext}`,
+      `${firstUserContext}\n\n${truncationMarker}${retainedContext}`,
     );
-    expect(harness.generateThreadTitle.mock.calls[0]?.[0].attachments).toBeUndefined();
+    expect(harness.generateThreadTitle.mock.calls[0]?.[0].attachments).toEqual([
+      expect.objectContaining({
+        id: "old-title-context-image",
+        name: "old-issue.png",
+      }),
+    ]);
   });
 
   it("does not overwrite a manual rename while title regeneration is running", async () => {

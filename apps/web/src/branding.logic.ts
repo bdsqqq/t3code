@@ -11,49 +11,6 @@ export function formatAppDisplayName(input: {
   return `${input.baseName} (${input.stageLabel})`;
 }
 
-/**
- * Whether the sidebar v2 beta is on by default for a build stage.
- *
- * The settled sidebar is now the default on every channel. Keep the stage
- * argument in this resolver because explicit user choices still flow through
- * the same settings contract and older clients call the stage-shaped API.
- */
-export function resolveSidebarV2Default(_stageLabel: string): boolean {
-  return true;
-}
-
-/**
- * Resolved sidebar v2 state: an explicit choice if the user has made one,
- * otherwise the default for this build stage.
- *
- * A stored `enabled: true` counts as an explicit choice even without the
- * companion flag. `true` was never the schema default, so it can only have come
- * from the Settings → Beta toggle — settings written before that flag existed
- * would otherwise lose the opt-in and drop such users back to v1 on production.
- * Mirrors how `normalizeDesktopSettingsDocument` treats a legacy stored
- * `updateChannel: "nightly"` as user-configured.
- *
- * `settingsHydrated` guards the startup window: client settings load
- * asynchronously and the pre-hydration snapshot is just the schema defaults, so
- * resolving against it would mount one sidebar and swap it out a tick later,
- * remounting the tree. While hydrating, hold v1 — where both paths already
- * start.
- */
-export function resolveSidebarV2Enabled(input: {
-  readonly enabled: boolean;
-  readonly configuredByUser: boolean;
-  readonly settingsHydrated: boolean;
-  readonly stageLabel: string;
-}): boolean {
-  if (!input.settingsHydrated) {
-    return false;
-  }
-
-  return input.configuredByUser || input.enabled
-    ? input.enabled
-    : resolveSidebarV2Default(input.stageLabel);
-}
-
 export function resolveServerBackedAppStageLabel(input: {
   readonly primaryServerVersion: string | null | undefined;
   readonly fallbackStageLabel: string;
