@@ -2266,7 +2266,7 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
     }),
   );
 
-  it.effect("retains only checkpointed message and activity turns after revert", () =>
+  it.effect("does not fallback-retain messages whose turnId is removed by revert", () =>
     Effect.gen(function* () {
       const projectionPipeline = yield* OrchestrationProjectionPipeline;
       const eventStore = yield* OrchestrationEventStore;
@@ -2368,30 +2368,6 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       });
 
       yield* appendAndProject({
-        type: "thread.activity-appended",
-        eventId: EventId.make("evt-revert-activity-keep"),
-        aggregateKind: "thread",
-        aggregateId: ThreadId.make("thread-revert"),
-        occurredAt: "2026-02-26T12:00:02.200Z",
-        commandId: CommandId.make("cmd-revert-activity-keep"),
-        causationEventId: null,
-        correlationId: CorrelationId.make("cmd-revert-activity-keep"),
-        metadata: {},
-        payload: {
-          threadId: ThreadId.make("thread-revert"),
-          activity: {
-            id: EventId.make("activity-revert-keep"),
-            tone: "tool",
-            kind: "tool.completed",
-            summary: "Kept tool boundary",
-            payload: { itemId: "tool-keep" },
-            turnId: TurnId.make("turn-1"),
-            createdAt: "2026-02-26T12:00:02.200Z",
-          },
-        },
-      });
-
-      yield* appendAndProject({
         type: "thread.turn-diff-completed",
         eventId: EventId.make("evt-revert-5"),
         aggregateKind: "thread",
@@ -2458,30 +2434,6 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
       });
 
       yield* appendAndProject({
-        type: "thread.activity-appended",
-        eventId: EventId.make("evt-revert-activity-remove"),
-        aggregateKind: "thread",
-        aggregateId: ThreadId.make("thread-revert"),
-        occurredAt: "2026-02-26T12:00:03.200Z",
-        commandId: CommandId.make("cmd-revert-activity-remove"),
-        causationEventId: null,
-        correlationId: CorrelationId.make("cmd-revert-activity-remove"),
-        metadata: {},
-        payload: {
-          threadId: ThreadId.make("thread-revert"),
-          activity: {
-            id: EventId.make("activity-revert-remove"),
-            tone: "tool",
-            kind: "tool.completed",
-            summary: "Removed tool boundary",
-            payload: { itemId: "tool-remove" },
-            turnId: TurnId.make("turn-2"),
-            createdAt: "2026-02-26T12:00:03.200Z",
-          },
-        },
-      });
-
-      yield* appendAndProject({
         type: "thread.reverted",
         eventId: EventId.make("evt-revert-8"),
         aggregateKind: "thread",
@@ -2517,29 +2469,6 @@ it.layer(BaseTestLayer)("OrchestrationProjectionPipeline", (it) => {
           role: "assistant",
         },
       ]);
-      const activityRows = yield* sql<{
-        readonly activityId: string;
-        readonly turnId: string | null;
-      }>`
-        SELECT activity_id AS "activityId", turn_id AS "turnId"
-        FROM projection_thread_activities
-        WHERE thread_id = 'thread-revert'
-        ORDER BY activity_id ASC
-      `;
-      assert.deepEqual(activityRows, [{ activityId: "activity-revert-keep", turnId: "turn-1" }]);
-      const activityHistory = yield* sql<{
-        readonly retentionFloorAppliedSequence: number;
-        readonly historyRevision: number;
-      }>`
-        SELECT
-          retention_floor_applied_sequence AS "retentionFloorAppliedSequence",
-          history_revision AS "historyRevision"
-        FROM projection_thread_activity_history
-        WHERE thread_id = 'thread-revert'
-      `;
-      assert.equal(activityHistory.length, 1);
-      assert.isAbove(activityHistory[0]?.retentionFloorAppliedSequence ?? 0, 0);
-      assert.equal(activityHistory[0]?.historyRevision, 1);
     }),
   );
 });

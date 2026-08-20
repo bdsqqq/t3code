@@ -3021,7 +3021,6 @@ describe("ProviderRuntimeIngestion", () => {
         ? (toolUpdate.payload as Record<string, unknown>)
         : undefined;
     expect(toolUpdate?.kind).toBe("tool.updated");
-    expect(toolUpdatePayload?.itemId).toBe("item-p1-tool");
     expect(toolUpdatePayload?.itemType).toBe("command_execution");
     expect(toolUpdatePayload?.status).toBe("in_progress");
     expect(toolUpdatePayload?.toolCallId).toBe("item-p1-tool");

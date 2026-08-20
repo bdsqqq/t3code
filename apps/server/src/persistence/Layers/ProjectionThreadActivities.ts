@@ -7,13 +7,8 @@ import * as Schema from "effect/Schema";
 import * as Struct from "effect/Struct";
 
 import { toPersistenceDecodeError, toPersistenceSqlError } from "../Errors.ts";
-import {
-  classifyActivityForRetention,
-  planCoalescibleToolUpdateRetention,
-} from "../../orchestration/ActivityRetentionPolicy.ts";
 
 import {
-  AdvanceProjectionThreadActivityHistoryInput,
   DeleteProjectionThreadActivitiesInput,
   ListProjectionThreadActivitiesInput,
   ProjectionThreadActivity,
@@ -28,15 +23,6 @@ const ProjectionThreadActivityDbRowSchema = ProjectionThreadActivity.mapFields(
   }),
 );
 
-const CoalescibleToolUpdateDbRowSchema = Schema.Struct({
-  activityId: ProjectionThreadActivity.fields.activityId,
-  logicalIdentity: Schema.String,
-  payloadUtf8Bytes: NonNegativeInt,
-  sequence: Schema.NullOr(NonNegativeInt),
-  createdAt: ProjectionThreadActivity.fields.createdAt,
-});
-const encodeActivityPayload = Schema.encodeUnknownEffect(Schema.UnknownFromJsonString);
-
 function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: string) {
   return (cause: unknown) =>
     Schema.isSchemaError(cause)
@@ -47,12 +33,10 @@ function toPersistenceSqlOrDecodeError(sqlOperation: string, decodeOperation: st
 const makeProjectionThreadActivityRepository = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
 
-  const upsertProjectionThreadActivityRow = (
-    row: ProjectionThreadActivity,
-    retentionIdentity: string | null,
-    payloadJson: string,
-  ) =>
-    sql`
+  const upsertProjectionThreadActivityRow = SqlSchema.void({
+    Request: ProjectionThreadActivity,
+    execute: (row) =>
+      sql`
             INSERT INTO projection_thread_activities (
               activity_id,
               thread_id,
@@ -63,8 +47,6 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               payload_json,
               sequence,
               applied_sequence,
-              retention_identity,
-              payload_utf8_bytes,
               created_at
             )
             VALUES (
@@ -74,11 +56,9 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               ${row.tone},
               ${row.kind},
               ${row.summary},
-              ${payloadJson},
+              ${JSON.stringify(row.payload)},
               ${row.sequence ?? null},
               ${row.appliedSequence},
-              ${retentionIdentity},
-              ${Buffer.byteLength(payloadJson, "utf8")},
               ${row.createdAt}
             )
             ON CONFLICT (activity_id)
@@ -91,10 +71,9 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
               payload_json = excluded.payload_json,
               sequence = excluded.sequence,
               applied_sequence = excluded.applied_sequence,
-              retention_identity = excluded.retention_identity,
-              payload_utf8_bytes = excluded.payload_utf8_bytes,
               created_at = excluded.created_at
-          `;
+          `,
+  });
 
   const listProjectionThreadActivityRows = SqlSchema.findAll({
     Request: ListProjectionThreadActivitiesInput,
@@ -131,103 +110,15 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
       `,
   });
 
-  const listCoalescibleToolUpdateRows = SqlSchema.findAll({
-    Request: Schema.Struct({
-      threadId: ProjectionThreadActivity.fields.threadId,
-      turnId: ProjectionThreadActivity.fields.turnId,
-    }),
-    Result: CoalescibleToolUpdateDbRowSchema,
-    execute: ({ threadId, turnId }) =>
-      sql`
-        SELECT
-          activity_id AS "activityId",
-          retention_identity AS "logicalIdentity",
-          payload_utf8_bytes AS "payloadUtf8Bytes",
-          sequence,
-          created_at AS "createdAt"
-        FROM projection_thread_activities
-        WHERE thread_id = ${threadId}
-          AND turn_id IS ${turnId}
-          AND kind = 'tool.updated'
-          AND retention_identity IS NOT NULL
-          AND payload_utf8_bytes IS NOT NULL
-      `,
-  });
-
-  const advanceProjectionThreadActivityHistory = SqlSchema.void({
-    Request: AdvanceProjectionThreadActivityHistoryInput,
-    execute: ({ threadId, appliedSequence, updatedAt }) =>
-      sql`
-        INSERT INTO projection_thread_activity_history (
-          thread_id,
-          retention_floor_applied_sequence,
-          history_revision,
-          updated_at
-        ) VALUES (${threadId}, ${appliedSequence}, 1, ${updatedAt})
-        ON CONFLICT (thread_id) DO UPDATE SET
-          retention_floor_applied_sequence = MAX(
-            retention_floor_applied_sequence,
-            excluded.retention_floor_applied_sequence
-          ),
-          history_revision = history_revision + 1,
-          updated_at = excluded.updated_at
-      `,
-  });
-
-  const advanceHistory: ProjectionThreadActivityRepositoryShape["advanceHistory"] = (input) =>
-    advanceProjectionThreadActivityHistory(input).pipe(
+  const upsert: ProjectionThreadActivityRepositoryShape["upsert"] = (row) =>
+    upsertProjectionThreadActivityRow(row).pipe(
       Effect.mapError(
         toPersistenceSqlOrDecodeError(
-          "ProjectionThreadActivityRepository.advanceHistory:query",
-          "ProjectionThreadActivityRepository.advanceHistory:encodeRequest",
+          "ProjectionThreadActivityRepository.upsert:query",
+          "ProjectionThreadActivityRepository.upsert:encodeRequest",
         ),
       ),
     );
-
-  const upsert: ProjectionThreadActivityRepositoryShape["upsert"] = Effect.fn(
-    "ProjectionThreadActivityRepository.upsert",
-  )(
-    function* (row) {
-      const payloadJson = yield* encodeActivityPayload(row.payload ?? null);
-      const classification = classifyActivityForRetention(row);
-      const retentionIdentity =
-        classification.kind === "coalescible-tool-update" ? classification.logicalIdentity : null;
-      yield* upsertProjectionThreadActivityRow(row, retentionIdentity, payloadJson);
-      if (retentionIdentity === null) {
-        return;
-      }
-
-      const scopeRows = yield* listCoalescibleToolUpdateRows({
-        threadId: row.threadId,
-        turnId: row.turnId,
-      });
-      const deletedRows = planCoalescibleToolUpdateRetention(scopeRows).filter(
-        ({ decision }) => decision.kind === "delete",
-      );
-      if (deletedRows.length === 0) {
-        return;
-      }
-      yield* Effect.forEach(
-        deletedRows,
-        ({ row: deletedRow }) => sql`
-        DELETE FROM projection_thread_activities
-        WHERE activity_id = ${deletedRow.activityId}
-      `,
-        { concurrency: 1, discard: true },
-      );
-      yield* advanceProjectionThreadActivityHistory({
-        threadId: row.threadId,
-        appliedSequence: row.appliedSequence,
-        updatedAt: row.createdAt,
-      });
-    },
-    Effect.mapError(
-      toPersistenceSqlOrDecodeError(
-        "ProjectionThreadActivityRepository.upsert:query",
-        "ProjectionThreadActivityRepository.upsert:retention",
-      ),
-    ),
-  );
 
   const listByThreadId: ProjectionThreadActivityRepositoryShape["listByThreadId"] = (input) =>
     listProjectionThreadActivityRows(input).pipe(
@@ -255,7 +146,6 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
 
   const deleteByThreadId: ProjectionThreadActivityRepositoryShape["deleteByThreadId"] = (input) =>
     deleteProjectionThreadActivityRows(input).pipe(
-      Effect.flatMap(() => advanceProjectionThreadActivityHistory(input)),
       Effect.mapError(
         toPersistenceSqlError("ProjectionThreadActivityRepository.deleteByThreadId:query"),
       ),
@@ -265,7 +155,6 @@ const makeProjectionThreadActivityRepository = Effect.gen(function* () {
     upsert,
     listByThreadId,
     deleteByThreadId,
-    advanceHistory,
   } satisfies ProjectionThreadActivityRepositoryShape;
 });
 

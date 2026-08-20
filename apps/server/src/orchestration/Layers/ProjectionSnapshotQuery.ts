@@ -2884,27 +2884,11 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       );
       if (Option.isNone(thread)) return Option.none<OrchestrationActivityPageResult>();
       const snapshot = yield* getSnapshotSequence();
-      const anchor = request.cursor.kind === "before" ? request.cursor.position : null;
-      const historyRows = yield* sql<ActivityHistoryStateRow>`
-        SELECT
-          retention_floor_applied_sequence AS "retentionFloorAppliedSequence",
-          history_revision AS "historyRevision"
-        FROM projection_thread_activity_history
-        WHERE thread_id = ${threadId}
-      `.pipe(
-        Effect.mapError(
-          toPersistenceSqlError("ProjectionSnapshotQuery.getThreadActivityPage:history"),
-        ),
-      );
-      const historyState = historyRows[0] ?? {
-        retentionFloorAppliedSequence: 0,
-        historyRevision: 0,
-      };
-      const historyRevision = historyState.historyRevision.toString();
       const asOfSequence =
         request.cursor.kind === "initial"
           ? (initialAsOfSequence ?? snapshot.snapshotSequence)
           : request.cursor.asOfSequence;
+      const anchor = request.cursor.kind === "before" ? request.cursor.position : null;
 
       const floorRows = yield* sql<OrchestrationActivityPosition>`
             SELECT sequence, created_at AS "createdAt", activity_id AS "activityId"
@@ -2919,10 +2903,6 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
       const retentionFloor = floorRows[0]
         ? { kind: "oldest-available" as const, position: floorRows[0] }
         : { kind: "empty" as const };
-
-      if (asOfSequence < historyState.retentionFloorAppliedSequence) {
-        return Option.some({ kind: "cursor-expired", asOfSequence, retentionFloor });
-      }
 
       if (anchor !== null) {
         const exact = yield* sql<{ readonly present: number }>`
@@ -2946,17 +2926,10 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
             (cursorFloor.position.activityId !== retentionFloor.position.activityId ||
               cursorFloor.position.sequence !== retentionFloor.position.sequence ||
               cursorFloor.position.createdAt !== retentionFloor.position.createdAt));
-        const cursorHistoryRevision =
-          request.cursor.kind === "before" ? request.cursor.historyRevision : null;
-        const historyRevisionChanged =
-          cursorHistoryRevision === null
-            ? historyState.historyRevision !== 0
-            : cursorHistoryRevision !== historyRevision;
         if (
           exact[0]?.present !== 1 ||
           asOfSequence > snapshot.snapshotSequence ||
-          retentionFloorChanged ||
-          historyRevisionChanged
+          retentionFloorChanged
         ) {
           return Option.some({ kind: "cursor-expired", asOfSequence, retentionFloor });
         }
@@ -3059,7 +3032,7 @@ const makeProjectionSnapshotQuery = Effect.gen(function* () {
                 activityId: oldest.activityId,
               },
               retentionFloor,
-              historyRevision,
+              historyRevision: null,
             }
           : null;
       return Option.some({

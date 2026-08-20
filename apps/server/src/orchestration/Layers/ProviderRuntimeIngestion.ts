@@ -802,7 +802,6 @@ export function runtimeEventToActivities(
           kind: "tool.updated",
           summary: event.payload.title ?? "Tool updated",
           payload: {
-            ...(event.itemId ? { itemId: event.itemId } : {}),
             itemType: event.payload.itemType,
             ...(event.itemId !== undefined ? { toolCallId: event.itemId } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
@@ -831,7 +830,6 @@ export function runtimeEventToActivities(
           kind: "tool.completed",
           summary: event.payload.title ?? "Tool",
           payload: {
-            ...(event.itemId ? { itemId: event.itemId } : {}),
             itemType: event.payload.itemType,
             ...(event.itemId !== undefined ? { toolCallId: event.itemId } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
@@ -860,7 +858,6 @@ export function runtimeEventToActivities(
           kind: "tool.started",
           summary: `${event.payload.title ?? "Tool"} started`,
           payload: {
-            ...(event.itemId ? { itemId: event.itemId } : {}),
             itemType: event.payload.itemType,
             ...(event.itemId !== undefined ? { toolCallId: event.itemId } : {}),
             ...(event.payload.status ? { status: event.payload.status } : {}),
