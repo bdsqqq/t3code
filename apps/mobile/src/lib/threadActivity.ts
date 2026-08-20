@@ -1062,9 +1062,6 @@ function isEmptyMessage(entry: RawThreadFeedEntry): boolean {
   if (entry.type !== "message") {
     return false;
   }
-  if (entry.message.role === "system") {
-    return false;
-  }
   const hasText = entry.message.text.trim().length > 0;
   const hasAttachments = (entry.message.attachments ?? []).length > 0;
   return !hasText && !hasAttachments;

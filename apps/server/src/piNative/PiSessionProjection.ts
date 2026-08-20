@@ -234,54 +234,12 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
   let currentTurnId: TurnId | null = null;
   let model = "unknown";
 
-  const pushSystemMessage = (
-    entryId: string,
-    createdAt: string,
-    text: string,
-    surface: NonNullable<OrchestrationMessage["surface"]>,
-  ) => {
-    messages.push({
-      id: messageId(record, entryId),
-      role: "system",
-      text,
-      surface,
-      turnId: currentTurnId,
-      streaming: false,
-      createdAt,
-      updatedAt: createdAt,
-    });
-  };
-
   for (const entry of branch.entries) {
     const entryId = String(entry.id);
     const createdAt = timestamp(entry.timestamp, record.updatedAt);
     if (entry.type === "model_change" && typeof entry.modelId === "string") {
       model =
         typeof entry.provider === "string" ? `${entry.provider}/${entry.modelId}` : entry.modelId;
-      continue;
-    }
-    if (entry.type === "custom_message" && entry.display === true) {
-      pushSystemMessage(entryId, createdAt, contentText(entry.content), {
-        kind: "custom",
-        label:
-          typeof entry.customType === "string" && entry.customType.trim().length > 0
-            ? entry.customType
-            : "Extension message",
-      });
-      continue;
-    }
-    if (entry.type === "compaction" && typeof entry.summary === "string") {
-      pushSystemMessage(entryId, createdAt, entry.summary, {
-        kind: "compaction",
-        label: "Context compacted",
-      });
-      continue;
-    }
-    if (entry.type === "branch_summary" && typeof entry.summary === "string") {
-      pushSystemMessage(entryId, createdAt, entry.summary, {
-        kind: "branch-summary",
-        label: "Branch summarized",
-      });
       continue;
     }
     if (entry.type !== "message" || !isRecord(entry.message)) continue;
@@ -356,39 +314,6 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
           });
         }
       }
-      continue;
-    }
-    if (role === "custom") {
-      if (message.display === true) {
-        pushSystemMessage(entryId, createdAt, contentText(message.content), {
-          kind: "custom",
-          label:
-            typeof message.customType === "string" && message.customType.trim().length > 0
-              ? message.customType
-              : "Extension message",
-        });
-      }
-      continue;
-    }
-    if (role === "compactionSummary" && typeof message.summary === "string") {
-      pushSystemMessage(entryId, createdAt, message.summary, {
-        kind: "compaction",
-        label: "Context compacted",
-      });
-      continue;
-    }
-    if (role === "branchSummary" && typeof message.summary === "string") {
-      pushSystemMessage(entryId, createdAt, message.summary, {
-        kind: "branch-summary",
-        label: "Branch summarized",
-      });
-      continue;
-    }
-    if (role === "system") {
-      pushSystemMessage(entryId, createdAt, contentText(message.content), {
-        kind: "provider",
-        label: "System message",
-      });
       continue;
     }
     if (

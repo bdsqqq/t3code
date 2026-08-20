@@ -151,38 +151,6 @@ function makeThread(
 }
 
 describe("buildThreadFeed", () => {
-  it("retains empty system messages with semantic surfaces", () => {
-    const thread = makeThread({
-      id: ThreadId.make("thread-empty-system-message"),
-      projectId: ProjectId.make("project-1"),
-      title: "Label-only system message",
-      messages: [
-        {
-          id: MessageId.make("empty-system-message"),
-          role: "system",
-          text: "",
-          surface: { kind: "compaction", label: "Context compacted" },
-          turnId: null,
-          streaming: false,
-          createdAt: "2026-04-01T00:00:01.000Z",
-          updatedAt: "2026-04-01T00:00:01.000Z",
-        },
-      ],
-    });
-
-    expect(buildThreadFeed(thread)).toMatchObject([
-      {
-        type: "message",
-        message: {
-          id: "empty-system-message",
-          role: "system",
-          text: "",
-          surface: { kind: "compaction", label: "Context compacted" },
-        },
-      },
-    ]);
-  });
-
   it("keeps historic work entries attributed to their turns", () => {
     const thread = makeThread({
       id: ThreadId.make("thread-1"),
