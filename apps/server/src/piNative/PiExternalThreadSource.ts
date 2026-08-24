@@ -398,22 +398,22 @@ async function* catalogTriggers(): AsyncGenerator<void> {
   }
 }
 
-function imagesFrom(
+function validateInlineImages(
   command: Extract<ClientOrchestrationCommand, { readonly type: "thread.turn.start" }>,
 ) {
-  return command.message.attachments.map((attachment) => {
+  for (const attachment of command.message.attachments) {
+    // Uploaded attachments are rejected below with the same external-thread
+    // capability error; only inline payloads need data-url validation here.
+    if (!("dataUrl" in attachment)) {
+      continue;
+    }
     const comma = attachment.dataUrl.indexOf(",");
     if (comma < 0) throw new Error("invalid image data url");
     const data = attachment.dataUrl.slice(comma + 1);
     if (Buffer.byteLength(data, "base64") > PROVIDER_SEND_TURN_MAX_IMAGE_BYTES) {
       throw new Error("image exceeds the attachment byte ceiling");
     }
-    return {
-      type: "image" as const,
-      data,
-      mimeType: attachment.mimeType,
-    };
-  });
+  }
 }
 
 export class PiExternalThreadSource extends Context.Service<
@@ -1058,11 +1058,11 @@ export class PiExternalThreadSource extends Context.Service<
         const runtime = runtimeFor(result.record, runtimes);
         let receipt: SupervisorCommandReceipt;
         if (command.type === "thread.turn.start") {
-          const images = yield* Effect.try({
-            try: () => imagesFrom(command),
+          yield* Effect.try({
+            try: () => validateInlineImages(command),
             catch: (cause) => sourceError("invalid_attachment", cause),
           });
-          if (images.length > 0) {
+          if (command.message.attachments.length > 0) {
             return yield* sourceError(
               "attachments_unsupported",
               "Native Pi image attachments are unavailable.",
@@ -1089,7 +1089,6 @@ export class PiExternalThreadSource extends Context.Service<
               commandId: command.commandId,
               runtimeId: runtime.runtimeId,
               message: command.message.text,
-              ...(images.length === 0 ? {} : { images }),
             });
           }
         } else if (command.type === "thread.turn.interrupt") {
