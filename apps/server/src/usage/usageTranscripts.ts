@@ -68,7 +68,7 @@ export function totalTokens(totals: UsageTokenTotals): number {
  * an order of magnitude.
  */
 export function mightCarryUsage(line: string, provider: UsageProviderKind): boolean {
-  return provider === "claude" ? line.includes('"usage"') : line.includes('"token_count"');
+  return provider === "codex" ? line.includes('"token_count"') : line.includes('"usage"');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -294,6 +294,154 @@ export function parseCodexLine(line: string, state: CodexScanState): UsageRecord
     // Events surviving the fork-copy suppression above are unique to this
     // rollout, so they need no global dedup.
     dedupeKey: null,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Pi                                                                         */
+/* -------------------------------------------------------------------------- */
+
+export interface PiScanState {
+  sessionId: string;
+  model: string;
+}
+
+export function initialPiScanState(): PiScanState {
+  return { sessionId: "", model: "" };
+}
+
+function piModel(message: Record<string, unknown>): string {
+  const rawModel =
+    typeof message["responseModel"] === "string" && message["responseModel"].trim().length > 0
+      ? message["responseModel"]
+      : message["model"];
+  const model = typeof rawModel === "string" ? rawModel.trim() : "";
+  if (model.length === 0) return "";
+  const provider = typeof message["provider"] === "string" ? message["provider"].trim() : "";
+  return provider.length === 0 ? model : `${provider}/${model}`;
+}
+
+function piToolResultModel(message: Record<string, unknown>): string {
+  const details = message["details"];
+  if (typeof details !== "object" || details === null) return "";
+  const detailRecord = details as Record<string, unknown>;
+  const reportedModel =
+    typeof detailRecord["model"] === "string" ? detailRecord["model"].trim() : "";
+  if (reportedModel.length > 0) return reportedModel;
+
+  const messages = detailRecord["messages"];
+  if (!Array.isArray(messages)) return "";
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const nested = messages[index];
+    if (typeof nested !== "object" || nested === null) continue;
+    const nestedRecord = nested as Record<string, unknown>;
+    if (nestedRecord["role"] !== "assistant") continue;
+    const model = piModel(nestedRecord);
+    if (model.length > 0) return model;
+  }
+  return "";
+}
+
+/**
+ * Feeds one line of a Pi session into `state`.
+ *
+ * Pi records usage on assistant messages, delegated tool results, and
+ * model-generated compaction and branch summaries. Input, cache-read, and
+ * cache-write counts are disjoint, while reasoning is included in output.
+ * Entry ids and timestamps survive session forks, so together they provide the
+ * cross-file identity needed to avoid charging copied history twice without
+ * treating session-local id collisions as the same request.
+ */
+export function parsePiLine(line: string, state: PiScanState): UsageRecord | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(line);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null) return null;
+
+  const record = parsed as Record<string, unknown>;
+  if (record["type"] === "session") {
+    if (typeof record["id"] === "string") state.sessionId = record["id"];
+    return null;
+  }
+  if (record["type"] === "model_change") {
+    const modelId = typeof record["modelId"] === "string" ? record["modelId"].trim() : "";
+    const provider = typeof record["provider"] === "string" ? record["provider"].trim() : "";
+    if (modelId.length > 0)
+      state.model = provider.length === 0 ? modelId : `${provider}/${modelId}`;
+    return null;
+  }
+
+  let usageRecord: Record<string, unknown>;
+  let model: string;
+  if (record["type"] === "message") {
+    const message = record["message"];
+    if (typeof message !== "object" || message === null) return null;
+    const messageRecord = message as Record<string, unknown>;
+
+    const usage = messageRecord["usage"];
+    if (typeof usage !== "object" || usage === null) return null;
+    usageRecord = usage as Record<string, unknown>;
+
+    if (messageRecord["role"] === "assistant") {
+      model = piModel(messageRecord);
+      if (model.length === 0) return null;
+      state.model = model;
+    } else if (messageRecord["role"] === "toolResult") {
+      const details = messageRecord["details"];
+      const sessionFile =
+        typeof details === "object" && details !== null
+          ? (details as Record<string, unknown>)["sessionFile"]
+          : null;
+      if (typeof sessionFile === "string" && sessionFile.trim().length > 0) {
+        // Persisted delegated sessions are scanned from their own transcript.
+        return null;
+      }
+      model = piToolResultModel(messageRecord);
+      if (model.length === 0) return null;
+    } else {
+      return null;
+    }
+  } else if (record["type"] === "compaction" || record["type"] === "branch_summary") {
+    const usage = record["usage"];
+    if (typeof usage !== "object" || usage === null || state.model.length === 0) return null;
+    usageRecord = usage as Record<string, unknown>;
+    model = state.model;
+  } else {
+    return null;
+  }
+
+  const timestampMs = parseTimestampMs(record["timestamp"]);
+  if (timestampMs === null) return null;
+
+  const outputTokens = int(usageRecord["output"]);
+  const totals: UsageTokenTotals = {
+    uncachedInputTokens: int(usageRecord["input"]),
+    cachedInputTokens: int(usageRecord["cacheRead"]),
+    cacheCreationTokens: int(usageRecord["cacheWrite"]),
+    outputTokens,
+    reasoningTokens: Math.min(outputTokens, int(usageRecord["reasoning"])),
+  };
+  const cost = usageRecord["cost"];
+  const rawReportedCost =
+    typeof cost === "object" && cost !== null ? (cost as Record<string, unknown>)["total"] : null;
+  const reportedCostUsd =
+    typeof rawReportedCost === "number" && Number.isFinite(rawReportedCost)
+      ? rawReportedCost
+      : null;
+  if (totalTokens(totals) === 0 && (reportedCostUsd === null || reportedCostUsd === 0)) return null;
+
+  const messageId = typeof record["id"] === "string" ? record["id"] : null;
+  return {
+    provider: "pi",
+    timestampMs,
+    model,
+    sessionId: state.sessionId,
+    totals,
+    reportedCostUsd,
+    dedupeKey: messageId === null ? null : `pi:${messageId}:${timestampMs}`,
   };
 }
 

@@ -60,6 +60,7 @@ vi.mock("./usageProviders", async (importOriginal) => {
     PROVIDER_PRESENTATION: {
       codex: { color: "white", label: "Codex", mark: "span" },
       claude: { color: "orange", label: "Claude Code", mark: "span" },
+      pi: { color: "purple", label: "Pi", mark: "span" },
     },
   };
 });

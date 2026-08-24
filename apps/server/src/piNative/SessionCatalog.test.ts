@@ -6,12 +6,57 @@ import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
-import { makeSessionCatalog, piThreadLifecycleFromEntries } from "./SessionCatalog.ts";
+import {
+  makeSessionCatalog,
+  piThreadLifecycleFromEntries,
+  resolvePiSessionsRoot,
+} from "./SessionCatalog.ts";
 const digest = async (file: string) =>
   NodeCrypto.createHash("sha256")
     .update(await NodeFS.promises.readFile(file))
     .digest("hex");
 describe("SessionCatalog", () => {
+  it("mirrors Pi's session directory precedence", () => {
+    const base = {
+      homeDir: "/home/test",
+      cwd: "/workspace",
+      environment: {},
+    } as const;
+
+    expect(resolvePiSessionsRoot(base)).toBe("/home/test/.pi/agent/sessions");
+    expect(
+      resolvePiSessionsRoot({
+        ...base,
+        environment: { PI_CODING_AGENT_DIR: "~/custom-agent" },
+      }),
+    ).toBe("/home/test/custom-agent/sessions");
+    expect(resolvePiSessionsRoot({ ...base, settingsSessionDir: ".pi/sessions" })).toBe(
+      "/workspace/.pi/sessions",
+    );
+    expect(
+      resolvePiSessionsRoot({
+        ...base,
+        settingsSessionDir: "/settings/sessions",
+        environment: { PI_CODING_AGENT_SESSION_DIR: "/environment/sessions" },
+      }),
+    ).toBe("/environment/sessions");
+    expect(
+      resolvePiSessionsRoot({
+        ...base,
+        environment: {
+          PI_CODING_AGENT_SESSION_DIR: "/environment/sessions",
+          T3_PI_SESSIONS_ROOT: "/t3/sessions",
+        },
+      }),
+    ).toBe("/t3/sessions");
+    expect(
+      resolvePiSessionsRoot({
+        ...base,
+        environment: { PI_CODING_AGENT_SESSION_DIR: "~\\windows-sessions" },
+      }),
+    ).toBe("/home/test/windows-sessions");
+  });
+
   it("projects the latest valid lifecycle marker and resets it on later activity", () => {
     const marker = {
       type: "custom",

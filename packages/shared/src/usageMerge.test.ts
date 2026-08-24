@@ -12,6 +12,7 @@ import { mergeUsage, type EnvironmentUsage } from "./usageMerge.ts";
 
 function bucket(overrides: Partial<UsageBucket> = {}): UsageBucket {
   return {
+    sourcePath: "<source>",
     day: "2026-08-07" as UsageDay,
     provider: "claude",
     model: "claude-fable-5",
@@ -49,7 +50,11 @@ function summary(
     timeZone: "UTC",
     sinceDay: "2026-08-01" as UsageDay,
     untilDay: "2026-08-31" as UsageDay,
-    buckets,
+    buckets: buckets.map((bucket) => {
+      if (bucket.sourcePath !== "<source>") return bucket;
+      const source = sources.find((candidate) => candidate.provider === bucket.provider);
+      return source === undefined ? bucket : { ...bucket, sourcePath: source.homePath };
+    }),
     sources: sources.map((source) => ({
       fingerprint: {
         hostId: source.hostId,
@@ -110,6 +115,74 @@ describe("mergeUsage", () => {
     expect(merged.sessions).toBe(1);
     expect(merged.duplicateSources).toHaveLength(1);
     expect(merged.contributingEnvironments).toEqual(["env-a"]);
+  });
+
+  it("deduplicates a shared Pi root without dropping environment-private Pi roots", () => {
+    const sharedPi = {
+      provider: "pi" as const,
+      hostId: "mac",
+      homePath: "/home/theo/.pi/agent/sessions",
+    };
+    const merged = mergeUsage(
+      [
+        environment(
+          "env-a",
+          summary(
+            [
+              bucket({ provider: "pi", sourcePath: sharedPi.homePath, costUsd: 10 }),
+              bucket({ provider: "pi", sourcePath: "/state-a/providers/pi", costUsd: 3 }),
+            ],
+            [sharedPi, { provider: "pi", hostId: "mac", homePath: "/state-a/providers/pi" }],
+          ),
+        ),
+        environment(
+          "env-b",
+          summary(
+            [
+              bucket({ provider: "pi", sourcePath: sharedPi.homePath, costUsd: 10 }),
+              bucket({ provider: "pi", sourcePath: "/state-b/providers/pi", costUsd: 4 }),
+            ],
+            [sharedPi, { provider: "pi", hostId: "mac", homePath: "/state-b/providers/pi" }],
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(merged.costUsd).toBe(17);
+    expect(merged.sessions).toBe(3);
+    expect(merged.duplicateSources).toEqual(["env-b: /home/theo/.pi/agent/sessions"]);
+  });
+
+  it("matches bucket ownership by provider and source path", () => {
+    const merged = mergeUsage(
+      [
+        environment(
+          "env-a",
+          summary(
+            [bucket({ provider: "claude", sourcePath: "/same", costUsd: 10 })],
+            [{ provider: "claude", hostId: "mac", homePath: "/same" }],
+          ),
+        ),
+        environment(
+          "env-b",
+          summary(
+            [
+              bucket({ provider: "claude", sourcePath: "/same", costUsd: 10 }),
+              bucket({ provider: "pi", sourcePath: "/same", costUsd: 4 }),
+            ],
+            [
+              { provider: "claude", hostId: "mac", homePath: "/same" },
+              { provider: "pi", hostId: "mac", homePath: "/same" },
+            ],
+          ),
+        ),
+      ],
+      USAGE_CONTRACT_VERSION,
+    );
+
+    expect(merged.costUsd).toBe(14);
+    expect(merged.providers.map((provider) => provider.provider).sort()).toEqual(["claude", "pi"]);
   });
 
   it("drops only the duplicated provider, keeping the environment's other one", () => {

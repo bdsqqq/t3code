@@ -34,6 +34,7 @@ import * as Schema from "effect/Schema";
 import { HttpClient, HttpClientResponse } from "effect/unstable/http";
 
 import { ServerConfig } from "../config.ts";
+import { defaultPiSessionsRoot } from "../piNative/PiSessionsRoot.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import { resolveClaudeHomePath } from "../provider/Drivers/ClaudeHome.ts";
 import { resolveCodexHomeLayout } from "../provider/Drivers/CodexHomeLayout.ts";
@@ -219,10 +220,18 @@ export const make = Effect.gen(function* () {
     const claudeDir = yield* resolveClaudeTranscriptDir(claudeHome);
     const codexLayout = yield* resolveCodexHomeLayout(settings.providers.codex);
 
-    return [
+    const dirs = [
       { provider: "claude" as const, dir: claudeDir },
       { provider: "codex" as const, dir: path.join(codexLayout.sharedHomePath, "sessions") },
+      { provider: "pi" as const, dir: defaultPiSessionsRoot() },
+      { provider: "pi" as const, dir: path.join(config.stateDir, "providers", "pi") },
     ];
+    return dirs.filter(
+      (entry, index) =>
+        dirs.findIndex(
+          (candidate) => candidate.provider === entry.provider && candidate.dir === entry.dir,
+        ) === index,
+    );
   });
 
   /**
@@ -351,6 +360,7 @@ export const make = Effect.gen(function* () {
 
     const sources: UsageSource[] = [];
     const livePaths = new Set<string>();
+    const attributedTranscriptPaths = new Set<string>();
     const walkedRoots: string[] = [];
 
     for (const { provider, dir } of dirs) {
@@ -381,6 +391,11 @@ export const make = Effect.gen(function* () {
       const sessionIds = new Set<string>();
 
       for (const file of files) {
+        // Explicit provider homes can overlap a T3-managed root. The first
+        // source keeps its identity; later roots skip files already attributed.
+        const attributionKey = `${provider}\u0000${file.path}`;
+        if (attributedTranscriptPaths.has(attributionKey)) continue;
+        attributedTranscriptPaths.add(attributionKey);
         livePaths.add(file.path);
         const records = yield* readFileRecords(file.path, file.size, file.mtimeMs, provider);
         if (records.length === 0) {
@@ -391,7 +406,7 @@ export const make = Effect.gen(function* () {
         for (const record of records) {
           // Only sessions that contributed in-window count: the mtime slack
           // admits boundary files whose records fall outside the range.
-          if (aggregator.add(record) && record.sessionId.length > 0) {
+          if (aggregator.add(record, dir) && record.sessionId.length > 0) {
             sessionIds.add(record.sessionId);
           }
         }

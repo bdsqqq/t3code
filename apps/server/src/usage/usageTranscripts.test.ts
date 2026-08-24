@@ -2,8 +2,10 @@ import { describe, expect, it } from "@effect/vitest";
 
 import {
   initialCodexScanState,
+  initialPiScanState,
   parseClaudeLine,
   parseCodexLine,
+  parsePiLine,
   totalTokens,
 } from "./usageTranscripts.ts";
 
@@ -233,6 +235,253 @@ describe("parseCodexLine", () => {
       );
       expect(record).not.toBeNull();
     });
+  });
+});
+
+describe("parsePiLine", () => {
+  const session = JSON.stringify({
+    type: "session",
+    id: "01a035bd-7418-7504-b1c6-e52ee3d517b3",
+    timestamp: "2026-08-24T21:46:43.609Z",
+    cwd: "/home/theo/project",
+  });
+  const assistant = (overrides: {
+    id?: string;
+    timestamp?: string;
+    usage?: Record<string, unknown>;
+    provider?: string;
+    model?: string;
+    responseModel?: string;
+  }) =>
+    JSON.stringify({
+      type: "message",
+      id: overrides.id ?? "c753f88a",
+      timestamp: overrides.timestamp ?? "2026-08-24T21:46:56.846Z",
+      message: {
+        role: "assistant",
+        provider: overrides.provider ?? "openai-codex",
+        model: overrides.model ?? "gpt-5.6-sol",
+        ...(overrides.responseModel === undefined
+          ? {}
+          : { responseModel: overrides.responseModel }),
+        usage: overrides.usage ?? {
+          input: 8219,
+          output: 388,
+          cacheRead: 82432,
+          cacheWrite: 20,
+          reasoning: 44,
+          totalTokens: 91059,
+          cost: { total: 0.093951 },
+        },
+      },
+    });
+
+  it("extracts Pi's disjoint token counts, reported cost, and session identity", () => {
+    const state = initialPiScanState();
+    parsePiLine(session, state);
+    const record = parsePiLine(assistant({}), state);
+
+    expect(record).toMatchObject({
+      provider: "pi",
+      model: "openai-codex/gpt-5.6-sol",
+      sessionId: "01a035bd-7418-7504-b1c6-e52ee3d517b3",
+      reportedCostUsd: 0.093951,
+      dedupeKey: `pi:c753f88a:${Date.parse("2026-08-24T21:46:56.846Z")}`,
+      totals: {
+        uncachedInputTokens: 8219,
+        cachedInputTokens: 82432,
+        cacheCreationTokens: 20,
+        outputTokens: 388,
+        reasoningTokens: 44,
+      },
+    });
+  });
+
+  it("uses the message id to deduplicate history copied into another session file", () => {
+    const original = initialPiScanState();
+    const fork = initialPiScanState();
+    parsePiLine(session, original);
+    parsePiLine(
+      JSON.stringify({ type: "session", id: "fork-session", timestamp: "2026-08-24T22:00:00Z" }),
+      fork,
+    );
+
+    expect(parsePiLine(assistant({ id: "copied-message" }), original)?.dedupeKey).toBe(
+      parsePiLine(assistant({ id: "copied-message" }), fork)?.dedupeKey,
+    );
+  });
+
+  it("keeps unrelated session-local ids apart", () => {
+    const first = parsePiLine(
+      assistant({ id: "same-id", timestamp: "2026-08-24T21:46:56.846Z" }),
+      initialPiScanState(),
+    );
+    const second = parsePiLine(
+      assistant({ id: "same-id", timestamp: "2026-08-24T22:46:56.846Z" }),
+      initialPiScanState(),
+    );
+
+    expect(first?.dedupeKey).not.toBe(second?.dedupeKey);
+  });
+
+  it("attributes routed responses to the concrete response model", () => {
+    const record = parsePiLine(
+      assistant({
+        provider: "opencode",
+        model: "big-pickle",
+        responseModel: "deepseek-v4-flash",
+      }),
+      initialPiScanState(),
+    );
+
+    expect(record?.model).toBe("opencode/deepseek-v4-flash");
+  });
+
+  it("counts delegated usage unless a persisted child transcript owns it", () => {
+    const toolResult = (details: Record<string, unknown>) =>
+      JSON.stringify({
+        type: "message",
+        id: "delegated-result",
+        timestamp: "2026-08-24T22:03:00.000Z",
+        message: {
+          role: "toolResult",
+          toolName: "finder",
+          usage: {
+            input: 1000,
+            output: 100,
+            cacheRead: 200,
+            cacheWrite: 0,
+            reasoning: 20,
+            cost: { total: 0.04 },
+          },
+          details,
+        },
+      });
+
+    expect(
+      parsePiLine(
+        toolResult({ agent: "finder", model: "openai-codex/gpt-5.6-luna", messages: [] }),
+        initialPiScanState(),
+      ),
+    ).toMatchObject({
+      provider: "pi",
+      model: "openai-codex/gpt-5.6-luna",
+      reportedCostUsd: 0.04,
+      totals: {
+        uncachedInputTokens: 1000,
+        cachedInputTokens: 200,
+        outputTokens: 100,
+        reasoningTokens: 20,
+      },
+    });
+    expect(
+      parsePiLine(
+        toolResult({
+          agent: "finder",
+          messages: [
+            {
+              role: "assistant",
+              provider: "openai-codex",
+              model: "gpt-5.6-luna",
+            },
+          ],
+        }),
+        initialPiScanState(),
+      )?.model,
+    ).toBe("openai-codex/gpt-5.6-luna");
+    expect(
+      parsePiLine(
+        toolResult({
+          agent: "finder",
+          model: "openai-codex/gpt-5.6-luna",
+          sessionFile: "/sessions/child.jsonl",
+        }),
+        initialPiScanState(),
+      ),
+    ).toBeNull();
+  });
+
+  it("counts model-generated compaction and branch summaries", () => {
+    const state = initialPiScanState();
+    parsePiLine(session, state);
+    parsePiLine(assistant({ provider: "openrouter", model: "google/gemini-3.1-pro" }), state);
+    const compaction = parsePiLine(
+      JSON.stringify({
+        type: "compaction",
+        id: "compaction-a",
+        timestamp: "2026-08-24T22:00:00.000Z",
+        usage: {
+          input: 1200,
+          output: 200,
+          cacheRead: 300,
+          cacheWrite: 40,
+          reasoning: 10,
+          cost: { total: 0.05 },
+        },
+      }),
+      state,
+    );
+    parsePiLine(
+      JSON.stringify({
+        type: "model_change",
+        id: "model-change-a",
+        timestamp: "2026-08-24T22:01:00.000Z",
+        provider: "openai-codex",
+        modelId: "gpt-5.6-sol",
+      }),
+      state,
+    );
+    const branchSummary = parsePiLine(
+      JSON.stringify({
+        type: "branch_summary",
+        id: "branch-summary-a",
+        timestamp: "2026-08-24T22:02:00.000Z",
+        usage: {
+          input: 100,
+          output: 20,
+          cacheRead: 0,
+          cacheWrite: 0,
+          reasoning: 5,
+          cost: { total: 0.01 },
+        },
+      }),
+      state,
+    );
+
+    expect(compaction).toMatchObject({
+      model: "openrouter/google/gemini-3.1-pro",
+      reportedCostUsd: 0.05,
+      totals: {
+        uncachedInputTokens: 1200,
+        cachedInputTokens: 300,
+        cacheCreationTokens: 40,
+        outputTokens: 200,
+        reasoningTokens: 10,
+      },
+    });
+    expect(branchSummary?.model).toBe("openai-codex/gpt-5.6-sol");
+  });
+
+  it("drops assistant messages without billable activity", () => {
+    const state = initialPiScanState();
+    parsePiLine(session, state);
+
+    expect(
+      parsePiLine(
+        assistant({
+          usage: {
+            input: 0,
+            output: 0,
+            cacheRead: 0,
+            cacheWrite: 0,
+            reasoning: 0,
+            totalTokens: 0,
+            cost: { total: 0 },
+          },
+        }),
+        state,
+      ),
+    ).toBeNull();
   });
 });
 

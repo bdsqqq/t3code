@@ -56,7 +56,7 @@ function aggregate(
     ...hourlyBounds,
     rates,
   });
-  for (const item of records) aggregator.add(item);
+  for (const item of records) aggregator.add(item, "/transcripts");
   return aggregator.finish();
 }
 
@@ -187,9 +187,11 @@ describe("UsageAggregator", () => {
       rates,
     });
 
-    expect(aggregator.add(record({ dedupeKey: "msg_1:" }))).toBe(true);
-    expect(aggregator.add(record({ dedupeKey: "msg_1:" }))).toBe(false);
-    expect(aggregator.add(record({ timestampMs: Date.parse("2026-07-01T12:00:00Z") }))).toBe(false);
+    expect(aggregator.add(record({ dedupeKey: "msg_1:" }), "/transcripts")).toBe(true);
+    expect(aggregator.add(record({ dedupeKey: "msg_1:" }), "/transcripts")).toBe(false);
+    expect(
+      aggregator.add(record({ timestampMs: Date.parse("2026-07-01T12:00:00Z") }), "/transcripts"),
+    ).toBe(false);
   });
 
   it("separates providers and models into their own buckets", () => {
@@ -200,5 +202,21 @@ describe("UsageAggregator", () => {
     ]);
 
     expect(result.buckets).toHaveLength(3);
+  });
+
+  it("keeps transcript roots separate for client-side source deduplication", () => {
+    const aggregator = new UsageAggregator({
+      timeZone: "UTC",
+      sinceDay: "2026-08-01",
+      untilDay: "2026-08-31",
+      rates,
+    });
+    aggregator.add(record(), "/home/theo/.pi/agent/sessions");
+    aggregator.add(record(), "/state/providers/pi");
+
+    expect(aggregator.finish().buckets.map((bucket) => bucket.sourcePath)).toEqual([
+      "/home/theo/.pi/agent/sessions",
+      "/state/providers/pi",
+    ]);
   });
 });

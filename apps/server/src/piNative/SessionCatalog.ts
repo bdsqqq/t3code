@@ -1,7 +1,6 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeCrypto from "node:crypto";
 import * as NodeFS from "node:fs";
-import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import type {
@@ -20,14 +19,12 @@ import {
   PiThreadLifecycleCustomEntry,
   ThreadId as ThreadIdSchema,
 } from "@t3tools/contracts";
+import { defaultPiSessionsRoot } from "./PiSessionsRoot.ts";
+export { defaultPiSessionsRoot, resolvePiSessionsRoot } from "./PiSessionsRoot.ts";
 
 export interface SessionCatalogOptions {
   readonly root?: string;
 }
-export const defaultPiSessionsRoot = () =>
-  NodePath.resolve(
-    process.env.T3_PI_SESSIONS_ROOT ?? NodePath.join(NodeOS.homedir(), ".pi", "agent", "sessions"),
-  );
 const SESSION_ENTRY_LIMIT = 1_000;
 const SESSION_HEAD_BYTES = 256 * 1024;
 const SESSION_TAIL_BYTES = 16 * 1024 * 1024;

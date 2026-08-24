@@ -19,9 +19,11 @@ import type { UsageProviderKind } from "@t3tools/contracts";
 
 import {
   initialCodexScanState,
+  initialPiScanState,
   mightCarryUsage,
   parseClaudeLine,
   parseCodexLine,
+  parsePiLine,
   type UsageRecord,
 } from "./usageTranscripts.ts";
 
@@ -108,6 +110,7 @@ export async function readTranscriptRecords(
 ): Promise<readonly UsageRecord[] | null> {
   const records: UsageRecord[] = [];
   const codexState = initialCodexScanState();
+  const piState = initialPiScanState();
 
   try {
     const lines = NodeReadline.createInterface({
@@ -125,6 +128,21 @@ export async function readTranscriptRecords(
           continue;
         }
         const record = parseCodexLine(line, codexState);
+        if (record !== null) records.push(record);
+        continue;
+      }
+
+      if (provider === "pi") {
+        if (
+          !mightCarryUsage(line, provider) &&
+          !line.includes('"type":"session"') &&
+          !line.includes('"type": "session"') &&
+          !line.includes('"type":"model_change"') &&
+          !line.includes('"type": "model_change"')
+        ) {
+          continue;
+        }
+        const record = parsePiLine(line, piState);
         if (record !== null) records.push(record);
         continue;
       }

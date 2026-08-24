@@ -2,13 +2,14 @@
  * Usage reporting contract.
  *
  * Each environment scans the provider CLIs' own on-disk session transcripts
- * (`~/.claude/projects/**\/*.jsonl`, `~/.codex/sessions/**\/*.jsonl`) rather than
- * relying on T3 Code's own orchestration projections, so usage stays complete
- * even for turns that were never driven through T3 Code. This mirrors the
- * approach `ccusage` takes.
+ * (`~/.claude/projects/**\/*.jsonl`, `~/.codex/sessions/**\/*.jsonl`,
+ * `~/.pi/agent/sessions/**\/*.jsonl`) rather than relying on T3 Code's own
+ * orchestration projections, so usage stays complete even for turns that were
+ * never driven through T3 Code. This mirrors the approach `ccusage` takes.
  *
- * Environments return pre-aggregated `(day, hourStart?, provider, model)`
- * buckets. Raw transcript records never cross the wire.
+ * Environments return pre-aggregated
+ * `(sourcePath, day, hourStart?, provider, model)` buckets. Raw transcript
+ * records never cross the wire.
  *
  * @module usage
  */
@@ -21,9 +22,9 @@ import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
  * client renders partial coverage when an environment reports an older version
  * rather than failing the whole page.
  */
-export const USAGE_CONTRACT_VERSION = 4 as const;
+export const USAGE_CONTRACT_VERSION = 5 as const;
 
-export const UsageProviderKind = Schema.Literals(["claude", "codex"]);
+export const UsageProviderKind = Schema.Literals(["claude", "codex", "pi"]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
 
 /**
@@ -71,8 +72,8 @@ export const UsageTokenTotals = Schema.Struct({
 export type UsageTokenTotals = typeof UsageTokenTotals.Type;
 
 /**
- * One `(day, hourStart?, provider, model)` cell. `hourStart` is the UTC start
- * instant of a rolling bucket and is present only for hourly requests.
+ * One `(sourcePath, day, hourStart?, provider, model)` cell. `hourStart` is the
+ * UTC start instant of a rolling bucket and is present only for hourly requests.
  *
  * `costUsd` is the raw API-equivalent cost of these tokens. It is not money
  * spent: subscription plans bill separately. `unpricedRecords` counts records
@@ -80,6 +81,13 @@ export type UsageTokenTotals = typeof UsageTokenTotals.Type;
  * to `costUsd`.
  */
 export const UsageBucket = Schema.Struct({
+  /**
+   * Transcript root that contributed this bucket. This links the bucket to a
+   * {@link UsageSource}, allowing clients to deduplicate shared roots without
+   * dropping another root for the same provider. Optional on the wire so a
+   * current client can decode and reject older contract versions cleanly.
+   */
+  sourcePath: Schema.optional(TrimmedNonEmptyString),
   day: UsageDay,
   hourStart: Schema.optional(TrimmedNonEmptyString),
   provider: UsageProviderKind,
@@ -93,7 +101,7 @@ export const UsageBucket = Schema.Struct({
    */
   cacheSavingsUsd: Schema.Number,
   costSource: UsageCostSource,
-  /** Distinct assistant responses, after de-duplication. */
+  /** Distinct model responses, after de-duplication. */
   records: NonNegativeInt,
   unpricedRecords: NonNegativeInt,
   /** Distinct transcript sessions that contributed to this cell. */

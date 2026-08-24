@@ -28,6 +28,7 @@ import {
   encodeLine,
   isRecord,
 } from "./SupervisorProtocol.ts";
+import { defaultPiSessionsRoot } from "./PiSessionsRoot.ts";
 
 const { createHash, randomUUID } = NodeCrypto;
 const { spawn } = NodeChildProcess;
@@ -1007,9 +1008,7 @@ async function spawnRuntime(command: Record<string, unknown>): Promise<Runtime> 
   if (sessionFile && writers.has(sessionFile)) throw new Error("session already has a writer");
   if (sessionFile) writers.set(sessionFile, runtimeId);
   const args = piRpcSpawnArgs({
-    sessionsRoot: path.resolve(
-      process.env.T3_PI_SESSIONS_ROOT ?? path.join(homedir(), ".pi", "agent", "sessions"),
-    ),
+    sessionsRoot: defaultPiSessionsRoot(),
     ...(sessionFile ? { sessionFile } : {}),
   });
   const child = spawn(process.env.T3_PI_EXECUTABLE ?? "pi", args, {
@@ -1319,9 +1318,7 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
     socket.end(encodeLine({ type: "error", error: "bridge sessionFile is required" }));
     return;
   }
-  const sessionsRoot = await fs
-    .realpath(process.env.T3_PI_SESSIONS_ROOT ?? path.join(homedir(), ".pi", "agent", "sessions"))
-    .catch(() => undefined);
+  const sessionsRoot = await fs.realpath(defaultPiSessionsRoot()).catch(() => undefined);
   const sessionFile = await fs.realpath(frame.sessionFile).catch(() => undefined);
   if (!sessionsRoot || !sessionFile || !sessionFile.startsWith(`${sessionsRoot}${path.sep}`)) {
     socket.end(

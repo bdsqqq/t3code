@@ -59,6 +59,21 @@ describe("scan cache round trip", () => {
     expect(encoded.sessions).toEqual(["session-a"]);
   });
 
+  it("restores Pi transcript records", () => {
+    const piRecord = record({
+      provider: "pi",
+      model: "openai-codex/gpt-5.6-sol",
+      dedupeKey: "pi:message-a:1786000000000",
+    });
+    const original: ScanCache = new Map([
+      ["/pi/session.jsonl", { size: 10, mtimeMs: 100, provider: "pi", records: [piRecord] }],
+    ]);
+
+    expect(decodeScanCache(JSON.parse(JSON.stringify(encodeScanCache(original))))).toEqual(
+      original,
+    );
+  });
+
   it("treats a corrupt or foreign document as an empty cache", () => {
     // A bad cache should cost one cold scan, never a broken page.
     expect(decodeScanCache(null).size).toBe(0);
