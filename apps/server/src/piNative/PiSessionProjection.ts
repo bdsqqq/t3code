@@ -232,7 +232,7 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
   const activities: OrchestrationThreadActivity[] = [];
   const toolActivityIndex = new Map<string, number>();
   let currentTurnId: TurnId | null = null;
-  let model = "unknown";
+  let model: string | undefined;
 
   for (const entry of branch.entries) {
     const entryId = String(entry.id);
@@ -416,7 +416,7 @@ export function projectPiThread(input: {
     title: input.record.title,
     modelSelection: {
       instanceId: ProviderInstanceId.make("pi"),
-      model: history.model,
+      model: history.model ?? input.record.model ?? "unknown",
     },
     runtimeMode: "full-access",
     interactionMode: "default",

@@ -52,6 +52,7 @@ export interface PiSessionCatalogRecord {
   readonly threadId: ThreadId;
   readonly canonicalFile: string;
   readonly sessionId: string;
+  readonly model?: string;
   readonly parentSessionFile?: string;
   readonly parentThreadId?: ThreadId;
   readonly cwd: string;
@@ -159,6 +160,31 @@ function parseEntry(line: string): PiNativeJsonlEntry | undefined {
   }
 }
 
+function modelFromEntry(entry: PiNativeJsonlEntry): string | undefined {
+  if (entry.type === "model_change" && typeof entry.modelId === "string") {
+    return typeof entry.provider === "string"
+      ? `${entry.provider}/${entry.modelId}`
+      : entry.modelId;
+  }
+  if (
+    entry.type === "message" &&
+    record(entry.message) &&
+    entry.message.role === "assistant" &&
+    typeof entry.message.model === "string"
+  ) {
+    return typeof entry.message.provider === "string"
+      ? `${entry.message.provider}/${entry.message.model}`
+      : entry.message.model;
+  }
+}
+
+function modelFromEntries(entries: ReadonlyArray<PiNativeJsonlEntry>): string | undefined {
+  return entries.reduce<string | undefined>(
+    (model, entry) => modelFromEntry(entry) ?? model,
+    undefined,
+  );
+}
+
 function parseEntries(text: string): PiNativeJsonlEntry[] {
   return text
     .split(/\r?\n/)
@@ -174,7 +200,9 @@ async function readLatestSessionMetadata(
   size: number,
   sessionId: string,
   targetOperationId?: string,
+  fallbackModel?: string,
 ): Promise<{
+  readonly model?: string;
   readonly jsonlLifecycle?: NonNullable<PiSessionCatalogRecord["jsonlLifecycle"]>;
   readonly lastActivityAt?: string;
   readonly lifecycleOperation?: {
@@ -190,6 +218,7 @@ async function readLatestSessionMetadata(
     let leadingFragment = "";
     let discardingOversizedLine = false;
     let lifecycleResolved = false;
+    let model: string | undefined;
     let jsonlLifecycle: PiSessionCatalogRecord["jsonlLifecycle"];
     let lastActivityAt: string | undefined;
     let laterUserSeen = false;
@@ -203,6 +232,7 @@ async function readLatestSessionMetadata(
     const inspect = (line: string) => {
       const entry = parseEntry(line);
       if (entry === undefined) return;
+      model ??= modelFromEntry(entry);
       if (
         lastActivityAt === undefined &&
         entry.type === "message" &&
@@ -253,6 +283,7 @@ async function readLatestSessionMetadata(
     while (
       position > 0 &&
       (!lifecycleResolved ||
+        (model === undefined && fallbackModel !== undefined) ||
         lastActivityAt === undefined ||
         (targetOperationId !== undefined && lifecycleOperation === undefined))
     ) {
@@ -283,7 +314,9 @@ async function readLatestSessionMetadata(
       }
       position = start;
     }
+    const resolvedModel = model ?? fallbackModel;
     return {
+      ...(resolvedModel === undefined ? {} : { model: resolvedModel }),
       ...(jsonlLifecycle === undefined ? {} : { jsonlLifecycle }),
       ...(lastActivityAt === undefined ? {} : { lastActivityAt }),
       ...(lifecycleOperation === undefined ? {} : { lifecycleOperation }),
@@ -489,7 +522,13 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
           typeof rawParentSession === "string" && rawParentSession.trim()
             ? await NodeFS.promises.realpath(rawParentSession).catch(() => rawParentSession)
             : undefined;
-        const latestMetadata = await readLatestSessionMetadata(canonical, stat.size, header.id);
+        const latestMetadata = await readLatestSessionMetadata(
+          canonical,
+          stat.size,
+          header.id,
+          undefined,
+          modelFromEntries(bounded.metadataEntries),
+        );
         const metadata = {
           sourceKey: keyFor(canonical),
           canonicalFile: canonical,
@@ -567,10 +606,17 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
             typeof header.cwd !== "string"
           )
             throw new Error("invalid session header");
-          const latestMetadata = await readLatestSessionMetadata(sessionFile, stat.size, header.id);
+          const latestMetadata = await readLatestSessionMetadata(
+            sessionFile,
+            stat.size,
+            header.id,
+            undefined,
+            modelFromEntries(bounded.metadataEntries),
+          );
           const {
             jsonlLifecycle: _priorLifecycle,
             lastActivityAt: _priorActivity,
+            model: _priorModel,
             ...freshCatalogRecord
           } = catalogRecord;
           return {

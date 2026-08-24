@@ -264,6 +264,19 @@ describe("PiSessionProjection", () => {
     expect(snapshot.thread.settledOverride).toBeNull();
   });
 
+  it("uses catalog model metadata when shell projection omits history", () => {
+    const snapshot = projectPiThread({
+      record: {
+        ...record,
+        model: "openai-codex/gpt-5.6-sol",
+      },
+      entries: [],
+      projectId: ProjectId.make("project-1"),
+    });
+
+    expect(snapshot.thread.modelSelection.model).toBe("openai-codex/gpt-5.6-sol");
+  });
+
   it("does not advertise images without an external asset resolver", () => {
     const runtime = {
       runtimeId: PiNativeRuntimeId.make("runtime-1"),

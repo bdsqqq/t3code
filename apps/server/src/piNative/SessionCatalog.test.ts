@@ -73,6 +73,12 @@ describe("SessionCatalog", () => {
               file,
               JSON.stringify({ type: "session", id: "s1", cwd: root }) +
                 "\n" +
+                JSON.stringify({
+                  type: "model_change",
+                  provider: "openai-codex",
+                  modelId: "gpt-5.6-sol",
+                }) +
+                "\n" +
                 JSON.stringify({ type: "message", role: "user", content: "hello" }) +
                 "\n",
             ),
@@ -84,7 +90,8 @@ describe("SessionCatalog", () => {
           const catalog = makeSessionCatalog({ root });
           const listed = yield* catalog.list();
           expect(listed[0]?.title).toBe("hello");
-          expect((yield* catalog.read(listed[0]!.threadId)).entries).toHaveLength(2);
+          expect(listed[0]?.model).toBe("openai-codex/gpt-5.6-sol");
+          expect((yield* catalog.read(listed[0]!.threadId)).entries).toHaveLength(3);
           const originalThreadId = listed[0]!.threadId;
           yield* Effect.tryPromise(() =>
             NodeFS.promises.copyFile(file, NodePath.join(root, "nested", "copy.jsonl")),
@@ -204,6 +211,40 @@ describe("SessionCatalog", () => {
           expect(
             yield* catalog.findLifecycleOperation(listed[0]!.threadId, "operation-1"),
           ).toMatchObject({ override: "settled", supersededByUser: true });
+        }),
+      (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
+    ),
+  );
+  it.effect("finds the latest model beyond the bounded catalog head and tail", () =>
+    Effect.acquireUseRelease(
+      Effect.tryPromise(() => NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-"))),
+      (root) =>
+        Effect.gen(function* () {
+          const file = NodePath.join(root, "session.jsonl");
+          const noise = (prefix: string) =>
+            Array.from({ length: 80 }, (_, index) => ({
+              type: "custom",
+              customType: "test.noise",
+              data: { text: `${prefix}-${String(index)}-${"x".repeat(1_024)}` },
+            }));
+          const entries = [
+            { type: "session", id: "s1", cwd: root },
+            { type: "model_change", provider: "openai", modelId: "old-model" },
+            ...noise("before"),
+            { type: "model_change", provider: "openai", modelId: "new-model" },
+            { type: "message", role: "user", content: "latest turn" },
+            ...noise("after"),
+          ];
+          yield* Effect.tryPromise(() =>
+            NodeFS.promises.writeFile(
+              file,
+              `${entries.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
+            ),
+          );
+
+          const listed = yield* makeSessionCatalog({ root }).list();
+
+          expect(listed[0]?.model).toBe("openai/new-model");
         }),
       (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),
