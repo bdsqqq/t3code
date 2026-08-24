@@ -369,6 +369,36 @@ describe("PiAdapter", () => {
     );
   });
 
+  it.effect("starts Pi with the selected model and thinking level", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* adapter.startSession({
+          provider: ProviderDriverKind.make("pi"),
+          providerInstanceId: instanceId,
+          threadId: ThreadId.make("selected-session"),
+          cwd: process.cwd(),
+          modelSelection,
+          runtimeMode: "full-access",
+        });
+
+        const args = h.spawns[0]?.args ?? [];
+        assert.deepEqual(args.slice(args.indexOf("--provider"), args.indexOf("--provider") + 2), [
+          "--provider",
+          "openai",
+        ]);
+        assert.deepEqual(args.slice(args.indexOf("--model"), args.indexOf("--model") + 2), [
+          "--model",
+          "gpt-5",
+        ]);
+        assert.deepEqual(args.slice(args.indexOf("--thinking"), args.indexOf("--thinking") + 2), [
+          "--thinking",
+          "max",
+        ]);
+      }),
+    );
+  });
+
   it.effect("sends persisted image attachments through Pi RPC", () => {
     const h = makeHarness();
     const attachmentId = "thread-image";
@@ -1384,11 +1414,15 @@ describe("PiAdapter", () => {
           providerInstanceId: instanceId,
           threadId: ThreadId.make("thread"),
           cwd: process.cwd(),
+          modelSelection,
           runtimeMode: "full-access",
           resumeCursor: first.resumeCursor,
         });
         assert.deepEqual(resumed.resumeCursor, first.resumeCursor);
         assert.equal(h.spawns.length, 2);
+        assert.equal(h.spawns[1]?.args?.includes("--provider"), false);
+        assert.equal(h.spawns[1]?.args?.includes("--model"), false);
+        assert.equal(h.spawns[1]?.args?.includes("--thinking"), false);
         yield* adapter.stopSession(ThreadId.make("thread"));
 
         const invalid = yield* adapter

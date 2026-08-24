@@ -55,6 +55,7 @@ import type { ProviderAdapterShape } from "../Services/ProviderAdapter.ts";
 
 const PROVIDER = ProviderDriverKind.make("pi");
 const DETERMINISTIC_ARGS = ["--offline"] as const;
+const decodePiThinkingLevel = Schema.decodeUnknownEffect(PiThinkingLevel);
 
 export type PiRpcClientFactory = (
   options: PiRpcSpawnOptions,
@@ -573,6 +574,26 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
               "startSession",
               "Provider instance does not match this Pi adapter.",
             );
+          const selection = input.modelSelection;
+          if (selection && selection.instanceId !== options.providerInstanceId)
+            return yield* validation(
+              "startSession",
+              "Model selection belongs to another provider instance.",
+            );
+          const parsedSelection = selection ? decodePiModelSlug(selection.model) : undefined;
+          if (selection && !parsedSelection)
+            return yield* validation("startSession", "A valid Pi model selection is required.");
+          const rawThinking = selection
+            ? getModelSelectionStringOptionValue(selection, "thinkingLevel")
+            : undefined;
+          const thinking =
+            rawThinking === undefined
+              ? undefined
+              : yield* decodePiThinkingLevel(rawThinking).pipe(
+                  Effect.mapError((cause) =>
+                    validation("startSession", "Invalid Pi thinking level.", cause),
+                  ),
+                );
           if (sessions.has(input.threadId))
             return yield* validation(
               "startSession",
@@ -650,6 +671,10 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
               ...(options.args ?? []),
               "--session",
               cursor?.sessionFile ?? freshFile!.sessionFile,
+              ...(fresh && parsedSelection
+                ? ["--provider", parsedSelection.provider, "--model", parsedSelection.modelId]
+                : []),
+              ...(fresh && thinking ? ["--thinking", thinking] : []),
               ...DETERMINISTIC_ARGS,
             ],
             cwd,
@@ -804,7 +829,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
           const thinking =
             rawThinking === undefined
               ? undefined
-              : yield* Schema.decodeUnknownEffect(PiThinkingLevel)(rawThinking).pipe(
+              : yield* decodePiThinkingLevel(rawThinking).pipe(
                   Effect.mapError((cause) =>
                     validation("sendTurn", "Invalid Pi thinking level.", cause),
                   ),
