@@ -37,6 +37,7 @@ import {
   AlarmClockOffIcon,
   CheckIcon,
   ChevronDownIcon,
+  ChevronRightIcon,
   CircleAlertIcon,
   CircleCheckIcon,
   CircleDashedIcon,
@@ -133,6 +134,7 @@ import {
   isSidebarNestedLinkClick,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  partitionPiExternalProjectsForSidebar,
   partitionSidebarThreadTrees,
   planPinnedReorder,
   resolveAdjacentThreadId,
@@ -184,7 +186,15 @@ import { useThreadRunningTerminalIds } from "../state/terminalSessions";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { Button } from "./ui/button";
 import { Input } from "./ui/input";
-import { Menu, MenuPopup, MenuRadioGroup, MenuRadioItem, MenuTrigger } from "./ui/menu";
+import {
+  Menu,
+  MenuItem,
+  MenuPopup,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+  MenuTrigger,
+} from "./ui/menu";
 import { SidebarContent, SidebarGroup, SidebarMenuButton, useSidebar } from "./ui/sidebar";
 import { SidebarChromeFooter, SidebarChromeHeader } from "./sidebar/SidebarChrome";
 import { Popover, PopoverPopup, PopoverTrigger } from "./ui/popover";
@@ -201,9 +211,12 @@ import {
 // stays behind an explicit Show more.
 const SETTLED_TAIL_INITIAL_COUNT = 10;
 const SETTLED_TAIL_PAGE_COUNT = 25;
+const SETTLED_PROJECT_INITIAL_COUNT = 10;
+const SETTLED_PROJECT_PAGE_COUNT = 25;
 // Keep the v2 key so existing preferences survive the v2-to-default rename.
 const SETTLED_SHELF_EXPANDED_KEY = "t3code:sidebar-v2:settled-expanded";
 const SNOOZED_SHELF_EXPANDED_KEY = "t3code:sidebar-v2:snoozed-expanded";
+const SETTLED_PROJECTS_EXPANDED_KEY = "t3code:sidebar:settled-projects-expanded";
 
 function compactSidebarTimeLabel(label: string): string {
   if (label === "just now") return "now";
@@ -2199,6 +2212,8 @@ export default function Sidebar() {
     activeThreads,
     snoozedThreads,
     settledThreads,
+    prominentProjectKeys,
+    settledProjectKeys,
     snoozeNow,
   } = useMemo(() => {
     const now = `${nowMinute}:00.000Z`;
@@ -2208,12 +2223,7 @@ export default function Sidebar() {
     // memo exactly at the next wake boundary.
     void snoozeWakeTick;
     const preciseNow = new Date().toISOString();
-    const visible = threads.filter(
-      (thread) =>
-        thread.archivedAt === null &&
-        (scopedProjectKeys === null ||
-          scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`)),
-    );
+    const visible = threads.filter((thread) => thread.archivedAt === null);
     const pinned: EnvironmentThreadShell[] = [];
     const treeThreads: EnvironmentThreadShell[] = [];
     const sectionByThreadKey = new Map<string, "active" | "snoozed" | "settled">();
@@ -2263,15 +2273,27 @@ export default function Sidebar() {
         sectionByThreadKey.get(scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))) ??
         "active",
     );
+    const prominentProjectKeys = new Set(
+      [...pinned, ...partitioned.active, ...partitioned.snoozed].map(
+        (thread) => `${thread.environmentId}:${thread.projectId}`,
+      ),
+    );
+    const settledProjectKeys = new Set(
+      partitioned.settled.map((thread) => `${thread.environmentId}:${thread.projectId}`),
+    );
+    const inProjectScope = (thread: EnvironmentThreadShell) =>
+      scopedProjectKeys === null ||
+      scopedProjectKeys.has(`${thread.environmentId}:${thread.projectId}`);
     // One shared rule on every platform (see sortPinnedThreadsByOrderKey):
     // user-arranged keys first, keyless threads in creation order below.
     // Server capability only gates DRAGGING — it must not influence the
     // sort, or mixed-version fleets would render different pinned orders on
     // web and mobile from the same data.
     return {
-      pinnedThreads: sortPinnedThreadsForSidebar(pinned),
+      pinnedThreads: sortPinnedThreadsForSidebar(pinned.filter(inProjectScope)),
       reorderablePinnedKeys: new Set(
         pinned
+          .filter(inProjectScope)
           .filter(
             (thread) =>
               serverConfigs.get(thread.environmentId)?.environment.capabilities.threadPinReorder ===
@@ -2279,14 +2301,18 @@ export default function Sidebar() {
           )
           .map((thread) => scopedThreadKey(scopeThreadRef(thread.environmentId, thread.id))),
       ),
-      activeThreads: sortThreadsForSidebar(partitioned.active),
+      activeThreads: sortThreadsForSidebar(partitioned.active.filter(inProjectScope)),
       // Soonest wake first: "what comes back next" is the shelf's question.
-      snoozedThreads: partitioned.snoozed.toSorted(
-        (left, right) =>
-          firstValidTimestampMs(left.snoozedUntil ?? null) -
-          firstValidTimestampMs(right.snoozedUntil ?? null),
-      ),
-      settledThreads: sortSettledThreadsForSidebar(partitioned.settled),
+      snoozedThreads: partitioned.snoozed
+        .filter(inProjectScope)
+        .toSorted(
+          (left, right) =>
+            firstValidTimestampMs(left.snoozedUntil ?? null) -
+            firstValidTimestampMs(right.snoozedUntil ?? null),
+        ),
+      settledThreads: sortSettledThreadsForSidebar(partitioned.settled.filter(inProjectScope)),
+      prominentProjectKeys,
+      settledProjectKeys,
       snoozeNow: preciseNow,
     };
   }, [
@@ -2299,6 +2325,53 @@ export default function Sidebar() {
     snoozeWakeTick,
     threads,
   ]);
+
+  const routeProjectKey = useMemo(() => {
+    if (routeTarget?.kind === "draft" && routeDraftThread !== null) {
+      return routeDraftThread.logicalProjectKey;
+    }
+    if (routeThreadRef === null) return null;
+    const routeThread = threads.find(
+      (thread) =>
+        thread.environmentId === routeThreadRef.environmentId &&
+        thread.id === routeThreadRef.threadId,
+    );
+    if (!routeThread) return null;
+    return (
+      projectGroups.find((project) =>
+        project.memberProjectRefs.some(
+          (ref) =>
+            ref.environmentId === routeThread.environmentId &&
+            ref.projectId === routeThread.projectId,
+        ),
+      )?.projectKey ?? null
+    );
+  }, [projectGroups, routeDraftThread, routeTarget?.kind, routeThreadRef, threads]);
+  const keptProjectKeys = useMemo(
+    () => new Set([projectScopeKey, routeProjectKey].filter((key): key is string => key !== null)),
+    [projectScopeKey, routeProjectKey],
+  );
+  const { visibleProjects: visibleProjectGroups, settledProjects: settledProjectGroups } = useMemo(
+    () =>
+      partitionPiExternalProjectsForSidebar({
+        projects: projectGroups,
+        prominentProjectKeys,
+        settledProjectKeys,
+        keepProjectKeys: keptProjectKeys,
+      }),
+    [keptProjectKeys, projectGroups, prominentProjectKeys, settledProjectKeys],
+  );
+  const [settledProjectsExpanded, setSettledProjectsExpanded] = useLocalStorage(
+    SETTLED_PROJECTS_EXPANDED_KEY,
+    false,
+    Schema.Boolean,
+  );
+  const [settledProjectVisibleCount, setSettledProjectVisibleCount] = useState(
+    SETTLED_PROJECT_INITIAL_COUNT,
+  );
+  const visibleSettledProjectGroups = settledProjectGroups.slice(0, settledProjectVisibleCount);
+  const hiddenSettledProjectCount =
+    settledProjectGroups.length - visibleSettledProjectGroups.length;
 
   const threadSearchInputRef = useRef<HTMLInputElement>(null);
   const [threadSearchQuery, setThreadSearchQuery] = useState("");
@@ -3850,7 +3923,7 @@ export default function Sidebar() {
                         <FolderIcon className="size-4 shrink-0" />
                         <span className="min-w-0 truncate text-sm">All projects</span>
                       </MenuRadioItem>
-                      {projectGroups.map((project) => {
+                      {visibleProjectGroups.map((project) => {
                         const scopeKey = project.projectKey;
                         return (
                           <MenuRadioItem
@@ -3882,6 +3955,64 @@ export default function Sidebar() {
                           </MenuRadioItem>
                         );
                       })}
+                      {settledProjectGroups.length > 0 ? (
+                        <>
+                          <MenuSeparator />
+                          <MenuItem
+                            aria-expanded={settledProjectsExpanded}
+                            closeOnClick={false}
+                            onClick={(event) => {
+                              event.preventDefault();
+                              setSettledProjectsExpanded((expanded) => !expanded);
+                            }}
+                          >
+                            {settledProjectsExpanded ? (
+                              <ChevronDownIcon className="size-4" />
+                            ) : (
+                              <ChevronRightIcon className="size-4" />
+                            )}
+                            <span className="min-w-0 flex-1">Settled projects</span>
+                            <span className="text-xs tabular-nums text-muted-foreground">
+                              {settledProjectGroups.length}
+                            </span>
+                          </MenuItem>
+                          {settledProjectsExpanded
+                            ? visibleSettledProjectGroups.map((project) => (
+                                <MenuRadioItem
+                                  key={project.projectKey}
+                                  value={project.projectKey}
+                                  closeOnClick
+                                  className="h-8 min-h-8 py-0 ps-8 text-sm font-medium [&>span:last-child]:flex [&>span:last-child]:min-w-0 [&>span:last-child]:items-center [&>span:last-child]:gap-2"
+                                >
+                                  <ProjectFavicon
+                                    environmentId={project.environmentId}
+                                    cwd={project.workspaceRoot}
+                                    faviconPath={project.faviconPath}
+                                    className="size-4 shrink-0"
+                                  />
+                                  <span className="min-w-0 truncate text-sm">
+                                    {project.displayName}
+                                  </span>
+                                </MenuRadioItem>
+                              ))
+                            : null}
+                          {settledProjectsExpanded && hiddenSettledProjectCount > 0 ? (
+                            <MenuItem
+                              closeOnClick={false}
+                              className="ps-8 text-muted-foreground"
+                              onClick={(event) => {
+                                event.preventDefault();
+                                setSettledProjectVisibleCount(
+                                  (count) => count + SETTLED_PROJECT_PAGE_COUNT,
+                                );
+                              }}
+                            >
+                              Show {Math.min(SETTLED_PROJECT_PAGE_COUNT, hiddenSettledProjectCount)}{" "}
+                              more
+                            </MenuItem>
+                          ) : null}
+                        </>
+                      ) : null}
                     </MenuRadioGroup>
                   </MenuPopup>
                 </Menu>

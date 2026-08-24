@@ -20,6 +20,7 @@ import {
   isSidebarNestedLinkClick,
   isTrailingDoubleClick,
   orderItemsByPreferredIds,
+  partitionPiExternalProjectsForSidebar,
   partitionSidebarThreadTrees,
   resolveProjectStatusIndicator,
   resolveSidebarStageBadgeLabel,
@@ -1935,6 +1936,58 @@ describe("sortScopedProjectsForSidebar", () => {
       "Visible project",
       "Archived-only project",
     ]);
+  });
+});
+
+describe("partitionPiExternalProjectsForSidebar", () => {
+  const project = (projectKey: string, id: string) => ({
+    projectKey,
+    memberProjects: [{ environmentId: "local", id }],
+  });
+
+  it("keeps manual and prominent external projects in the main list", () => {
+    const manual = project("manual", "project-1");
+    const active = project("active", "external:pi-project:active");
+
+    expect(
+      partitionPiExternalProjectsForSidebar({
+        projects: [manual, active],
+        prominentProjectKeys: new Set(["local:external:pi-project:active"]),
+        settledProjectKeys: new Set(),
+      }),
+    ).toEqual({
+      visibleProjects: [manual, active],
+      settledProjects: [],
+    });
+  });
+
+  it("moves settled-only external projects to history and omits archived-only projects", () => {
+    const settled = project("settled", "external:pi-project:settled");
+    const archived = project("archived", "external:pi-project:archived");
+
+    expect(
+      partitionPiExternalProjectsForSidebar({
+        projects: [settled, archived],
+        prominentProjectKeys: new Set(),
+        settledProjectKeys: new Set(["local:external:pi-project:settled"]),
+      }),
+    ).toEqual({
+      visibleProjects: [],
+      settledProjects: [settled],
+    });
+  });
+
+  it("keeps the selected external project visible regardless of lifecycle", () => {
+    const selected = project("selected", "external:pi-project:selected");
+
+    expect(
+      partitionPiExternalProjectsForSidebar({
+        projects: [selected],
+        prominentProjectKeys: new Set(),
+        settledProjectKeys: new Set(["local:external:pi-project:selected"]),
+        keepProjectKeys: new Set(["selected"]),
+      }).visibleProjects,
+    ).toEqual([selected]);
   });
 });
 
