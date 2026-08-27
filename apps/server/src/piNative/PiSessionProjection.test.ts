@@ -104,6 +104,7 @@ describe("PiSessionProjection", () => {
       record,
       entries,
       projectId: ProjectId.make("project-1"),
+      catalogResumeSupported: true,
     });
 
     expect(snapshot.thread.messages.map((message) => message.text)).toEqual([
@@ -114,14 +115,27 @@ describe("PiSessionProjection", () => {
     expect(snapshot.thread.activities).toHaveLength(1);
     expect(snapshot.thread.messages[0]?.attachments).toBeUndefined();
     expect(snapshot.thread.activities[0]?.kind).toBe("item.completed");
-    expect(snapshot.thread.backing).toEqual(projectPiBacking(record, undefined));
-    expect(snapshot.thread.backing?.control).toBe("readOnly");
-    expect(snapshot.thread.backing?.capabilities.send).toBe(false);
+    expect(snapshot.thread.backing).toEqual(projectPiBacking(record, undefined, true));
+    expect(snapshot.thread.backing?.control).toBe("resumable");
+    expect(snapshot.thread.backing?.capabilities.send).toBe(true);
     expect(snapshot.thread.backing?.capabilities.attachments).toBe(false);
+    expect(snapshot.thread.backing?.capabilities.interrupt).toBe(false);
+    expect(snapshot.thread.backing?.capabilities.stop).toBe(false);
     expect(snapshot.thread.backing?.capabilities.rename).toBe(false);
     expect(snapshot.thread.backing?.capabilities.settle).toBe(true);
     expect(snapshot.thread.backing?.capabilities.unsettle).toBe(true);
     expect(snapshot.thread.historyTruncation?.truncated).toBe(false);
+  });
+
+  it("fails catalog-only control closed without guarded-resume capability", () => {
+    expect(projectPiBacking(record, undefined)).toMatchObject({
+      control: "readOnly",
+      capabilities: { send: false },
+    });
+    expect(projectPiBacking(record, undefined, true)).toMatchObject({
+      control: "resumable",
+      capabilities: { send: true },
+    });
   });
 
   it("preserves Pi tool arguments and presentation in completed history", () => {

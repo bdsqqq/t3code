@@ -10,12 +10,15 @@ import { MANAGED_TURN_ADMISSION_PROTOCOL } from "@t3tools/contracts";
 
 export const SUPERVISOR_PROTOCOL = "t3-control-v2";
 export const MANAGED_ADMISSION_PROTOCOL = MANAGED_TURN_ADMISSION_PROTOCOL;
+export const GUARDED_RESUME_CAPABILITY = "guarded-resume-v1";
 export const SUPERVISOR_MAX_LINE_BYTES = 112 * 1024 * 1024;
 export const SUPERVISOR_MAX_STREAM_ITEM_BYTES = 32 * 1024 * 1024;
 
 export interface SupervisorCapabilities {
   readonly managedAdmission: typeof MANAGED_ADMISSION_PROTOCOL;
+  readonly guardedResume: typeof GUARDED_RESUME_CAPABILITY;
 }
+export type SupervisorCapabilityProbe = Partial<SupervisorCapabilities>;
 
 export interface ManagedPiTurnStartPayload {
   readonly type: "managed-pi.turn-start";
@@ -103,6 +106,7 @@ export type SupervisorCommand =
       readonly sessionFile: string;
       readonly cwd: string;
       readonly message: string;
+      readonly streamingBehavior: "steer" | "followUp";
       readonly images?: ReadonlyArray<{
         readonly type: "image";
         readonly data: string;
@@ -264,6 +268,21 @@ export type SupervisorResponse =
       readonly error: string;
     }
   | { readonly type: "stream"; readonly requestId: string; readonly item: SupervisorStreamItem };
+export function decodeSupervisorCapabilityProbe(value: unknown): SupervisorCapabilityProbe {
+  if (!isRecord(value)) return {};
+  return {
+    ...(value.managedAdmission === MANAGED_ADMISSION_PROTOCOL
+      ? { managedAdmission: MANAGED_ADMISSION_PROTOCOL }
+      : {}),
+    ...(value.guardedResume === GUARDED_RESUME_CAPABILITY
+      ? { guardedResume: GUARDED_RESUME_CAPABILITY }
+      : {}),
+  };
+}
+
+export const supportsGuardedResume = (capabilities: SupervisorCapabilityProbe): boolean =>
+  capabilities.guardedResume === GUARDED_RESUME_CAPABILITY;
+
 export const encodeLine = (value: unknown): string => `${JSON.stringify(value)}\n`;
 export class SupervisorStreamBuffer {
   readonly #maxBytes: number;

@@ -805,6 +805,9 @@ function ThreadRouteContent(
           threadCwd={selectedThreadCwd}
           selectedThreadQueueCount={composer.selectedThreadQueueCount}
           selectedThreadIndeterminateQueueCount={composer.selectedThreadIndeterminateQueueCount}
+          selectedThreadTakeoverConfirmationQueueCount={
+            composer.selectedThreadTakeoverConfirmationQueueCount
+          }
           layoutVariant={layout.variant}
           usesAutomaticContentInsets={usesNativeHeaderGlass}
           onOpenConnectionEditor={handleOpenConnectionEditor}
@@ -816,6 +819,7 @@ function ThreadRouteContent(
           onStopThread={handleStopThread}
           onStopSession={handleStopSession}
           onDiscardIndeterminateMessages={composer.onDiscardIndeterminateMessages}
+          onReviewQueuedExternalResumeMessages={composer.onReviewQueuedExternalResumeMessages}
           onSendMessage={composer.onSendMessage}
           onReconnectEnvironment={handleReconnectEnvironment}
           onUpdateThreadModelSelection={composer.onUpdateModelSelection}

@@ -1,7 +1,26 @@
 import { describe, expect, it } from "@effect/vitest";
-import { JsonLineDecoder, SupervisorStreamBuffer, encodeLine } from "./SupervisorProtocol.ts";
+import {
+  JsonLineDecoder,
+  SupervisorStreamBuffer,
+  encodeLine,
+  type SupervisorCommand,
+} from "./SupervisorProtocol.ts";
 
 describe("SupervisorProtocol", () => {
+  it("keeps resume-and-send streaming intent in the supervisor command", () => {
+    const command = {
+      type: "resumeAndSend",
+      commandId: "takeover-1" as never,
+      sessionKey: "source-key" as never,
+      sessionFile: "/sessions/session.jsonl",
+      cwd: "/workspace",
+      message: "continue",
+      streamingBehavior: "steer",
+    } satisfies SupervisorCommand;
+
+    expect(command.streamingBehavior).toBe("steer");
+  });
+
   it("decodes fragmented LF JSON frames", () => {
     const decoder = new JsonLineDecoder();
     expect(decoder.push('{"type":"eve')).toEqual([]);

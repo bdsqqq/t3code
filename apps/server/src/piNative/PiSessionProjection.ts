@@ -125,7 +125,10 @@ function runtimeSession(
   };
 }
 
-function backingFor(runtime: SupervisorRuntimeState | undefined): ExternalThreadBacking {
+function backingFor(
+  runtime: SupervisorRuntimeState | undefined,
+  catalogResumeSupported: boolean,
+): ExternalThreadBacking {
   const reconnecting = runtime?.status === "starting";
   const controlled = runtime !== undefined && runtime.status !== "exited" && !reconnecting;
   const streaming = runtime?.status === "streaming";
@@ -133,9 +136,18 @@ function backingFor(runtime: SupervisorRuntimeState | undefined): ExternalThread
     kind: "external",
     source: "pi",
     sourceKey: runtime?.sessionKey ?? "catalog",
-    control: reconnecting ? "live" : controlled ? "live" : "readOnly",
+    control:
+      runtime === undefined
+        ? catalogResumeSupported
+          ? "resumable"
+          : "readOnly"
+        : reconnecting
+          ? "live"
+          : controlled
+            ? "live"
+            : "readOnly",
     capabilities: {
-      send: controlled,
+      send: (runtime === undefined && catalogResumeSupported) || controlled,
       attachments: false,
       streamingBehaviors: streaming ? ["steer", "followUp"] : [],
       interrupt: controlled && streaming,
@@ -156,9 +168,10 @@ function backingFor(runtime: SupervisorRuntimeState | undefined): ExternalThread
 export function projectPiBacking(
   record: PiSessionCatalogRecord,
   runtime: SupervisorRuntimeState | undefined,
+  catalogResumeSupported = false,
 ): ExternalThreadBacking {
   return {
-    ...backingFor(runtime),
+    ...backingFor(runtime, catalogResumeSupported),
     sourceKey: record.sourceKey,
     ...(record.parentThreadId === undefined ? {} : { parentThreadId: record.parentThreadId }),
   };
@@ -375,6 +388,7 @@ export function projectPiThread(input: {
   readonly entries: ReadonlyArray<JsonRecord>;
   readonly projectId: ProjectId;
   readonly runtime?: SupervisorRuntimeState;
+  readonly catalogResumeSupported?: boolean;
   readonly lifecycle?: {
     readonly override: "settled" | "active";
     readonly updatedAt: string;
@@ -446,7 +460,7 @@ export function projectPiThread(input: {
     activities: history.activities,
     checkpoints: [],
     session,
-    backing: projectPiBacking(input.record, input.runtime),
+    backing: projectPiBacking(input.record, input.runtime, input.catalogResumeSupported),
     historyTruncation: {
       ...input.record.historyTruncation,
       truncated: input.record.historyTruncation.truncated || history.missingParentId !== undefined,

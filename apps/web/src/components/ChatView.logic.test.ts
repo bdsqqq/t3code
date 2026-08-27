@@ -1,4 +1,5 @@
 import {
+  CommandId,
   EnvironmentId,
   MessageId,
   ProjectId,
@@ -17,6 +18,7 @@ import {
   buildLoadingThreadFromShell,
   buildThreadTurnInterruptInput,
   createLocalDispatchSnapshot,
+  createTakeoverRetryIdentity,
   deriveComposerSendState,
   dismissBranchMismatchForSession,
   ENVIRONMENT_RECONNECT_WARNING_GRACE_MS,
@@ -24,11 +26,16 @@ import {
   hasEnvironmentReconnectWarningGraceElapsed,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
+  isPiNativeCommandRejected,
+  isTakeoverDeliveryIndeterminate,
+  matchTakeoverRetryIdentity,
   reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
   resolveBackgroundDraftWorkspaceOptions,
   resolveDraftPromotionNavigationTarget,
+  resolveExternalResumeForSend,
   resolveThreadMetadataUpdateForNextTurn,
+  rotateTakeoverRetryCommandId,
   resolveSendEnvMode,
   resolveDraftHeroState,
   scheduleEnvironmentReconnectWarning,
@@ -43,6 +50,116 @@ const environmentId = EnvironmentId.make("environment-local");
 const projectId = ProjectId.make("project-1");
 const threadId = ThreadId.make("thread-1");
 const now = "2026-03-29T00:00:00.000Z";
+
+describe("takeover retry identity", () => {
+  const identity = createTakeoverRetryIdentity({
+    threadKey: "environment-local:thread-1",
+    outgoingText: "continue the migration",
+    commandId: CommandId.make("command-1"),
+    messageId: MessageId.make("message-1"),
+    createdAt: now,
+  });
+
+  it("reuses the complete identity for the same thread and outgoing text", () => {
+    expect(
+      matchTakeoverRetryIdentity(identity, {
+        threadKey: identity.threadKey,
+        outgoingText: identity.outgoingText,
+      }),
+    ).toBe(identity);
+  });
+
+  it("invalidates the identity when the outgoing text or thread changes", () => {
+    expect(
+      matchTakeoverRetryIdentity(identity, {
+        threadKey: identity.threadKey,
+        outgoingText: "continue the edited migration",
+      }),
+    ).toBeNull();
+    expect(
+      matchTakeoverRetryIdentity(identity, {
+        threadKey: "environment-local:thread-2",
+        outgoingText: identity.outgoingText,
+      }),
+    ).toBeNull();
+  });
+
+  it("retains the takeover marker with the retry command and message ids", () => {
+    expect(identity).toMatchObject({
+      commandId: "command-1",
+      messageId: "message-1",
+      createdAt: now,
+      externalResume: "takeover",
+    });
+  });
+
+  it("rotates only the command id after terminal command rejection", () => {
+    const rotated = rotateTakeoverRetryCommandId(identity, CommandId.make("command-2"));
+
+    expect(rotated).toEqual({ ...identity, commandId: "command-2" });
+    expect(rotated.messageId).toBe(identity.messageId);
+    expect(rotated.createdAt).toBe(identity.createdAt);
+    expect(rotated.outgoingText).toBe(identity.outgoingText);
+    expect(rotated.externalResume).toBe("takeover");
+  });
+
+  it("classifies only takeover indeterminate delivery as unresolved", () => {
+    expect(isTakeoverDeliveryIndeterminate(identity, { deliveryStatus: "indeterminate" })).toBe(
+      true,
+    );
+    expect(isTakeoverDeliveryIndeterminate(identity, { deliveryStatus: "completed" })).toBe(false);
+    expect(isTakeoverDeliveryIndeterminate(null, { deliveryStatus: "indeterminate" })).toBe(false);
+  });
+
+  it("recognizes definitive Pi command rejection without matching generic coded errors", () => {
+    expect(isPiNativeCommandRejected({ _tag: "PiNativeError", code: "command_rejected" })).toBe(
+      true,
+    );
+    expect(isPiNativeCommandRejected({ code: "command_rejected" })).toBe(false);
+    expect(isPiNativeCommandRejected({ _tag: "PiNativeError", code: "upgrade_required" })).toBe(
+      false,
+    );
+  });
+});
+
+describe("external Pi thread takeover", () => {
+  it.each([
+    undefined,
+    { kind: "external", control: "live" },
+    { kind: "external", control: "readOnly" },
+  ])("sends without confirmation when the backing is %j", async (backing) => {
+    const confirm = vi.fn(async () => false);
+
+    await expect(resolveExternalResumeForSend(backing, confirm)).resolves.toEqual({
+      proceed: true,
+    });
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("cancels before takeover when the user declines", async () => {
+    const confirm = vi.fn(async () => false);
+
+    await expect(
+      resolveExternalResumeForSend({ kind: "external", control: "resumable" }, confirm),
+    ).resolves.toEqual({ proceed: false });
+    expect(confirm).toHaveBeenCalledWith(
+      [
+        "Take over this Pi thread?",
+        "T3 will start a new Pi writer for this thread.",
+        "Continue only if this session is not open in another terminal. T3 cannot detect unbridged writers.",
+      ].join("\n\n"),
+      { variant: "destructive" },
+    );
+  });
+
+  it("marks a confirmed takeover on the outgoing command", async () => {
+    const confirm = vi.fn(async () => true);
+
+    await expect(
+      resolveExternalResumeForSend({ kind: "external", control: "resumable" }, confirm),
+    ).resolves.toEqual({ proceed: true, externalResume: "takeover" });
+  });
+});
 
 describe("draft hero submission transition", () => {
   it("does not dock the composer before a background submission", () => {

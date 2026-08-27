@@ -21,6 +21,7 @@ import type {
   SupervisorStreamItem,
 } from "./SupervisorProtocol.ts";
 import {
+  GUARDED_RESUME_CAPABILITY,
   JsonLineDecoder,
   MANAGED_ADMISSION_PROTOCOL,
   SUPERVISOR_MAX_STREAM_ITEM_BYTES,
@@ -61,6 +62,16 @@ const SNAPSHOT_HEAD_BYTES = 256 * 1024;
 const SNAPSHOT_TAIL_BYTES = 16 * 1024 * 1024;
 class IndeterminateCommandError extends Error {}
 class RpcCommandRejectedError extends Error {}
+class SessionWriterClaimConflictError extends Error {
+  readonly sessionFile: string;
+  readonly runtimeId: string;
+
+  constructor(sessionFile: string, runtimeId: string) {
+    super("session already has a writer");
+    this.sessionFile = sessionFile;
+    this.runtimeId = runtimeId;
+  }
+}
 type CommandLedgerEntry = {
   hash: string;
   command?: Record<string, unknown>;
@@ -104,8 +115,11 @@ type Runtime = {
 };
 const runtimes = new Map<string, Runtime>();
 const writers = new Map<string, string>();
+/** lets a racing resume await the writer claim that won before its child is ready. */
+const startingRuntimes = new Map<string, Promise<Runtime | undefined>>();
 const bridgeRegistrations = new Set<string>();
 const liveCommands = new Map<string, { hash: string; work: Promise<SupervisorCommandReceipt> }>();
+const resumeAndSendQueues = new Map<string, Promise<void>>();
 let ledger: Record<string, LedgerEntry> = {};
 let ledgerWrite = Promise.resolve();
 const socketWrites = new WeakMap<
@@ -747,6 +761,70 @@ export function reserveBridgeRegistration(sessionFile: string): boolean {
 export function releaseBridgeRegistration(sessionFile: string): void {
   bridgeRegistrations.delete(sessionFile);
 }
+
+interface BridgeRegistrationSocketTarget {
+  readonly destroyed: boolean;
+  readonly once: (event: "close" | "error", listener: () => void) => unknown;
+  readonly off: (event: "close" | "error", listener: () => void) => unknown;
+}
+
+export function createBridgeRegistrationSocketGuard(socket: BridgeRegistrationSocketTarget) {
+  let closed = socket.destroyed;
+  let handedOff = false;
+  const markClosed = () => {
+    closed = true;
+  };
+  socket.once("close", markClosed);
+  socket.once("error", markClosed);
+  const removeRegistrationListeners = () => {
+    socket.off("close", markClosed);
+    socket.off("error", markClosed);
+  };
+  return {
+    isClosed: () => closed || socket.destroyed,
+    handoff: (cleanup: () => void): boolean => {
+      if (handedOff) return !closed;
+      handedOff = true;
+      removeRegistrationListeners();
+      if (closed || socket.destroyed) {
+        cleanup();
+        return false;
+      }
+      socket.once("close", cleanup);
+      socket.once("error", cleanup);
+      return true;
+    },
+    dispose: () => {
+      if (!handedOff) removeRegistrationListeners();
+    },
+  };
+}
+
+export function claimRpcSessionWriter(input: {
+  readonly writers: Map<string, string>;
+  readonly bridgeRegistrations: ReadonlySet<string>;
+  readonly sessionFile: string;
+  readonly runtimeId: string;
+}):
+  | { readonly status: "claimed" }
+  | { readonly status: "bridgeReserved" }
+  | { readonly status: "owned"; readonly runtimeId: string } {
+  if (input.bridgeRegistrations.has(input.sessionFile)) return { status: "bridgeReserved" };
+  const owner = input.writers.get(input.sessionFile);
+  if (owner !== undefined) return { status: "owned", runtimeId: owner };
+  input.writers.set(input.sessionFile, input.runtimeId);
+  return { status: "claimed" };
+}
+
+export function releaseSessionWriterIfOwned(input: {
+  readonly writers: Map<string, string>;
+  readonly sessionFile: string;
+  readonly runtimeId: string;
+}): boolean {
+  if (input.writers.get(input.sessionFile) !== input.runtimeId) return false;
+  input.writers.delete(input.sessionFile);
+  return true;
+}
 export const projectOverlayPayload = (payload: unknown, eventType: string | undefined): unknown => {
   if (!isRecord(payload) || eventType !== "message_update") return payload;
   if (payload.type === "event" && isRecord(payload.data) && isRecord(payload.data.update)) {
@@ -876,7 +954,13 @@ const setExited = (runtime: Runtime, exitCode?: number) => {
   if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
   const sequence = runtime.state.sequence + 1;
   runtime.state = { ...runtime.state, sequence, status: "exited" };
-  if (runtime.state.sessionFile) writers.delete(runtime.state.sessionFile);
+  if (runtime.state.sessionFile) {
+    releaseSessionWriterIfOwned({
+      writers,
+      sessionFile: runtime.state.sessionFile,
+      runtimeId: runtime.state.runtimeId,
+    });
+  }
   emit(runtime, {
     type: "exited",
     runtimeId: runtime.state.runtimeId,
@@ -998,90 +1082,214 @@ const attachRpc = (runtime: Runtime) => {
     setExited(runtime, code ?? undefined);
   });
 };
-async function spawnRuntime(command: Record<string, unknown>): Promise<Runtime> {
-  const runtimeId = randomUUID() as never;
-  const cwd = String(command.cwd);
+export async function validateExistingPiSessionSpawn(input: {
+  readonly sessionsRoot: string;
+  readonly sessionFile: string;
+  readonly cwd: string;
+  readonly sessionKey?: string;
+}): Promise<{ readonly sessionFile: string; readonly cwd: string; readonly sessionId: string }> {
+  const sessionsRoot = await fs.realpath(input.sessionsRoot);
+  const sessionFile = await fs.realpath(input.sessionFile);
+  const relativeSessionFile = path.relative(sessionsRoot, sessionFile);
+  if (
+    relativeSessionFile === "" ||
+    relativeSessionFile.startsWith(`..${path.sep}`) ||
+    relativeSessionFile === ".." ||
+    path.isAbsolute(relativeSessionFile)
+  ) {
+    throw new Error("session file is outside the pi sessions root");
+  }
+  const sessionStat = await fs.stat(sessionFile);
+  if (!sessionStat.isFile()) throw new Error("session file is not a regular file");
+
+  const cwd = await fs.realpath(input.cwd);
   const cwdStat = await fs.stat(cwd);
   if (!cwdStat.isDirectory()) throw new Error("cwd is not a directory");
-  const sessionFile =
-    typeof command.sessionFile === "string" ? await fs.realpath(command.sessionFile) : undefined;
-  if (sessionFile && writers.has(sessionFile)) throw new Error("session already has a writer");
-  if (sessionFile) writers.set(sessionFile, runtimeId);
-  const args = piRpcSpawnArgs({
-    sessionsRoot: defaultPiSessionsRoot(),
-    ...(sessionFile ? { sessionFile } : {}),
-  });
-  const child = spawn(process.env.T3_PI_EXECUTABLE ?? "pi", args, {
-    cwd,
-    stdio: ["pipe", "pipe", "pipe"],
-  });
-  await new Promise<void>((resolve, reject) => {
-    child.once("spawn", resolve);
-    child.once("error", reject);
-  }).catch((cause) => {
-    if (sessionFile && writers.get(sessionFile) === runtimeId) writers.delete(sessionFile);
-    throw cause;
-  });
-  const runtime: Runtime = {
-    state: {
-      runtimeId,
-      ...(sessionFile ? { sessionFile } : {}),
-      cwd,
-      writerKind: "rpc",
-      status: "starting",
-      sequence: 0,
-      overlay: { isStreaming: false, pendingMessageCount: 0 },
-    },
-    child,
-    ring: [],
-    ringBytes: 0,
-    ringEvictedThrough: -1,
-    overlayEvents: [],
-    overlayBytes: 0,
-    overlayOmittedCount: 0,
-    sessionReadOffset: 0,
-    subscribers: new Set(),
-    nextRpcId: 0,
-    pending: new Map(),
-    bridgePending: new Map(),
-  };
-  runtimes.set(runtimeId, runtime);
-  attachRpc(runtime);
-  const response = await rpc(runtime, "get_state").catch(async (cause) => {
-    await stopChild(runtime);
-    runtimes.delete(runtimeId);
-    if (sessionFile) writers.delete(sessionFile);
-    throw cause;
-  });
-  const state = isRecord(response.data) ? response.data : {};
-  const discoveredFile =
-    typeof state.sessionFile === "string"
-      ? await fs.realpath(state.sessionFile).catch(() => state.sessionFile as string)
-      : sessionFile;
-  if (discoveredFile) {
-    const owner = writers.get(discoveredFile);
-    if (owner && owner !== runtimeId) {
-      child.kill("SIGTERM");
-      throw new Error("session already has a writer");
-    }
-    writers.set(discoveredFile, runtimeId);
+
+  const firstLine = await readSessionHeaderLine(sessionFile);
+  let header: unknown;
+  try {
+    header = JSON.parse(firstLine ?? "");
+  } catch {
+    header = undefined;
   }
-  runtime.state = {
-    ...runtime.state,
-    ...(discoveredFile ? { sessionFile: discoveredFile } : {}),
-    status: state.isStreaming === true ? "streaming" : "idle",
-    state,
-    overlay: {
-      isStreaming: state.isStreaming === true,
-      pendingMessageCount:
-        typeof state.pendingMessageCount === "number"
-          ? Math.max(0, Math.trunc(state.pendingMessageCount))
-          : 0,
-      lastEventType: "get_state",
-    },
-  };
-  runtime.sessionReadOffset = (await readSessionFile(discoveredFile)).offset;
-  return runtime;
+  if (
+    !isRecord(header) ||
+    header.type !== "session" ||
+    typeof header.id !== "string" ||
+    header.id.length === 0 ||
+    typeof header.cwd !== "string"
+  ) {
+    throw new Error("invalid session header");
+  }
+  const headerCwd = await fs.realpath(header.cwd).catch(() => undefined);
+  if (headerCwd !== cwd) throw new Error("session header cwd does not match resume cwd");
+
+  if (input.sessionKey !== undefined) {
+    const expectedSessionKey = createHash("sha256").update(sessionFile).digest("hex");
+    if (input.sessionKey !== expectedSessionKey) {
+      throw new Error("session key does not match canonical session file");
+    }
+  }
+  return { sessionFile, cwd, sessionId: header.id };
+}
+
+export async function acquireResumeAndSendRuntime<T>(input: {
+  readonly existingWriter: () => Promise<T | undefined>;
+  readonly spawnWriter: () => Promise<T>;
+  readonly isWriterClaimConflict: (cause: unknown) => boolean;
+}): Promise<{ readonly runtime: T; readonly reusedWriter: boolean }> {
+  const existing = await input.existingWriter();
+  if (existing !== undefined) return { runtime: existing, reusedWriter: true };
+  try {
+    return { runtime: await input.spawnWriter(), reusedWriter: false };
+  } catch (cause) {
+    if (!input.isWriterClaimConflict(cause)) throw cause;
+    const raced = await input.existingWriter();
+    if (raced !== undefined) return { runtime: raced, reusedWriter: true };
+    throw cause;
+  }
+}
+
+async function liveWriterForSession(sessionFile: string): Promise<Runtime | undefined> {
+  const runtimeId = writers.get(sessionFile);
+  if (runtimeId === undefined) return undefined;
+  const starting = startingRuntimes.get(runtimeId);
+  const runtime = starting === undefined ? runtimes.get(runtimeId) : await starting;
+  return runtime?.state.status === "exited" ? undefined : runtime;
+}
+
+type ValidatedExistingPiSessionSpawn = Awaited<ReturnType<typeof validateExistingPiSessionSpawn>>;
+
+async function spawnRuntime(
+  command: Record<string, unknown>,
+  existingValidation?: ValidatedExistingPiSessionSpawn,
+): Promise<Runtime> {
+  const runtimeId = randomUUID() as never;
+  let cwd = String(command.cwd);
+  let sessionFile = typeof command.sessionFile === "string" ? command.sessionFile : undefined;
+  const sessionKey = command.type === "resumeAndSend" ? String(command.sessionKey) : undefined;
+  if (sessionFile) {
+    const validated =
+      existingValidation ??
+      (await validateExistingPiSessionSpawn({
+        sessionsRoot: defaultPiSessionsRoot(),
+        sessionFile,
+        cwd,
+        ...(sessionKey === undefined ? {} : { sessionKey }),
+      }));
+    sessionFile = validated.sessionFile;
+    cwd = validated.cwd;
+  } else {
+    const cwdStat = await fs.stat(cwd);
+    if (!cwdStat.isDirectory()) throw new Error("cwd is not a directory");
+  }
+
+  let resolveStarting: ((runtime: Runtime | undefined) => void) | undefined;
+  if (sessionFile) {
+    const readiness = new Promise<Runtime | undefined>((resolve) => {
+      resolveStarting = resolve;
+    });
+    startingRuntimes.set(runtimeId, readiness);
+    const claim = claimRpcSessionWriter({
+      writers,
+      bridgeRegistrations,
+      sessionFile,
+      runtimeId,
+    });
+    if (claim.status !== "claimed") {
+      startingRuntimes.delete(runtimeId);
+      resolveStarting?.(undefined);
+      if (claim.status === "bridgeReserved") {
+        throw new Error("session bridge registration is in progress");
+      }
+      throw new SessionWriterClaimConflictError(sessionFile, claim.runtimeId);
+    }
+  }
+
+  try {
+    const args = piRpcSpawnArgs({
+      sessionsRoot: defaultPiSessionsRoot(),
+      ...(sessionFile ? { sessionFile } : {}),
+    });
+    const child = spawn(process.env.T3_PI_EXECUTABLE ?? "pi", args, {
+      cwd,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    await new Promise<void>((resolve, reject) => {
+      child.once("spawn", resolve);
+      child.once("error", reject);
+    });
+    const runtime: Runtime = {
+      state: {
+        runtimeId,
+        ...(sessionKey ? { sessionKey: sessionKey as never } : {}),
+        ...(sessionFile ? { sessionFile } : {}),
+        cwd,
+        writerKind: "rpc",
+        status: "starting",
+        sequence: 0,
+        overlay: { isStreaming: false, pendingMessageCount: 0 },
+      },
+      child,
+      ring: [],
+      ringBytes: 0,
+      ringEvictedThrough: -1,
+      overlayEvents: [],
+      overlayBytes: 0,
+      overlayOmittedCount: 0,
+      sessionReadOffset: 0,
+      subscribers: new Set(),
+      nextRpcId: 0,
+      pending: new Map(),
+      bridgePending: new Map(),
+    };
+    runtimes.set(runtimeId, runtime);
+    attachRpc(runtime);
+    const response = await rpc(runtime, "get_state").catch(async (cause) => {
+      await stopChild(runtime);
+      throw cause;
+    });
+    const state = isRecord(response.data) ? response.data : {};
+    const discoveredFile =
+      typeof state.sessionFile === "string"
+        ? await fs.realpath(state.sessionFile).catch(() => state.sessionFile as string)
+        : sessionFile;
+    if (discoveredFile) {
+      const owner = writers.get(discoveredFile);
+      if (owner && owner !== runtimeId) {
+        child.kill("SIGTERM");
+        throw new SessionWriterClaimConflictError(discoveredFile, owner);
+      }
+      writers.set(discoveredFile, runtimeId);
+    }
+    runtime.state = {
+      ...runtime.state,
+      ...(discoveredFile ? { sessionFile: discoveredFile } : {}),
+      status: state.isStreaming === true ? "streaming" : "idle",
+      state,
+      overlay: {
+        isStreaming: state.isStreaming === true,
+        pendingMessageCount:
+          typeof state.pendingMessageCount === "number"
+            ? Math.max(0, Math.trunc(state.pendingMessageCount))
+            : 0,
+        lastEventType: "get_state",
+      },
+    };
+    runtime.sessionReadOffset = (await readSessionFile(discoveredFile)).offset;
+    resolveStarting?.(runtime);
+    return runtime;
+  } catch (cause) {
+    if (sessionFile) {
+      releaseSessionWriterIfOwned({ writers, sessionFile, runtimeId });
+    }
+    runtimes.delete(runtimeId);
+    resolveStarting?.(undefined);
+    throw cause;
+  } finally {
+    startingRuntimes.delete(runtimeId);
+  }
 }
 async function stopChild(runtime: Runtime): Promise<void> {
   const child = runtime.child;
@@ -1107,38 +1315,20 @@ export function bridgeCommandFrame(command: Record<string, unknown>) {
   };
 }
 
-async function execute(command: Record<string, unknown>): Promise<SupervisorCommandReceipt> {
+export function existingWriterResumeAndSendCommand(
+  command: Record<string, unknown>,
+  runtimeId: SupervisorRuntimeState["runtimeId"],
+): Record<string, unknown> {
+  const streamingBehavior = command.streamingBehavior === "followUp" ? "followUp" : "steer";
+  return { ...command, type: streamingBehavior, runtimeId };
+}
+
+async function deliverRuntimeCommand(
+  runtime: Runtime,
+  command: Record<string, unknown>,
+): Promise<SupervisorCommandReceipt> {
   const commandId = String(command.commandId);
-  if (command.type === "start") {
-    const runtime = await spawnRuntime(command);
-    return {
-      commandId: commandId as never,
-      status: "completed",
-      runtimeId: runtime.state.runtimeId,
-      result: runtime.state.sessionFile ? { sessionFile: runtime.state.sessionFile } : undefined,
-    };
-  }
-  if (command.type === "resumeAndSend") {
-    const runtime = await spawnRuntime(command);
-    try {
-      await rpc(runtime, "prompt", {
-        message: String(command.message),
-        ...(Array.isArray(command.images) ? { images: command.images } : {}),
-      });
-    } catch (cause) {
-      if (cause instanceof RpcCommandRejectedError) throw cause;
-      throw new IndeterminateCommandError(
-        cause instanceof Error ? cause.message : "pi command outcome is unknown",
-      );
-    }
-    return {
-      commandId: commandId as never,
-      status: "completed",
-      runtimeId: runtime.state.runtimeId,
-    };
-  }
-  const runtime = runtimes.get(String(command.runtimeId));
-  if (!runtime || runtime.state.status === "exited") throw new Error("runtime is not live");
+  if (runtime.state.status === "exited") throw new Error("runtime is not live");
   if (runtime.state.writerKind === "tuiBridge" && !runtime.bridge)
     throw new Error("bridge is reconnecting");
   if (runtime.bridge) {
@@ -1228,76 +1418,205 @@ async function execute(command: Record<string, unknown>): Promise<SupervisorComm
   };
   return { commandId: commandId as never, status: "completed", runtimeId: runtime.state.runtimeId };
 }
+
+export function runKeyedSerialQueue<T>(input: {
+  readonly entries: Map<string, Promise<void>>;
+  readonly key: string;
+  readonly run: () => Promise<T>;
+}): Promise<T> {
+  const prior = input.entries.get(input.key) ?? Promise.resolve();
+  const work = prior.catch(() => undefined).then(() => input.run());
+  const tail = work.then(
+    () => undefined,
+    () => undefined,
+  );
+  input.entries.set(input.key, tail);
+  void tail.then(() => {
+    if (input.entries.get(input.key) === tail) input.entries.delete(input.key);
+  });
+  return work;
+}
+
+/**
+ * Keeps a queued resume replayable until its session slot is ready, then persists
+ * delivery before any writer acquisition or prompt handoff can begin.
+ */
+export function runSerializedResumeAndSendDelivery<T>(input: {
+  readonly entries: Map<string, Promise<void>>;
+  readonly sessionFile: string;
+  readonly startDelivery: () => Promise<void>;
+  readonly deliver: () => Promise<T>;
+}): Promise<T> {
+  return runKeyedSerialQueue({
+    entries: input.entries,
+    key: input.sessionFile,
+    run: async () => {
+      await input.startDelivery();
+      return input.deliver();
+    },
+  });
+}
+
+async function execute(
+  command: Record<string, unknown>,
+  startResumeAndSendDelivery?: () => Promise<void>,
+): Promise<SupervisorCommandReceipt> {
+  const commandId = String(command.commandId);
+  if (command.type === "start") {
+    const runtime = await spawnRuntime(command);
+    return {
+      commandId: commandId as never,
+      status: "completed",
+      runtimeId: runtime.state.runtimeId,
+      result: runtime.state.sessionFile ? { sessionFile: runtime.state.sessionFile } : undefined,
+    };
+  }
+  if (command.type === "resumeAndSend") {
+    const validated = await validateExistingPiSessionSpawn({
+      sessionsRoot: defaultPiSessionsRoot(),
+      sessionFile: String(command.sessionFile),
+      cwd: String(command.cwd),
+      sessionKey: String(command.sessionKey),
+    });
+    if (startResumeAndSendDelivery === undefined)
+      throw new Error("resume-and-send delivery start callback is required");
+    return runSerializedResumeAndSendDelivery({
+      entries: resumeAndSendQueues,
+      sessionFile: validated.sessionFile,
+      startDelivery: startResumeAndSendDelivery,
+      deliver: async () => {
+        const acquisition = await acquireResumeAndSendRuntime({
+          existingWriter: () => liveWriterForSession(validated.sessionFile),
+          spawnWriter: () =>
+            spawnRuntime(
+              { ...command, sessionFile: validated.sessionFile, cwd: validated.cwd },
+              validated,
+            ),
+          isWriterClaimConflict: (cause) => cause instanceof SessionWriterClaimConflictError,
+        });
+        if (acquisition.reusedWriter) {
+          return deliverRuntimeCommand(
+            acquisition.runtime,
+            existingWriterResumeAndSendCommand(command, acquisition.runtime.state.runtimeId),
+          );
+        }
+        try {
+          await rpc(acquisition.runtime, "prompt", {
+            message: String(command.message),
+            ...(Array.isArray(command.images) ? { images: command.images } : {}),
+          });
+        } catch (cause) {
+          if (cause instanceof RpcCommandRejectedError) throw cause;
+          throw new IndeterminateCommandError(
+            cause instanceof Error ? cause.message : "pi command outcome is unknown",
+          );
+        }
+        return {
+          commandId: commandId as never,
+          status: "completed",
+          runtimeId: acquisition.runtime.state.runtimeId,
+        };
+      },
+    });
+  }
+  const runtime = runtimes.get(String(command.runtimeId));
+  if (!runtime) throw new Error("runtime is not live");
+  return deliverRuntimeCommand(runtime, command);
+}
+export function runCommandSingleFlight<T>(input: {
+  readonly entries: Map<string, { readonly hash: string; readonly work: Promise<T> }>;
+  readonly id: string;
+  readonly hash: string;
+  readonly run: () => Promise<T>;
+}): Promise<T> {
+  const active = input.entries.get(input.id);
+  if (active !== undefined) {
+    if (active.hash !== input.hash) throw new Error("commandId payload conflict");
+    return active.work;
+  }
+  let work!: Promise<T>;
+  work = Promise.resolve()
+    .then(() => input.run())
+    .finally(() => {
+      if (input.entries.get(input.id)?.work === work) input.entries.delete(input.id);
+    });
+  input.entries.set(input.id, { hash: input.hash, work });
+  return work;
+}
+
 async function dispatch(command: Record<string, unknown>): Promise<SupervisorCommandReceipt> {
   const id = String(command.commandId);
   const hash = hashCommand(command);
-  const active = liveCommands.get(id);
-  if (active) {
-    if (active.hash !== hash) throw new Error("commandId payload conflict");
-    return active.work;
-  }
-  let prior = ledger[id];
-  if (prior) {
-    if (isManagedLedgerEntry(prior)) throw new Error("commandId payload conflict");
-    if (prior.hash !== hash) throw new Error("commandId payload conflict");
-    if (prior.receipt.status !== "started") {
-      if (
-        !shouldRestartPersistedSession(
-          command,
-          prior.receipt,
-          prior.receipt.runtimeId === undefined
-            ? undefined
-            : runtimes.get(prior.receipt.runtimeId)?.state,
-        )
-      ) {
-        return prior.receipt;
+  return runCommandSingleFlight({
+    entries: liveCommands,
+    id,
+    hash,
+    run: async () => {
+      let prior = ledger[id];
+      if (prior) {
+        if (isManagedLedgerEntry(prior)) throw new Error("commandId payload conflict");
+        if (prior.hash !== hash) throw new Error("commandId payload conflict");
+        if (prior.receipt.status !== "started") {
+          if (
+            !shouldRestartPersistedSession(
+              command,
+              prior.receipt,
+              prior.receipt.runtimeId === undefined
+                ? undefined
+                : runtimes.get(prior.receipt.runtimeId)?.state,
+            )
+          ) {
+            return prior.receipt;
+          }
+          delete ledger[id];
+          await atomicLedger();
+          prior = undefined;
+        }
       }
-      delete ledger[id];
-      await atomicLedger();
-      prior = undefined;
-    }
-  }
-  if (prior) {
-    if (isManagedLedgerEntry(prior)) throw new Error("commandId payload conflict");
-    if (prior.phase !== "queued" || !prior.command)
-      return { ...prior.receipt, status: "indeterminate" };
-    command = prior.command;
-  }
-  const started = { commandId: id as never, status: "started" as const };
-  let queuedWrite = Promise.resolve();
-  if (!prior) {
-    ledger[id] = { hash, command, phase: "queued", receipt: started };
-    queuedWrite = atomicLedger();
-  }
-  const work = queuedWrite
-    .then(async () => {
-      ledger[id] = { hash, command, phase: "delivering", receipt: started };
-      await atomicLedger();
-      return execute(command);
-    })
-    .then(
-      async (receipt) => {
-        ledger[id] = { hash, receipt };
+      if (prior) {
+        if (isManagedLedgerEntry(prior)) throw new Error("commandId payload conflict");
+        if (prior.phase !== "queued" || !prior.command)
+          return { ...prior.receipt, status: "indeterminate" };
+        command = prior.command;
+      }
+      const started = { commandId: id as never, status: "started" as const };
+      let queuedWrite = Promise.resolve();
+      if (!prior) {
+        ledger[id] = { hash, command, phase: "queued", receipt: started };
+        queuedWrite = atomicLedger();
+      }
+      const startDelivery = async () => {
+        ledger[id] = { hash, command, phase: "delivering", receipt: started };
         await atomicLedger();
-        return receipt;
-      },
-      async (cause) => {
-        const receipt = {
-          commandId: id as never,
-          status:
-            cause instanceof IndeterminateCommandError
-              ? ("indeterminate" as const)
-              : ("rejected" as const),
-          error: String(cause),
-        };
-        ledger[id] = { hash, receipt };
-        await atomicLedger();
-        return receipt;
-      },
-    )
-    .finally(() => liveCommands.delete(id));
-  liveCommands.set(id, { hash, work });
-  return work;
+      };
+      return queuedWrite
+        .then(async () => {
+          if (command.type === "resumeAndSend") return execute(command, startDelivery);
+          await startDelivery();
+          return execute(command);
+        })
+        .then(
+          async (receipt) => {
+            ledger[id] = { hash, receipt };
+            await atomicLedger();
+            return receipt;
+          },
+          async (cause) => {
+            const receipt = {
+              commandId: id as never,
+              status:
+                cause instanceof IndeterminateCommandError
+                  ? ("indeterminate" as const)
+                  : ("rejected" as const),
+              error: String(cause),
+            };
+            ledger[id] = { hash, receipt };
+            await atomicLedger();
+            return receipt;
+          },
+        );
+    },
+  });
 }
 async function readSessionHeaderLine(sessionFile: string): Promise<string | undefined> {
   const handle = await fs.open(sessionFile, "r");
@@ -1313,135 +1632,142 @@ async function readSessionHeaderLine(sessionFile: string): Promise<string | unde
   }
 }
 async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
-  const sessionId = String(frame.sessionId);
-  if (typeof frame.sessionFile !== "string") {
-    socket.end(encodeLine({ type: "error", error: "bridge sessionFile is required" }));
-    return;
-  }
-  const sessionsRoot = await fs.realpath(defaultPiSessionsRoot()).catch(() => undefined);
-  const sessionFile = await fs.realpath(frame.sessionFile).catch(() => undefined);
-  if (!sessionsRoot || !sessionFile || !sessionFile.startsWith(`${sessionsRoot}${path.sep}`)) {
-    socket.end(
-      encodeLine({ type: "error", error: "bridge sessionFile is outside the pi sessions root" }),
-    );
-    return;
-  }
-  if (!reserveBridgeRegistration(sessionFile)) {
-    socket.end(encodeLine({ type: "error", error: "session registration is already in progress" }));
-    return;
-  }
+  const socketGuard = createBridgeRegistrationSocketGuard(socket);
   try {
-    const firstLine = await readSessionHeaderLine(sessionFile);
-    let header: unknown;
-    try {
-      header = JSON.parse(firstLine ?? "");
-    } catch {
-      header = undefined;
+    const sessionId = String(frame.sessionId);
+    if (typeof frame.sessionFile !== "string") {
+      socket.end(encodeLine({ type: "error", error: "bridge sessionFile is required" }));
+      return;
     }
-    if (
-      !isRecord(header) ||
-      header.type !== "session" ||
-      header.id !== sessionId ||
-      typeof header.cwd !== "string" ||
-      header.cwd !== frame.cwd
-    ) {
+    const sessionsRoot = await fs.realpath(defaultPiSessionsRoot()).catch(() => undefined);
+    const sessionFile = await fs.realpath(frame.sessionFile).catch(() => undefined);
+    if (!sessionsRoot || !sessionFile || !sessionFile.startsWith(`${sessionsRoot}${path.sep}`)) {
       socket.end(
-        encodeLine({ type: "error", error: "bridge session header does not match registration" }),
+        encodeLine({ type: "error", error: "bridge sessionFile is outside the pi sessions root" }),
       );
       return;
     }
-    if (socket.destroyed) return;
-    const writerId = writers.get(sessionFile);
-    const existing = writerId ? runtimes.get(writerId) : undefined;
-    if (
-      writerId &&
-      (!existing ||
-        existing.state.writerKind !== "tuiBridge" ||
-        existing.bridge !== undefined ||
-        !isRecord(existing.state.state) ||
-        existing.state.state.sessionId !== sessionId)
-    ) {
-      socket.end(encodeLine({ type: "error", error: "session already has a writer" }));
+    if (!reserveBridgeRegistration(sessionFile)) {
+      socket.end(
+        encodeLine({ type: "error", error: "session registration is already in progress" }),
+      );
       return;
     }
-    const runtime: Runtime =
-      existing ??
-      ({
-        state: {
-          runtimeId: randomUUID() as never,
-          sessionFile,
-          cwd: String(frame.cwd),
-          writerKind: "tuiBridge",
-          status: "idle",
-          sequence: 0,
-          overlay: { isStreaming: false, pendingMessageCount: 0 },
-          state: { sessionId, cwd: frame.cwd, pid: frame.pid },
+    try {
+      const firstLine = await readSessionHeaderLine(sessionFile);
+      let header: unknown;
+      try {
+        header = JSON.parse(firstLine ?? "");
+      } catch {
+        header = undefined;
+      }
+      if (
+        !isRecord(header) ||
+        header.type !== "session" ||
+        header.id !== sessionId ||
+        typeof header.cwd !== "string" ||
+        header.cwd !== frame.cwd
+      ) {
+        socket.end(
+          encodeLine({ type: "error", error: "bridge session header does not match registration" }),
+        );
+        return;
+      }
+      if (socketGuard.isClosed()) return;
+      const writerId = writers.get(sessionFile);
+      const existing = writerId ? runtimes.get(writerId) : undefined;
+      if (
+        writerId &&
+        (!existing ||
+          existing.state.writerKind !== "tuiBridge" ||
+          existing.bridge !== undefined ||
+          !isRecord(existing.state.state) ||
+          existing.state.state.sessionId !== sessionId)
+      ) {
+        socket.end(encodeLine({ type: "error", error: "session already has a writer" }));
+        return;
+      }
+      const runtime: Runtime =
+        existing ??
+        ({
+          state: {
+            runtimeId: randomUUID() as never,
+            sessionFile,
+            cwd: String(frame.cwd),
+            writerKind: "tuiBridge",
+            status: "idle",
+            sequence: 0,
+            overlay: { isStreaming: false, pendingMessageCount: 0 },
+            state: { sessionId, cwd: frame.cwd, pid: frame.pid },
+          },
+          ring: [],
+          ringBytes: 0,
+          ringEvictedThrough: -1,
+          overlayEvents: [],
+          overlayBytes: 0,
+          overlayOmittedCount: 0,
+          sessionReadOffset: (await readSessionFile(sessionFile)).offset,
+          subscribers: new Set(),
+          nextRpcId: 0,
+          pending: new Map(),
+          bridgePending: new Map(),
+        } satisfies Runtime);
+      if (socketGuard.isClosed()) return;
+      if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
+      delete runtime.bridgeExpiry;
+      runtime.bridge = socket;
+      const bridgeIsStreaming =
+        typeof frame.isStreaming === "boolean"
+          ? frame.isStreaming
+          : runtime.state.overlay?.isStreaming === true;
+      const steering = Array.isArray(frame.steering)
+        ? frame.steering.filter((value): value is string => typeof value === "string")
+        : [];
+      const followUp = Array.isArray(frame.followUp)
+        ? frame.followUp.filter((value): value is string => typeof value === "string")
+        : [];
+      runtime.state = {
+        ...runtime.state,
+        status: bridgeIsStreaming ? "streaming" : "idle",
+        overlay: {
+          ...(runtime.state.overlay ?? { pendingMessageCount: 0 }),
+          isStreaming: bridgeIsStreaming,
+          pendingMessageCount: steering.length + followUp.length,
+          lastEventType: existing ? "bridge_reconnected" : "bridge_registered",
         },
-        ring: [],
-        ringBytes: 0,
-        ringEvictedThrough: -1,
-        overlayEvents: [],
-        overlayBytes: 0,
-        overlayOmittedCount: 0,
-        sessionReadOffset: (await readSessionFile(sessionFile)).offset,
-        subscribers: new Set(),
-        nextRpcId: 0,
-        pending: new Map(),
-        bridgePending: new Map(),
-      } satisfies Runtime);
-    if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
-    delete runtime.bridgeExpiry;
-    runtime.bridge = socket;
-    const bridgeIsStreaming =
-      typeof frame.isStreaming === "boolean"
-        ? frame.isStreaming
-        : runtime.state.overlay?.isStreaming === true;
-    const steering = Array.isArray(frame.steering)
-      ? frame.steering.filter((value): value is string => typeof value === "string")
-      : [];
-    const followUp = Array.isArray(frame.followUp)
-      ? frame.followUp.filter((value): value is string => typeof value === "string")
-      : [];
-    runtime.state = {
-      ...runtime.state,
-      status: bridgeIsStreaming ? "streaming" : "idle",
-      overlay: {
-        ...(runtime.state.overlay ?? { pendingMessageCount: 0 }),
-        isStreaming: bridgeIsStreaming,
-        pendingMessageCount: steering.length + followUp.length,
-        lastEventType: existing ? "bridge_reconnected" : "bridge_registered",
-      },
-      state: { sessionId, cwd: frame.cwd, pid: frame.pid },
-      cwd: String(frame.cwd),
-    };
-    runtimes.set(runtime.state.runtimeId, runtime);
-    writers.set(sessionFile, runtime.state.runtimeId);
-    event(runtime, {
-      type: "event",
-      event: "queue_update",
-      data: { steering, followUp },
-    });
-    if (existing) event(runtime, { type: "bridge_reconnected", isStreaming: bridgeIsStreaming });
-    if (existing && !bridgeIsStreaming)
-      void publishSettledSnapshot(runtime, runtime.state.sequence);
-    const cleanup = () => {
-      if (runtime.state.status === "exited" || runtime.bridge !== socket) return;
-      delete runtime.bridge;
-      for (const pending of runtime.bridgePending.values())
-        pending({ status: "indeterminate", error: "bridge disconnected" });
-      runtime.bridgePending.clear();
-      runtime.state = { ...runtime.state, status: "starting" };
-      event(runtime, { type: "bridge_disconnected" });
-      runtime.bridgeExpiry = setTimeout(() => {
-        delete runtime.bridgeExpiry;
-        if (!runtime.bridge) setExited(runtime);
-      }, 30_000);
-      runtime.bridgeExpiry.unref();
-    };
-    socket.once("close", cleanup);
-    socket.once("error", cleanup);
+        state: { sessionId, cwd: frame.cwd, pid: frame.pid },
+        cwd: String(frame.cwd),
+      };
+      runtimes.set(runtime.state.runtimeId, runtime);
+      writers.set(sessionFile, runtime.state.runtimeId);
+      event(runtime, {
+        type: "event",
+        event: "queue_update",
+        data: { steering, followUp },
+      });
+      if (existing) event(runtime, { type: "bridge_reconnected", isStreaming: bridgeIsStreaming });
+      if (existing && !bridgeIsStreaming)
+        void publishSettledSnapshot(runtime, runtime.state.sequence);
+      const cleanup = () => {
+        if (runtime.state.status === "exited" || runtime.bridge !== socket) return;
+        delete runtime.bridge;
+        for (const pending of runtime.bridgePending.values())
+          pending({ status: "indeterminate", error: "bridge disconnected" });
+        runtime.bridgePending.clear();
+        runtime.state = { ...runtime.state, status: "starting" };
+        event(runtime, { type: "bridge_disconnected" });
+        runtime.bridgeExpiry = setTimeout(() => {
+          delete runtime.bridgeExpiry;
+          if (!runtime.bridge) setExited(runtime);
+        }, 30_000);
+        runtime.bridgeExpiry.unref();
+      };
+      socketGuard.handoff(cleanup);
+    } finally {
+      releaseBridgeRegistration(sessionFile);
+    }
   } finally {
-    releaseBridgeRegistration(sessionFile);
+    socketGuard.dispose();
   }
 }
 function parseSessionEntries(text: string): ReadonlyArray<Record<string, unknown>> {
@@ -1720,7 +2046,10 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
         requestId: value.requestId,
         ok: true,
         result: [...runtimes.values()].map((runtime) => projectListedRuntime(runtime.state)),
-        capabilities: { managedAdmission: MANAGED_ADMISSION_PROTOCOL },
+        capabilities: {
+          managedAdmission: MANAGED_ADMISSION_PROTOCOL,
+          guardedResume: GUARDED_RESUME_CAPABILITY,
+        },
       });
     } else if (value.method === "dispatch" && isRecord(value.command)) {
       writeBounded(socket, {

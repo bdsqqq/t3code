@@ -6,8 +6,10 @@ import {
 } from "@t3tools/client-runtime/environment";
 import * as Schema from "effect/Schema";
 import {
+  CommandId,
   defaultInstanceIdForDriver,
   EnvironmentId,
+  MessageId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -61,6 +63,7 @@ import {
   COMPOSER_DRAFT_STORAGE_KEY,
   clearComposerDraftsEnvironment,
   finalizePromotedDraftThreadByRef,
+  flushComposerDraftStorage,
   markPromotedDraftThread,
   markPromotedDraftThreadByRef,
   markPromotedDraftThreads,
@@ -342,6 +345,138 @@ describe("composerDraftStore moveComposerPromptAndImages", () => {
     store.moveComposerPromptAndImages(sourceDraftId, sourceDraftId);
 
     expect(draftByKey(sourceDraftId)?.prompt).toBe("keep me");
+  });
+});
+
+describe("composerDraftStore takeover retry identity persistence", () => {
+  const threadId = ThreadId.make("thread-takeover-retry");
+  const threadRef = scopeThreadRef(TEST_ENVIRONMENT_ID, threadId);
+  const threadKey = scopedThreadKey(threadRef);
+  const identity = {
+    commandId: CommandId.make("takeover-command"),
+    messageId: MessageId.make("takeover-message"),
+    createdAt: "2026-08-27T12:00:00.000Z",
+    threadKey,
+    outgoingText: "continue from the imported session",
+    externalResume: "takeover" as const,
+  };
+
+  beforeEach(() => {
+    removeLocalStorageItem(COMPOSER_DRAFT_STORAGE_KEY);
+    resetComposerDraftStore();
+  });
+
+  afterEach(() => {
+    removeLocalStorageItem(COMPOSER_DRAFT_STORAGE_KEY);
+  });
+
+  it("flushes a newly persisted retry identity synchronously", () => {
+    useComposerDraftStore.getState().setTakeoverRetryIdentity(threadRef, identity);
+
+    flushComposerDraftStorage();
+
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        storage: {
+          getItem: (key: string) => {
+            state?: {
+              draftsByThreadKey?: Record<string, { takeoverRetryIdentity?: unknown }>;
+            };
+          } | null;
+        };
+      };
+    };
+    const persisted = persistApi.getOptions().storage.getItem(COMPOSER_DRAFT_STORAGE_KEY);
+    expect(persisted?.state?.draftsByThreadKey?.[threadKey]?.takeoverRetryIdentity).toEqual(
+      identity,
+    );
+  });
+
+  it("round-trips metadata-only retry state and preserves it while clearing sent content", () => {
+    const store = useComposerDraftStore.getState();
+    store.setPrompt(threadRef, identity.outgoingText);
+    store.setTakeoverRetryIdentity(threadRef, identity);
+    store.clearComposerContent(threadRef);
+
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toMatchObject({
+      prompt: "",
+      takeoverRetryIdentity: identity,
+    });
+
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        partialize: (state: ReturnType<typeof useComposerDraftStore.getState>) => unknown;
+        merge: (
+          persistedState: unknown,
+          currentState: ReturnType<typeof useComposerDraftStore.getState>,
+        ) => ReturnType<typeof useComposerDraftStore.getState>;
+      };
+    };
+    const persisted = persistApi.getOptions().partialize(useComposerDraftStore.getState());
+    const hydrated = persistApi
+      .getOptions()
+      .merge(persisted, useComposerDraftStore.getInitialState());
+
+    expect(hydrated.draftsByThreadKey[threadKey]?.takeoverRetryIdentity).toEqual(identity);
+
+    useComposerDraftStore.getState().setTakeoverRetryIdentity(threadRef, null);
+    expect(draftFor(threadId, TEST_ENVIRONMENT_ID)).toBeUndefined();
+  });
+
+  it("drops malformed retry metadata without dropping a compatible persisted draft", () => {
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        merge: (
+          persistedState: unknown,
+          currentState: ReturnType<typeof useComposerDraftStore.getState>,
+        ) => ReturnType<typeof useComposerDraftStore.getState>;
+      };
+    };
+    const hydrated = persistApi.getOptions().merge(
+      {
+        draftsByThreadKey: {
+          [threadKey]: {
+            prompt: "keep this draft",
+            attachments: [],
+            takeoverRetryIdentity: {
+              ...identity,
+              externalResume: "not-takeover",
+            },
+          },
+        },
+        draftThreadsByThreadKey: {},
+        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      },
+      useComposerDraftStore.getInitialState(),
+    );
+
+    expect(hydrated.draftsByThreadKey[threadKey]).toMatchObject({
+      prompt: "keep this draft",
+      takeoverRetryIdentity: null,
+    });
+  });
+
+  it("hydrates older drafts that do not contain retry metadata", () => {
+    const persistApi = useComposerDraftStore.persist as unknown as {
+      getOptions: () => {
+        merge: (
+          persistedState: unknown,
+          currentState: ReturnType<typeof useComposerDraftStore.getState>,
+        ) => ReturnType<typeof useComposerDraftStore.getState>;
+      };
+    };
+    const hydrated = persistApi.getOptions().merge(
+      {
+        draftsByThreadKey: {
+          [threadKey]: { prompt: "older draft", attachments: [] },
+        },
+        draftThreadsByThreadKey: {},
+        logicalProjectDraftThreadKeyByLogicalProjectKey: {},
+      },
+      useComposerDraftStore.getInitialState(),
+    );
+
+    expect(hydrated.draftsByThreadKey[threadKey]?.takeoverRetryIdentity).toBeNull();
   });
 });
 

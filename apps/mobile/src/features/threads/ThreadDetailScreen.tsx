@@ -108,6 +108,7 @@ export interface ThreadDetailScreenProps {
   readonly threadCwd: string | null;
   readonly selectedThreadQueueCount: number;
   readonly selectedThreadIndeterminateQueueCount: number;
+  readonly selectedThreadTakeoverConfirmationQueueCount: number;
   readonly serverConfig: T3ServerConfig | null;
   readonly layoutVariant?: LayoutVariant;
   readonly usesAutomaticContentInsets?: boolean;
@@ -120,6 +121,7 @@ export interface ThreadDetailScreenProps {
   readonly onStopThread: () => void;
   readonly onStopSession: () => void;
   readonly onDiscardIndeterminateMessages: () => Promise<void>;
+  readonly onReviewQueuedExternalResumeMessages: () => Promise<void>;
   readonly onSendMessage: (behavior?: "steer" | "followUp") => Promise<MessageId | null>;
   readonly onReconnectEnvironment: () => void;
   readonly onUpdateThreadModelSelection: (modelSelection: ModelSelection) => void;
@@ -760,6 +762,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 serverConfig={props.serverConfig}
                 queueCount={props.selectedThreadQueueCount}
                 indeterminateQueueCount={props.selectedThreadIndeterminateQueueCount}
+                takeoverConfirmationQueueCount={props.selectedThreadTakeoverConfirmationQueueCount}
                 environmentId={props.environmentId}
                 projectCwd={props.projectWorkspaceRoot}
                 bottomInset={composerBottomInset}
@@ -770,6 +773,7 @@ export const ThreadDetailScreen = memo(function ThreadDetailScreen(props: Thread
                 onStopThread={props.onStopThread}
                 onStopSession={props.onStopSession}
                 onDiscardIndeterminateMessages={props.onDiscardIndeterminateMessages}
+                onReviewQueuedExternalResumeMessages={props.onReviewQueuedExternalResumeMessages}
                 onSendMessage={handleSendMessage}
                 onReconnectEnvironment={props.onReconnectEnvironment}
                 onUpdateModelSelection={props.onUpdateThreadModelSelection}

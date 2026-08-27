@@ -67,6 +67,7 @@ import type {
   SupervisorStreamEvent,
   SupervisorStreamItem,
 } from "./SupervisorProtocol.ts";
+import { supportsGuardedResume } from "./SupervisorProtocol.ts";
 
 const EXTERNAL_THREAD_PREFIX = "external:pi:";
 const CATALOG_MAX_THREADS = 5_000;
@@ -328,6 +329,41 @@ function runtimeFor(
   );
 }
 
+type PiExternalTurnStartCommand = Extract<
+  ClientOrchestrationCommand,
+  { readonly type: "thread.turn.start" }
+>;
+type PiResumeAndSendCommand = Extract<SupervisorCommand, { readonly type: "resumeAndSend" }>;
+
+export function planPiExternalTurnStart(input: {
+  readonly command: PiExternalTurnStartCommand;
+  readonly record: PiSessionCatalogRecord;
+  readonly runtime: SupervisorRuntimeState | undefined;
+  readonly guardedResumeSupported: boolean;
+}):
+  | { readonly type: "runtime"; readonly runtime: SupervisorRuntimeState }
+  | { readonly type: "takeoverConfirmationRequired" }
+  | { readonly type: "supervisorUpgradeRequired" }
+  | { readonly type: "takeover"; readonly command: PiResumeAndSendCommand } {
+  if (input.command.externalResume === "takeover") {
+    if (!input.guardedResumeSupported) return { type: "supervisorUpgradeRequired" };
+    return {
+      type: "takeover",
+      command: {
+        type: "resumeAndSend",
+        commandId: input.command.commandId,
+        sessionKey: input.record.sourceKey,
+        sessionFile: input.record.canonicalFile,
+        cwd: input.record.cwd,
+        message: input.command.message.text,
+        streamingBehavior: input.command.streamingBehavior ?? "steer",
+      },
+    };
+  }
+  if (input.runtime !== undefined) return { type: "runtime", runtime: input.runtime };
+  return { type: "takeoverConfirmationRequired" };
+}
+
 export function runtimeCatalogSignature(runtimes: ReadonlyArray<SupervisorRuntimeState>): string {
   return JSON.stringify(
     runtimes
@@ -458,6 +494,11 @@ export class PiExternalThreadSource extends Context.Service<
       let lastCatalogRuntimeSignature = "";
       let lastInternalAssociationSignature = "";
       let lastManagedPiBindingSignature = "";
+      let lastGuardedResumeSupported = false;
+
+      const probeGuardedResume = (refresh = false) =>
+        supervisor.probeCapabilities(refresh).pipe(Effect.map(supportsGuardedResume));
+      const projectedGuardedResume = probeGuardedResume().pipe(Effect.orElseSucceed(() => false));
 
       const internalShell = snapshots
         .getShellSnapshot()
@@ -471,9 +512,11 @@ export class PiExternalThreadSource extends Context.Service<
         refreshCatalog = true,
         runtimeOverride?: ReadonlyArray<SupervisorRuntimeState>,
         providerBindingsOverride?: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
+        guardedResumeOverride?: boolean,
       ) {
         const runtimes =
           runtimeOverride ?? (yield* supervisor.list().pipe(Effect.orElseSucceed(() => [])));
+        const catalogResumeSupported = guardedResumeOverride ?? (yield* projectedGuardedResume);
         if (refreshCatalog || cachedRecords === undefined || cachedInternal === undefined) {
           [cachedRecords, cachedInternal] = yield* Effect.all([
             catalog.list(
@@ -497,6 +540,7 @@ export class PiExternalThreadSource extends Context.Service<
         lastInternalAssociationSignature = internalAssociationSignature(internal);
         lastCatalogRuntimeSignature = runtimeCatalogSignature(runtimes);
         lastManagedPiBindingSignature = managedPiBindingSignature(providerBindings);
+        lastGuardedResumeSupported = catalogResumeSupported;
         if (cachedAssociation === undefined) {
           cachedAssociation = yield* Effect.tryPromise({
             try: () => associate(resolvedRecords, internal),
@@ -527,6 +571,7 @@ export class PiExternalThreadSource extends Context.Service<
             record,
             entries: [],
             projectId,
+            catalogResumeSupported,
             ...(runtimeFor(record, runtimes) === undefined
               ? {}
               : { runtime: runtimeFor(record, runtimes)! }),
@@ -570,18 +615,21 @@ export class PiExternalThreadSource extends Context.Service<
         function* () {
           return yield* catalogBuildSemaphore.withPermit(
             Effect.gen(function* () {
-              const [runtimes, internal, providerBindings] = yield* Effect.all([
-                supervisor.list().pipe(Effect.orElseSucceed(() => [])),
-                internalShell,
-                providerSessions.listBindings().pipe(Effect.orElseSucceed(() => [])),
-              ]);
+              const [runtimes, internal, providerBindings, catalogResumeSupported] =
+                yield* Effect.all([
+                  supervisor.list().pipe(Effect.orElseSucceed(() => [])),
+                  internalShell,
+                  providerSessions.listBindings().pipe(Effect.orElseSucceed(() => [])),
+                  projectedGuardedResume,
+                ]);
               const runtimeSignature = runtimeCatalogSignature(runtimes);
               const internalSignature = internalAssociationSignature(internal);
               const bindingSignature = managedPiBindingSignature(providerBindings);
               if (
                 runtimeSignature === lastCatalogRuntimeSignature &&
                 internalSignature === lastInternalAssociationSignature &&
-                bindingSignature === lastManagedPiBindingSignature
+                bindingSignature === lastManagedPiBindingSignature &&
+                catalogResumeSupported === lastGuardedResumeSupported
               ) {
                 return undefined;
               }
@@ -589,7 +637,12 @@ export class PiExternalThreadSource extends Context.Service<
                 cachedInternal = internal;
                 cachedAssociation = undefined;
               }
-              return yield* buildCatalogUnlocked(false, runtimes, providerBindings);
+              return yield* buildCatalogUnlocked(
+                false,
+                runtimes,
+                providerBindings,
+                catalogResumeSupported,
+              );
             }),
           );
         },
@@ -654,6 +707,7 @@ export class PiExternalThreadSource extends Context.Service<
           record: result.record,
           entries: entriesOverride ?? result.entries,
           projectId: association.projectIdByThread.get(threadId)!,
+          catalogResumeSupported: yield* projectedGuardedResume,
           ...(runtime === undefined ? {} : { runtime }),
           ...(lifecycle === undefined ? {} : { lifecycle }),
         });
@@ -1068,16 +1122,33 @@ export class PiExternalThreadSource extends Context.Service<
               "Native Pi image attachments are unavailable.",
             );
           }
-          if (!runtime) {
+          const plan = planPiExternalTurnStart({
+            command,
+            record: result.record,
+            runtime,
+            guardedResumeSupported:
+              command.externalResume === "takeover" ? yield* probeGuardedResume(true) : false,
+          });
+          if (plan.type === "supervisorUpgradeRequired") {
+            return yield* sourceError(
+              "supervisor_upgrade_required",
+              "The running Pi supervisor must be restarted after live sessions finish before guarded takeover is available.",
+            );
+          }
+          if (plan.type === "takeoverConfirmationRequired") {
             return yield* sourceError(
               "read_only",
-              "Catalog-only native Pi sessions cannot be resumed safely.",
+              "Resuming this native Pi session requires takeover confirmation.",
             );
+          }
+          if (plan.type === "takeover") {
+            receipt = yield* dispatchSupervisor(plan.command);
           } else {
-            if (runtime.status === "starting") {
+            const liveRuntime = plan.runtime;
+            if (liveRuntime.status === "starting") {
               return yield* sourceError("runtime_starting", "pi runtime is reconnecting");
             }
-            const type = runtime.status === "streaming" ? command.streamingBehavior : "send";
+            const type = liveRuntime.status === "streaming" ? command.streamingBehavior : "send";
             if (type === undefined) {
               return yield* sourceError(
                 "streaming_behavior_required",
@@ -1087,7 +1158,7 @@ export class PiExternalThreadSource extends Context.Service<
             receipt = yield* dispatchSupervisor({
               type,
               commandId: command.commandId,
-              runtimeId: runtime.runtimeId,
+              runtimeId: liveRuntime.runtimeId,
               message: command.message.text,
             });
           }

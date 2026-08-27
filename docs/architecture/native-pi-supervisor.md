@@ -25,7 +25,9 @@ difference.
 4. internal and native threads share the same client-facing shell, detail,
    stream, route, timeline, and composer models.
 5. source selection happens at the server boundary, not in chat components.
-6. each canonical pi session has at most one registered writer.
+6. each canonical pi session has at most one supervisor-registered writer.
+   an unbridged terminal writer remains invisible, so guarded takeover reduces
+   accidental concurrency but cannot eliminate it.
 7. t3 server restarts and client disconnects do not stop supervisor-owned pi
    processes.
 8. stable command ids survive retries. a command whose delivery began before a
@@ -187,7 +189,7 @@ add `PiExternalThreadSource` with these responsibilities:
 - subscribe to external catalog shells
 - resolve an external thread id
 - read and subscribe to common thread detail
-- create a managed session; catalog-only sessions remain read-only
+- create a managed session; catalog-only sessions are guarded resumable
 - translate common thread commands into supervisor commands
 
 add `ClientThreadRouter` as the single source switch:
@@ -207,10 +209,31 @@ v1 external-thread subscriptions force an authoritative snapshot on attach
 because the common numeric cursor does not identify a supervisor runtime
 generation. runtime-local replay remains available inside the supervisor.
 
-new-session creation and its first prompt currently use separate stable command
-ids. mobile persists both identities before creation, so retry cannot create a
-second session. atomic resume-plus-prompt delivery remains pending before
-catalog-only sessions can become safely resumable.
+new-session creation and its first prompt use separate stable command ids.
+mobile persists both identities before creation, so retry cannot create a second
+session. catalog takeover instead maps the original `thread.turn.start` command
+id to one durable supervisor `resumeAndSend` command. that mapping remains stable
+if a runtime appears before a retry. after validation, the supervisor sends
+through an existing canonical writer or synchronously claims the writer map,
+spawns, and prompts under that one ledger identity. the stable payload records
+`streamingBehavior`, defaulting to `steer`; reuse preserves that intent even
+when runtime state still looks idle after the preceding prompt admission.
+distinct takeover commands serialize by canonical session through writer
+acquisition and first-prompt admission, so a later command cannot observe the
+new runtime prematurely.
+
+guarded takeover is capability-gated because detached `t3-control-v2`
+supervisors can outlive the server that launched them. an old daemon's list
+envelope has no `guardedResume: "guarded-resume-v1"`; catalog-only backing then
+stays read-only and dispatch rejects takeover with an upgrade-required error. t3
+does not kill that daemon or start a competing one. users finish its live
+sessions and restart the old supervisor or t3 host before takeover appears.
+
+catalog-only backing is `resumable`: text send is advertised, while attachments,
+interrupt, stop, and other writer-dependent controls remain disabled. the first
+send without `externalResume: "takeover"` is rejected as confirmation-required.
+a confirmed retry preserves the original command id and adds that client-only
+marker; internal `ThreadTurnStartCommand` does not carry it.
 
 ## client shell merge
 
@@ -259,19 +282,28 @@ catalog, detail, and control remain authenticated environment rpc.
 
 | pi state            | common thread state        | control                     |
 | ------------------- | -------------------------- | --------------------------- |
-| jsonl only          | settled, no active session | read-only                   |
+| jsonl only          | settled, no active session | guarded takeover            |
 | rpc starting        | starting                   | temporarily disabled        |
 | rpc idle            | ready                      | send                        |
 | rpc streaming       | running with active turn   | steer, follow-up, interrupt |
 | bridge reconnecting | starting                   | temporarily disabled        |
-| exited              | settled                    | read-only                   |
-| unbridged tui       | read-only                  | no safe control             |
+| exited              | settled                    | guarded takeover            |
+| unbridged tui       | resumable                  | confirmation required       |
 
 an unbridged tui cannot provide authoritative liveness or a writer lease.
-reading remains safe; resuming while that process writes does not.
-catalog-only sessions therefore remain read-only in v1. managed sessions stay
-controllable across t3 restarts because the surviving supervisor retains their
-writer lease.
+reading remains safe; takeover while that process writes can still create a
+second writer. the confirmation guard makes that residual risk explicit; it is
+not a cross-process lease. after confirmation, the supervisor validates that the
+canonical regular file is under pi's configured session root, that its session
+header cwd matches the canonical command cwd, and that the source key is the
+sha-256 of the canonical path before atomically claiming its in-memory writer
+map entry. bridge registration reserves the canonical path through header and
+history reads, so rpc admission cannot claim it mid-registration. an early
+socket guard spans those reads and transfers to reconnect cleanup only after a
+final closed check, before runtime and writer publication. runtime cleanup
+releases only a writer claim still owned by that runtime. managed
+sessions stay controllable across t3 restarts because the surviving supervisor
+retains that writer claim.
 
 ## idempotency and durability
 
@@ -281,6 +313,10 @@ router passes them unchanged to the supervisor.
 - duplicate id plus identical payload returns the prior receipt
 - duplicate id plus different payload rejects
 - queued, pre-delivery commands are safe to replay
+- one live-command promise is published before stale-restart ledger persistence,
+  so identical concurrent retries join it and payload conflicts reject
+- takeover keeps one `resumeAndSend` payload after a runtime appears; execution
+  reuses that writer without redispatching a differently shaped ledger command
 - delivery-in-progress commands become indeterminate after supervisor failure
 - t3 restart reconnects to the surviving supervisor and rebuilds associations
   from catalog and runtime state

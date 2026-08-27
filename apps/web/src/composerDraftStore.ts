@@ -1,8 +1,10 @@
 import {
+  CommandId,
   DEFAULT_MODEL,
   DEFAULT_MODEL_BY_PROVIDER,
   defaultInstanceIdForDriver,
   type EnvironmentId,
+  MessageId,
   ModelSelection,
   ProjectId,
   ProviderInstanceId,
@@ -72,12 +74,28 @@ const composerDebouncedStorage = createDebouncedStorage(
   COMPOSER_PERSIST_DEBOUNCE_MS,
 );
 
+export function flushComposerDraftStorage(): void {
+  composerDebouncedStorage.flush();
+}
+
 // Flush pending composer draft writes before page unload to prevent data loss.
 if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
-  window.addEventListener("beforeunload", () => {
-    composerDebouncedStorage.flush();
-  });
+  window.addEventListener("beforeunload", flushComposerDraftStorage);
 }
+
+/**
+ * keeps an ambiguous Pi takeover addressable by the supervisor ledger across remounts and reloads.
+ */
+export const TakeoverRetryIdentitySchema = Schema.Struct({
+  commandId: CommandId,
+  messageId: MessageId,
+  createdAt: Schema.String,
+  threadKey: Schema.String,
+  outgoingText: Schema.String,
+  externalResume: Schema.Literal("takeover"),
+});
+export type TakeoverRetryIdentity = typeof TakeoverRetryIdentitySchema.Type;
+const isTakeoverRetryIdentity = Schema.is(TakeoverRetryIdentitySchema);
 
 export const PersistedComposerImageAttachment = Schema.Struct({
   id: Schema.String,
@@ -148,6 +166,7 @@ const PersistedComposerThreadDraftState = Schema.Struct({
   activeProvider: Schema.optionalKey(Schema.NullOr(ProviderInstanceId)),
   runtimeMode: Schema.optionalKey(RuntimeMode),
   interactionMode: Schema.optionalKey(ProviderInteractionMode),
+  takeoverRetryIdentity: Schema.optionalKey(TakeoverRetryIdentitySchema),
 });
 type PersistedComposerThreadDraftState = typeof PersistedComposerThreadDraftState.Type;
 
@@ -276,6 +295,7 @@ export interface ComposerThreadDraftState {
   activeProvider: ProviderInstanceId | null;
   runtimeMode: RuntimeMode | null;
   interactionMode: ProviderInteractionMode | null;
+  takeoverRetryIdentity: TakeoverRetryIdentity | null;
 }
 
 /**
@@ -429,6 +449,10 @@ interface ComposerDraftStoreState {
   clearDraftThread: (threadRef: ComposerThreadTarget) => void;
   setStickyModelSelection: (modelSelection: ModelSelection | null | undefined) => void;
   setPrompt: (threadRef: ComposerThreadTarget, prompt: string) => void;
+  setTakeoverRetryIdentity: (
+    threadRef: ComposerThreadTarget,
+    identity: TakeoverRetryIdentity | null,
+  ) => void;
   setTerminalContexts: (threadRef: ComposerThreadTarget, contexts: TerminalContextDraft[]) => void;
   setModelSelection: (
     threadRef: ComposerThreadTarget,
@@ -636,6 +660,7 @@ const EMPTY_THREAD_DRAFT = Object.freeze<ComposerThreadDraftState>({
   activeProvider: null,
   runtimeMode: null,
   interactionMode: null,
+  takeoverRetryIdentity: null,
 });
 
 /**
@@ -658,6 +683,7 @@ export function createEmptyThreadDraft(): ComposerThreadDraftState {
     activeProvider: null,
     runtimeMode: null,
     interactionMode: null,
+    takeoverRetryIdentity: null,
   };
 }
 
@@ -730,7 +756,8 @@ function shouldRemoveDraft(draft: ComposerThreadDraftState): boolean {
     Object.keys(draft.modelSelectionByProvider).length === 0 &&
     draft.activeProvider === null &&
     draft.runtimeMode === null &&
-    draft.interactionMode === null
+    draft.interactionMode === null &&
+    draft.takeoverRetryIdentity === null
   );
 }
 
@@ -1716,6 +1743,9 @@ function normalizePersistedDraftsByThreadId(
       draftCandidate.interactionMode === "plan" || draftCandidate.interactionMode === "default"
         ? draftCandidate.interactionMode
         : null;
+    const takeoverRetryIdentity = isTakeoverRetryIdentity(draftCandidate.takeoverRetryIdentity)
+      ? { ...draftCandidate.takeoverRetryIdentity }
+      : null;
     const prompt = ensureInlineTerminalContextPlaceholders(
       promptCandidate,
       terminalContexts.length,
@@ -1776,7 +1806,8 @@ function normalizePersistedDraftsByThreadId(
       reviewComments.length === 0 &&
       !hasModelData &&
       !runtimeMode &&
-      !interactionMode
+      !interactionMode &&
+      takeoverRetryIdentity === null
     ) {
       continue;
     }
@@ -1806,6 +1837,7 @@ function normalizePersistedDraftsByThreadId(
         : {}),
       ...(runtimeMode ? { runtimeMode } : {}),
       ...(interactionMode ? { interactionMode } : {}),
+      ...(takeoverRetryIdentity ? { takeoverRetryIdentity } : {}),
     };
   }
 
@@ -1908,7 +1940,8 @@ function partializeComposerDraftStoreState(
       draft.reviewComments.length === 0 &&
       !hasModelData &&
       draft.runtimeMode === null &&
-      draft.interactionMode === null
+      draft.interactionMode === null &&
+      draft.takeoverRetryIdentity === null
     ) {
       continue;
     }
@@ -1967,6 +2000,9 @@ function partializeComposerDraftStoreState(
         : {}),
       ...(draft.runtimeMode ? { runtimeMode: draft.runtimeMode } : {}),
       ...(draft.interactionMode ? { interactionMode: draft.interactionMode } : {}),
+      ...(draft.takeoverRetryIdentity
+        ? { takeoverRetryIdentity: { ...draft.takeoverRetryIdentity } }
+        : {}),
     };
     persistedDraftsByThreadKey[threadKey] = persistedDraft;
   }
@@ -2213,6 +2249,9 @@ function toHydratedThreadDraft(
     activeProvider,
     runtimeMode: persistedDraft.runtimeMode ?? null,
     interactionMode: persistedDraft.interactionMode ?? null,
+    takeoverRetryIdentity: persistedDraft.takeoverRetryIdentity
+      ? { ...persistedDraft.takeoverRetryIdentity }
+      : null,
   };
 }
 
@@ -2677,6 +2716,33 @@ const composerDraftStore = create<ComposerDraftStoreState>()(
             const nextDraft: ComposerThreadDraftState = {
               ...existing,
               prompt,
+            };
+            const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
+            if (shouldRemoveDraft(nextDraft)) {
+              delete nextDraftsByThreadKey[threadKey];
+            } else {
+              nextDraftsByThreadKey[threadKey] = nextDraft;
+            }
+            return { draftsByThreadKey: nextDraftsByThreadKey };
+          });
+        },
+        setTakeoverRetryIdentity: (threadRef, identity) => {
+          const threadKey = resolveComposerDraftKey(get(), threadRef) ?? "";
+          if (threadKey.length === 0) {
+            return;
+          }
+          set((state) => {
+            const existing = state.draftsByThreadKey[threadKey];
+            if (!existing && identity === null) {
+              return state;
+            }
+            const base = existing ?? createEmptyThreadDraft();
+            if (Equal.equals(base.takeoverRetryIdentity, identity)) {
+              return state;
+            }
+            const nextDraft: ComposerThreadDraftState = {
+              ...base,
+              takeoverRetryIdentity: identity ? { ...identity } : null,
             };
             const nextDraftsByThreadKey = { ...state.draftsByThreadKey };
             if (shouldRemoveDraft(nextDraft)) {

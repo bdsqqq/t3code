@@ -928,6 +928,7 @@ const ClientThreadTurnStartCommand = Schema.Struct({
   bootstrap: Schema.optional(ThreadTurnStartBootstrap),
   sourceProposedPlan: Schema.optional(SourceProposedPlanReference),
   streamingBehavior: Schema.optional(Schema.Literals(["steer", "followUp"])),
+  externalResume: Schema.optional(Schema.Literal("takeover")),
   createdAt: IsoDateTime,
 });
 

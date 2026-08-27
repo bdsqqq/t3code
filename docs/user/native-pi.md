@@ -16,15 +16,27 @@ normal new-task composer. both flows return to the ordinary thread screen.
 
 - **live** — a supervisor-owned rpc process or registered tui bridge currently
   owns the session.
-- **historical** — the jsonl file is readable, but no writer is registered; t3
-  keeps it read-only because an unbridged tui cannot be ruled out.
+- **resumable** — the jsonl file is readable, but no writer is registered. text
+  send is available through a guarded takeover; attachments, interrupt, and stop
+  remain unavailable until t3 owns the resumed runtime.
 - **unmanaged** — reserved for a writer whose history cannot be safely
   cataloged. current bridge registration rejects this state instead of exposing
   an unusable session.
 
-starting a managed session uses pi's normal session directory. while pi streams,
-send defaults to steering; the composer menu also offers a queued follow-up.
-interrupt and supervisor shutdown use the same thread controls.
+guarded takeover requires a current host supervisor. if t3 was upgraded while an
+older detached supervisor kept running, catalog-only sessions remain read-only.
+finish its live sessions, then restart the old supervisor or the t3 host. t3
+does not automatically kill it or start a competing supervisor.
+
+starting a managed session uses pi's normal session directory. sending to a
+resumable session first asks you to confirm takeover. confirmation is required
+because an unbridged terminal pi may still be writing the same jsonl; t3 cannot
+detect that process, so takeover can still create a second writer. after
+confirmation, t3 validates the session path and header before starting pi.
+
+while pi streams, send defaults to steering; the composer menu also offers a
+queued follow-up. interrupt and supervisor shutdown use the same thread
+controls.
 
 rename, archive, delete, model changes, runtime-mode changes, interaction-mode
 changes, and checkpoints are unavailable because pi, rather than t3, owns this
@@ -64,10 +76,14 @@ a 16 mib outbound socket queue, and a 112 mib inbound protocol frame. an
 individual streamed item is capped at 32 mib. catalog snapshots are capped at
 5,000 threads and 8 mib; omission counts are included in the snapshot.
 
-command ids are persisted before delivery. retrying an identical command id
+command ids are persisted before delivery. guarded takeover resumes the session
+and sends the text as one supervisor command under the original send command id.
+if the runtime appears before a retry, the same command safely targets that
+writer instead of changing command shape. retrying an identical command id
 returns its existing receipt. reusing an id with different content is rejected.
-if the supervisor itself crashes after recording a command but before recording
-its result, the receipt is `indeterminate` and t3 does not resend it.
+if the supervisor itself crashes after recording a command
+but before recording its result, the receipt is `indeterminate` and t3 does not
+resend it.
 
 supervised rpc sessions cannot render an extension's terminal dialog on a
 remote client. select, confirm, input, and editor requests are cancelled

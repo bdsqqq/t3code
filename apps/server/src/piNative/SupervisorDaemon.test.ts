@@ -1,13 +1,17 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import { PiNativeEventId, PiNativeRuntimeId } from "@t3tools/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as NodeCrypto from "node:crypto";
+import * as NodeEvents from "node:events";
 import * as NodeFS from "node:fs";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
   projectOverlayPayload,
+  acquireResumeAndSendRuntime,
   bridgeCommandFrame,
+  claimRpcSessionWriter,
   projectListedRuntime,
   projectQueuePayload,
   projectQueueValues,
@@ -15,14 +19,21 @@ import {
   piRpcSpawnArgs,
   publishSettlementInOrder,
   releaseBridgeRegistration,
+  releaseSessionWriterIfOwned,
   reserveBridgeRegistration,
+  runCommandSingleFlight,
+  runKeyedSerialQueue,
+  runSerializedResumeAndSendDelivery,
   decodeRuntimeChunk,
   createSupervisorLockFile,
+  createBridgeRegistrationSocketGuard,
+  existingWriterResumeAndSendCommand,
   makeManagedAdmissionController,
   type ManagedLedgerEntry,
   queuePayloadHasPending,
   shouldUseSnapshot,
   shouldRestartPersistedSession,
+  validateExistingPiSessionSpawn,
 } from "./SupervisorDaemon.ts";
 import {
   JsonLineDecoder,
@@ -115,6 +126,415 @@ describe("native Pi replay projection", () => {
         sessionFile: "/isolated/sessions/existing.jsonl",
       }),
     ).toContain("/isolated/sessions/existing.jsonl");
+  });
+
+  it("observes bridge socket closure before registration handoff", () => {
+    const emitter = new NodeEvents.EventEmitter();
+    const socket = {
+      destroyed: false,
+      once: (event: "close" | "error", listener: () => void) => {
+        emitter.once(event, listener);
+        return socket;
+      },
+      off: (event: "close" | "error", listener: () => void) => {
+        emitter.off(event, listener);
+        return socket;
+      },
+    };
+    const guard = createBridgeRegistrationSocketGuard(socket);
+    emitter.emit("close");
+
+    expect(guard.isClosed()).toBe(true);
+    let cleanupCount = 0;
+    expect(
+      guard.handoff(() => {
+        cleanupCount += 1;
+      }),
+    ).toBe(false);
+    expect(cleanupCount).toBe(1);
+    guard.dispose();
+
+    const liveEmitter = new NodeEvents.EventEmitter();
+    const liveSocket = {
+      destroyed: false,
+      once: (event: "close" | "error", listener: () => void) => {
+        liveEmitter.once(event, listener);
+        return liveSocket;
+      },
+      off: (event: "close" | "error", listener: () => void) => {
+        liveEmitter.off(event, listener);
+        return liveSocket;
+      },
+    };
+    const liveGuard = createBridgeRegistrationSocketGuard(liveSocket);
+    expect(
+      liveGuard.handoff(() => {
+        cleanupCount += 1;
+      }),
+    ).toBe(true);
+    liveEmitter.emit("error", new Error("disconnected"));
+    expect(cleanupCount).toBe(2);
+    liveGuard.dispose();
+  });
+
+  it("blocks rpc writer claims while bridge registration holds its reservation", () => {
+    const sessionFile = "/sessions/reserved.jsonl";
+    const writers = new Map<string, string>();
+    const reservations = new Set([sessionFile]);
+
+    expect(
+      claimRpcSessionWriter({
+        writers,
+        bridgeRegistrations: reservations,
+        sessionFile,
+        runtimeId: "rpc-runtime",
+      }),
+    ).toEqual({ status: "bridgeReserved" });
+    expect(writers.has(sessionFile)).toBe(false);
+
+    reservations.delete(sessionFile);
+    expect(
+      claimRpcSessionWriter({
+        writers,
+        bridgeRegistrations: reservations,
+        sessionFile,
+        runtimeId: "rpc-runtime",
+      }),
+    ).toEqual({ status: "claimed" });
+    expect(writers.get(sessionFile)).toBe("rpc-runtime");
+  });
+
+  it("does not let stale runtime cleanup clear another writer", () => {
+    const sessionFile = "/sessions/owned.jsonl";
+    const writers = new Map([[sessionFile, "current-runtime"]]);
+
+    expect(
+      releaseSessionWriterIfOwned({
+        writers,
+        sessionFile,
+        runtimeId: "stale-runtime",
+      }),
+    ).toBe(false);
+    expect(writers.get(sessionFile)).toBe("current-runtime");
+    expect(
+      releaseSessionWriterIfOwned({
+        writers,
+        sessionFile,
+        runtimeId: "current-runtime",
+      }),
+    ).toBe(true);
+    expect(writers.has(sessionFile)).toBe(false);
+  });
+
+  it("preserves resume-and-send streaming intent for a reused writer", () => {
+    const outer = {
+      type: "resumeAndSend",
+      commandId: "takeover-1",
+      sessionKey: "source-key",
+      sessionFile: "/sessions/session.jsonl",
+      cwd: "/workspace",
+      message: "continue",
+      streamingBehavior: "steer",
+    };
+
+    const delivery = existingWriterResumeAndSendCommand(outer, PiNativeRuntimeId.make("runtime-1"));
+    expect(delivery).toMatchObject({
+      type: "steer",
+      commandId: "takeover-1",
+      runtimeId: "runtime-1",
+      message: "continue",
+    });
+    expect(bridgeCommandFrame(delivery)).toMatchObject({
+      command: "steer",
+      commandId: "takeover-1",
+      text: "continue",
+    });
+    expect(outer.type).toBe("resumeAndSend");
+
+    expect(
+      existingWriterResumeAndSendCommand(
+        { ...outer, streamingBehavior: "followUp" },
+        PiNativeRuntimeId.make("runtime-1"),
+      ),
+    ).toMatchObject({ type: "followUp" });
+    expect(
+      existingWriterResumeAndSendCommand(
+        { ...outer, streamingBehavior: undefined },
+        PiNativeRuntimeId.make("runtime-1"),
+      ),
+    ).toMatchObject({ type: "steer" });
+  });
+
+  it("reuses an existing writer without spawning for resume-and-send", async () => {
+    let spawnCount = 0;
+    const result = await acquireResumeAndSendRuntime({
+      existingWriter: async () => ({ runtimeId: "existing" }),
+      spawnWriter: async () => {
+        spawnCount += 1;
+        return { runtimeId: "spawned" };
+      },
+      isWriterClaimConflict: () => false,
+    });
+
+    expect(result).toEqual({ runtime: { runtimeId: "existing" }, reusedWriter: true });
+    expect(spawnCount).toBe(0);
+  });
+
+  it("reuses the winner when a writer claims the session during spawn admission", async () => {
+    const claimConflict = new Error("writer claimed");
+    let lookupCount = 0;
+    let spawnCount = 0;
+    const result = await acquireResumeAndSendRuntime({
+      existingWriter: async () => {
+        lookupCount += 1;
+        return lookupCount === 1 ? undefined : { runtimeId: "race-winner" };
+      },
+      spawnWriter: async () => {
+        spawnCount += 1;
+        throw claimConflict;
+      },
+      isWriterClaimConflict: (cause) => cause === claimConflict,
+    });
+
+    expect(result).toEqual({ runtime: { runtimeId: "race-winner" }, reusedWriter: true });
+    expect(spawnCount).toBe(1);
+    expect(lookupCount).toBe(2);
+  });
+
+  it("validates a canonical existing session before spawning", async () => {
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "t3-supervisor-resume-"),
+    );
+    try {
+      const sessionsRoot = NodePath.join(root, "sessions");
+      const cwd = NodePath.join(root, "workspace");
+      const sessionDir = NodePath.join(sessionsRoot, "project");
+      const sessionFile = NodePath.join(sessionDir, "session.jsonl");
+      await NodeFS.promises.mkdir(sessionDir, { recursive: true });
+      await NodeFS.promises.mkdir(cwd);
+      await NodeFS.promises.writeFile(
+        sessionFile,
+        `${JSON.stringify({ type: "session", id: "session-1", cwd })}\n`,
+      );
+      const canonicalFile = await NodeFS.promises.realpath(sessionFile);
+      const canonicalCwd = await NodeFS.promises.realpath(cwd);
+      const sessionKey = NodeCrypto.createHash("sha256").update(canonicalFile).digest("hex");
+
+      await expect(
+        validateExistingPiSessionSpawn({ sessionsRoot, sessionFile, cwd, sessionKey }),
+      ).resolves.toEqual({
+        sessionFile: canonicalFile,
+        cwd: canonicalCwd,
+        sessionId: "session-1",
+      });
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects mismatched existing-session takeover inputs", async () => {
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "t3-supervisor-resume-mismatch-"),
+    );
+    try {
+      const sessionsRoot = NodePath.join(root, "sessions");
+      const cwd = NodePath.join(root, "workspace");
+      const otherCwd = NodePath.join(root, "other-workspace");
+      const sessionFile = NodePath.join(sessionsRoot, "session.jsonl");
+      const outsideFile = NodePath.join(root, "outside.jsonl");
+      await NodeFS.promises.mkdir(sessionsRoot);
+      await NodeFS.promises.mkdir(cwd);
+      await NodeFS.promises.mkdir(otherCwd);
+      const header = `${JSON.stringify({ type: "session", id: "session-1", cwd })}\n`;
+      await NodeFS.promises.writeFile(sessionFile, header);
+      await NodeFS.promises.writeFile(outsideFile, header);
+
+      await expect(
+        validateExistingPiSessionSpawn({
+          sessionsRoot,
+          sessionFile,
+          cwd,
+          sessionKey: "not-the-canonical-path-hash",
+        }),
+      ).rejects.toThrow("session key does not match canonical session file");
+      await expect(
+        validateExistingPiSessionSpawn({ sessionsRoot, sessionFile, cwd: otherCwd }),
+      ).rejects.toThrow("session header cwd does not match resume cwd");
+      await expect(
+        validateExistingPiSessionSpawn({ sessionsRoot, sessionFile: outsideFile, cwd }),
+      ).rejects.toThrow("session file is outside the pi sessions root");
+      await expect(
+        validateExistingPiSessionSpawn({ sessionsRoot, sessionFile: otherCwd, cwd }),
+      ).rejects.toThrow("session file is outside the pi sessions root");
+      const sessionDirectory = NodePath.join(sessionsRoot, "not-a-file");
+      await NodeFS.promises.mkdir(sessionDirectory);
+      await expect(
+        validateExistingPiSessionSpawn({ sessionsRoot, sessionFile: sessionDirectory, cwd }),
+      ).rejects.toThrow("session file is not a regular file");
+
+      await NodeFS.promises.writeFile(
+        sessionFile,
+        `${JSON.stringify({ type: "not-session", id: "session-1", cwd })}\n`,
+      );
+      await expect(
+        validateExistingPiSessionSpawn({ sessionsRoot, sessionFile, cwd }),
+      ).rejects.toThrow("invalid session header");
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("serializes resume-and-send admission per canonical session", async () => {
+    const entries = new Map<string, Promise<void>>();
+    let releaseFirst!: () => void;
+    const firstAdmission = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let markFirstStarted!: () => void;
+    const firstStarted = new Promise<void>((resolve) => {
+      markFirstStarted = resolve;
+    });
+    const order: string[] = [];
+
+    const first = runKeyedSerialQueue({
+      entries,
+      key: "/sessions/one.jsonl",
+      run: async () => {
+        order.push("first:start");
+        markFirstStarted();
+        await firstAdmission;
+        order.push("first:admitted");
+        return "first";
+      },
+    });
+    await firstStarted;
+    const second = runKeyedSerialQueue({
+      entries,
+      key: "/sessions/one.jsonl",
+      run: async () => {
+        order.push("second:start");
+        return "second";
+      },
+    });
+    const other = runKeyedSerialQueue({
+      entries,
+      key: "/sessions/two.jsonl",
+      run: async () => {
+        order.push("other:start");
+        return "other";
+      },
+    });
+    await expect(other).resolves.toBe("other");
+    expect(order).toEqual(["first:start", "other:start"]);
+
+    releaseFirst();
+    await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
+    expect(order).toEqual(["first:start", "other:start", "first:admitted", "second:start"]);
+    expect(entries.size).toBe(0);
+  });
+
+  it("keeps serialized resume-and-send queued until delivery can begin", async () => {
+    const entries = new Map<string, Promise<void>>();
+    const phases = new Map([
+      ["first", "queued"],
+      ["second", "queued"],
+    ]);
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstAdmission = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let markFirstWorking!: () => void;
+    const firstWorking = new Promise<void>((resolve) => {
+      markFirstWorking = resolve;
+    });
+
+    const first = runSerializedResumeAndSendDelivery({
+      entries,
+      sessionFile: "/sessions/one.jsonl",
+      startDelivery: async () => {
+        phases.set("first", "delivering");
+        order.push("first:delivering");
+      },
+      deliver: async () => {
+        expect(phases.get("first")).toBe("delivering");
+        order.push("first:work");
+        markFirstWorking();
+        await firstAdmission;
+        return "first";
+      },
+    });
+    await firstWorking;
+
+    const second = runSerializedResumeAndSendDelivery({
+      entries,
+      sessionFile: "/sessions/one.jsonl",
+      startDelivery: async () => {
+        phases.set("second", "delivering");
+        order.push("second:delivering");
+      },
+      deliver: async () => {
+        expect(phases.get("second")).toBe("delivering");
+        order.push("second:work");
+        return "second";
+      },
+    });
+
+    await Promise.resolve();
+    expect(phases.get("second")).toBe("queued");
+    expect(order).toEqual(["first:delivering", "first:work"]);
+
+    releaseFirst();
+    await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
+    expect(order).toEqual(["first:delivering", "first:work", "second:delivering", "second:work"]);
+    expect(entries.size).toBe(0);
+  });
+
+  it("publishes one shared command promise before stale restart persistence", async () => {
+    const entries = new Map<string, { readonly hash: string; readonly work: Promise<string> }>();
+    let releasePersistence!: () => void;
+    const persistence = new Promise<void>((resolve) => {
+      releasePersistence = resolve;
+    });
+    let markStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      markStarted = resolve;
+    });
+    let runCount = 0;
+    const run = async () => {
+      runCount += 1;
+      markStarted();
+      await persistence;
+      return "delivered";
+    };
+
+    const first = runCommandSingleFlight({
+      entries,
+      id: "stale-start",
+      hash: "same-payload",
+      run,
+    });
+    const duplicate = runCommandSingleFlight({
+      entries,
+      id: "stale-start",
+      hash: "same-payload",
+      run,
+    });
+    expect(first).toBe(duplicate);
+    expect(() =>
+      runCommandSingleFlight({
+        entries,
+        id: "stale-start",
+        hash: "different-payload",
+        run,
+      }),
+    ).toThrow("commandId payload conflict");
+
+    await started;
+    expect(runCount).toBe(1);
+    releasePersistence();
+    await expect(Promise.all([first, duplicate])).resolves.toEqual(["delivered", "delivered"]);
+    expect(entries.has("stale-start")).toBe(false);
   });
 
   it("restarts only stale persisted-session start receipts", () => {

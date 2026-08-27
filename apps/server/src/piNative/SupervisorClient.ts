@@ -15,6 +15,7 @@ import type {
   ManagedFinalization,
   ManagedFinalizeResponse,
   SupervisorCommand,
+  SupervisorCapabilityProbe,
   SupervisorCommandReceipt,
   SupervisorRuntimeState,
   SupervisorStreamItem,
@@ -23,6 +24,7 @@ import {
   JsonLineDecoder,
   MANAGED_ADMISSION_PROTOCOL,
   SupervisorStreamBuffer,
+  decodeSupervisorCapabilityProbe,
   encodeLine,
   isRecord,
 } from "./SupervisorProtocol.ts";
@@ -70,7 +72,15 @@ async function connectOrSpawn(): Promise<Socket> {
   await daemonReady;
   return connect();
 }
-async function request(method: string, fields: Record<string, unknown> = {}): Promise<unknown> {
+export interface SupervisorResponseEnvelope {
+  readonly result: unknown;
+  readonly capabilities: unknown;
+}
+
+async function requestEnvelope(
+  method: string,
+  fields: Record<string, unknown> = {},
+): Promise<SupervisorResponseEnvelope> {
   const socket = await connectOrSpawn();
   const requestId = randomUUID();
   const decoder = new JsonLineDecoder();
@@ -96,8 +106,9 @@ async function request(method: string, fields: Record<string, unknown> = {}): Pr
             settled = true;
             clearTimeout(timer);
             socket.end();
-            if (value.ok === true) resolve(value.result);
-            else reject(new Error(String(value.error)));
+            if (value.ok === true) {
+              resolve({ result: value.result, capabilities: value.capabilities });
+            } else reject(new Error(String(value.error)));
           }
       } catch (cause) {
         socket.destroy();
@@ -108,6 +119,21 @@ async function request(method: string, fields: Record<string, unknown> = {}): Pr
     socket.once("close", () => fail(new Error("pi supervisor request closed")));
     socket.write(encodeLine({ type: "request", requestId, method, ...fields }));
   });
+}
+
+async function request(method: string, fields: Record<string, unknown> = {}): Promise<unknown> {
+  return (await requestEnvelope(method, fields)).result;
+}
+
+export function decodeSupervisorListEnvelope(envelope: SupervisorResponseEnvelope): {
+  readonly runtimes: ReadonlyArray<SupervisorRuntimeState>;
+  readonly capabilities: SupervisorCapabilityProbe;
+} {
+  if (!Array.isArray(envelope.result)) throw new Error("invalid supervisor list response");
+  return {
+    runtimes: envelope.result as ReadonlyArray<SupervisorRuntimeState>,
+    capabilities: decodeSupervisorCapabilityProbe(envelope.capabilities),
+  };
 }
 
 interface ManagedConnection {
@@ -330,6 +356,9 @@ export class SupervisorClient extends Context.Service<
   SupervisorClient,
   {
     readonly list: () => Effect.Effect<ReadonlyArray<SupervisorRuntimeState>, PiNativeError>;
+    readonly probeCapabilities: (
+      refresh?: boolean,
+    ) => Effect.Effect<SupervisorCapabilityProbe, PiNativeError>;
     readonly dispatch: (
       command: SupervisorCommand | Record<string, unknown>,
     ) => Effect.Effect<SupervisorCommandReceipt, PiNativeError>;
@@ -345,10 +374,45 @@ export class SupervisorClient extends Context.Service<
   static readonly layer = Layer.sync(SupervisorClient, makeSupervisorClient);
 }
 export function makeSupervisorClient(): SupervisorClient["Service"] {
+  const capabilityCacheMs = 1_000;
+  let capabilityCache: SupervisorCapabilityProbe | undefined;
+  let capabilityCacheExpiry: NodeJS.Timeout | undefined;
+  let listInFlight:
+    | Promise<{
+        readonly runtimes: ReadonlyArray<SupervisorRuntimeState>;
+        readonly capabilities: SupervisorCapabilityProbe;
+      }>
+    | undefined;
+  const listEnvelope = () => {
+    listInFlight ??= requestEnvelope("list")
+      .then(decodeSupervisorListEnvelope)
+      .then((value) => {
+        capabilityCache = value.capabilities;
+        if (capabilityCacheExpiry) clearTimeout(capabilityCacheExpiry);
+        capabilityCacheExpiry = setTimeout(() => {
+          capabilityCache = undefined;
+          capabilityCacheExpiry = undefined;
+        }, capabilityCacheMs);
+        capabilityCacheExpiry.unref();
+        return value;
+      })
+      .finally(() => {
+        listInFlight = undefined;
+      });
+    return listInFlight;
+  };
   return SupervisorClient.of({
     list: () =>
       Effect.tryPromise({
-        try: () => request("list") as Promise<ReadonlyArray<SupervisorRuntimeState>>,
+        try: () => listEnvelope().then((value) => value.runtimes),
+        catch: mapError,
+      }),
+    probeCapabilities: (refresh = false) =>
+      Effect.tryPromise({
+        try: () =>
+          !refresh && capabilityCache !== undefined
+            ? Promise.resolve(capabilityCache)
+            : listEnvelope().then((value) => value.capabilities),
         catch: mapError,
       }),
     dispatch: (command) =>

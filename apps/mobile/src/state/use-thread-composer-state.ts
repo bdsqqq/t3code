@@ -24,6 +24,7 @@ import { isAtomCommandInterrupted } from "@t3tools/client-runtime/state/runtime"
 import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
 
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
+import { uuidv4 } from "../lib/uuid";
 import {
   convertPastedImagesToAttachments,
   pasteComposerClipboard,
@@ -50,11 +51,29 @@ import {
 import { setPendingConnectionError } from "../state/use-remote-environment-registry";
 import { useSelectedThreadDetail } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
-import { enqueueThreadOutboxMessage, removeThreadOutboxMessage } from "./thread-outbox";
+import {
+  enqueueThreadOutboxMessage,
+  removeThreadOutboxMessage,
+  updateThreadOutboxMessage,
+} from "./thread-outbox";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
-import { threadComposerQueueCount } from "./thread-outbox-model";
+import { renewQueuedExternalResumeTakeover, threadComposerQueueCount } from "./thread-outbox-model";
 import { environmentThreadShells, threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
+
+function confirmExternalPiTakeover(): Promise<boolean> {
+  return new Promise((resolve) => {
+    Alert.alert(
+      "Continue this Pi session?",
+      "T3 starts a new Pi writer for this session. Continue only if this session is not open in another terminal because unbridged writers cannot be detected.",
+      [
+        { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
+        { text: "Start new writer", onPress: () => resolve(true) },
+      ],
+      { cancelable: true, onDismiss: () => resolve(false) },
+    );
+  });
+}
 
 export function appendReviewCommentToDraft(input: {
   readonly environmentId: EnvironmentId;
@@ -152,6 +171,10 @@ export function useThreadComposerState() {
   const selectedThreadIndeterminateQueueCount = selectedThreadQueuedMessages.filter(
     (message) => message.deliveryStatus === "indeterminate",
   ).length;
+  const selectedThreadTakeoverConfirmationQueueCount = selectedThreadQueuedMessages.filter(
+    (message) =>
+      message.externalResume === "needsConfirmation" && message.deliveryStatus !== "indeterminate",
+  ).length;
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
   const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;
   const interactionMode = selectedDraft?.interactionMode ?? selectedThread?.interactionMode ?? null;
@@ -201,6 +224,13 @@ export function useThreadComposerState() {
       if (attachments.length > 0 && !threadAllows(thread, "attachments")) {
         return null;
       }
+
+      const isResumableExternalThread =
+        thread.backing?.kind === "external" && thread.backing.control === "resumable";
+      if (isResumableExternalThread && !(await confirmExternalPiTakeover())) {
+        return null;
+      }
+      const externalResume = isResumableExternalThread ? ("takeover" as const) : undefined;
 
       const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
         (entry) => entry.instanceId === thread.modelSelection.instanceId,
@@ -286,6 +316,7 @@ export function useThreadComposerState() {
         runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
         interactionMode: draft.interactionMode ?? thread.interactionMode,
         ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
+        ...(externalResume === undefined ? {} : { externalResume }),
         createdAt: metadata.createdAt,
       });
       clearComposerDraftContent(threadKey);
@@ -400,6 +431,31 @@ export function useThreadComposerState() {
         .map((message) => removeThreadOutboxMessage(message)),
     );
   }, [selectedThreadQueuedMessages]);
+  const onReviewQueuedExternalResumeMessages = useCallback(async () => {
+    const messages = selectedThreadQueuedMessages.filter(
+      (message) =>
+        message.externalResume === "needsConfirmation" &&
+        message.deliveryStatus !== "indeterminate",
+    );
+    if (messages.length === 0 || !(await confirmExternalPiTakeover())) {
+      return;
+    }
+    try {
+      await Promise.all(
+        messages.map((message) =>
+          updateThreadOutboxMessage(
+            renewQueuedExternalResumeTakeover(message, CommandId.make(uuidv4())),
+          ),
+        ),
+      );
+    } catch (error) {
+      setPendingConnectionError(
+        error instanceof Error
+          ? error.message
+          : "Failed to save takeover confirmation for the queued message.",
+      );
+    }
+  }, [selectedThreadQueuedMessages]);
 
   const onUpdateModelSelection = useCallback(
     (value: ModelSelection) => {
@@ -436,6 +492,7 @@ export function useThreadComposerState() {
     selectedThreadFeed,
     selectedThreadQueueCount,
     selectedThreadIndeterminateQueueCount,
+    selectedThreadTakeoverConfirmationQueueCount,
     activeWorkStartedAt,
     draftMessage,
     draftAttachments,
@@ -448,6 +505,7 @@ export function useThreadComposerState() {
     onNativePasteImages,
     onRemoveDraftImage,
     onDiscardIndeterminateMessages,
+    onReviewQueuedExternalResumeMessages,
     onSendMessage,
     onUpdateModelSelection,
     onUpdateRuntimeMode,

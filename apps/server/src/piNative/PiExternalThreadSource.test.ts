@@ -1,10 +1,12 @@
 import {
   CommandId,
+  MessageId,
   PiNativeRuntimeId,
   PiNativeSessionKey,
   ProjectId,
   ProviderDriverKind,
   ThreadId,
+  type ClientOrchestrationCommand,
   type OrchestrationProjectShell,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
@@ -21,6 +23,7 @@ import {
   runtimeCatalogSignature,
   isRuntimeLifecycleEvent,
   managedPiBindingSignature,
+  planPiExternalTurnStart,
   receiptSessionFile,
   resolveManagedPiParentThreadIds,
   shutdownCreatedRuntime,
@@ -28,7 +31,119 @@ import {
 } from "./PiExternalThreadSource.ts";
 import type { SupervisorRuntimeState } from "./SupervisorProtocol.ts";
 
+const takeoverRecord = {
+  sourceKey: PiNativeSessionKey.make("source-key"),
+  threadId: ThreadId.make("external:pi:path:source-key"),
+  canonicalFile: "/sessions/session.jsonl",
+  sessionId: "session-1",
+  cwd: "/workspace",
+  title: "session",
+  createdAt: "2026-08-06T00:00:00.000Z",
+  updatedAt: "2026-08-06T00:01:00.000Z",
+  fileSize: 10,
+  fileMtimeMs: 20,
+  historyTruncation: { truncated: false },
+} as const;
+
+const takeoverTurn = (externalResume?: "takeover", streamingBehavior?: "steer" | "followUp") =>
+  ({
+    type: "thread.turn.start",
+    commandId: CommandId.make("takeover-command"),
+    threadId: takeoverRecord.threadId,
+    message: {
+      messageId: MessageId.make("takeover-message"),
+      role: "user",
+      text: "continue here",
+      attachments: [],
+    },
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    ...(externalResume === undefined ? {} : { externalResume }),
+    ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
+    createdAt: "2026-08-06T00:02:00.000Z",
+  }) satisfies Extract<ClientOrchestrationCommand, { readonly type: "thread.turn.start" }>;
+
 describe("PiExternalThreadSource hardening", () => {
+  it("requires explicit takeover confirmation only when no runtime is present", () => {
+    expect(
+      planPiExternalTurnStart({
+        command: takeoverTurn(),
+        record: takeoverRecord,
+        runtime: undefined,
+        guardedResumeSupported: false,
+      }),
+    ).toEqual({ type: "takeoverConfirmationRequired" });
+
+    const runtime = {
+      runtimeId: PiNativeRuntimeId.make("runtime-1"),
+      writerKind: "rpc",
+      status: "idle",
+      sequence: 1,
+    } satisfies SupervisorRuntimeState;
+    expect(
+      planPiExternalTurnStart({
+        command: takeoverTurn(),
+        record: takeoverRecord,
+        runtime,
+        guardedResumeSupported: false,
+      }),
+    ).toEqual({ type: "runtime", runtime });
+  });
+
+  it("keeps guarded takeover on one stable resume-and-send payload after runtime appears", () => {
+    const runtime = {
+      runtimeId: PiNativeRuntimeId.make("runtime-1"),
+      writerKind: "rpc",
+      status: "idle",
+      sequence: 1,
+    } satisfies SupervisorRuntimeState;
+    const expected = {
+      type: "takeover",
+      command: {
+        type: "resumeAndSend",
+        commandId: "takeover-command",
+        sessionKey: "source-key",
+        sessionFile: "/sessions/session.jsonl",
+        cwd: "/workspace",
+        message: "continue here",
+        streamingBehavior: "steer",
+      },
+    } as const;
+
+    expect(
+      planPiExternalTurnStart({
+        command: takeoverTurn("takeover"),
+        record: takeoverRecord,
+        runtime: undefined,
+        guardedResumeSupported: true,
+      }),
+    ).toEqual(expected);
+    expect(
+      planPiExternalTurnStart({
+        command: takeoverTurn("takeover"),
+        record: takeoverRecord,
+        runtime,
+        guardedResumeSupported: true,
+      }),
+    ).toEqual(expected);
+    expect(
+      planPiExternalTurnStart({
+        command: takeoverTurn("takeover", "followUp"),
+        record: takeoverRecord,
+        runtime,
+        guardedResumeSupported: true,
+      }),
+    ).toMatchObject({ command: { streamingBehavior: "followUp" } });
+    expect(
+      planPiExternalTurnStart({
+        command: takeoverTurn("takeover"),
+        record: takeoverRecord,
+        runtime,
+        guardedResumeSupported: false,
+      }),
+    ).toEqual({ type: "supervisorUpgradeRequired" });
+  });
+
   it.effect("shuts down a newly created runtime when session cataloging fails", () =>
     Effect.gen(function* () {
       const commands: unknown[] = [];

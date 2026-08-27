@@ -309,6 +309,32 @@ it.effect("accepts both inline and uploaded image attachments from clients", () 
   }),
 );
 
+it.effect("decodes guarded external takeover only on client turn starts", () =>
+  Effect.gen(function* () {
+    const command = yield* decodeClientOrchestrationCommand({
+      type: "thread.turn.start",
+      commandId: "cmd-turn-takeover",
+      threadId: "external:pi:path:session",
+      message: {
+        messageId: "msg-takeover",
+        role: "user",
+        text: "continue",
+        attachments: [],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      externalResume: "takeover",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    });
+
+    if (command.type !== "thread.turn.start") {
+      assert.fail(`Expected thread.turn.start, received ${command.type}.`);
+    }
+    assert.strictEqual(command.externalResume, "takeover");
+    assert.strictEqual("externalResume" in ThreadTurnStartCommand.fields, false);
+  }),
+);
+
 it.effect("preserves explicit provider and runtime mode in thread.turn.start", () =>
   Effect.gen(function* () {
     const parsed = yield* decodeThreadTurnStartCommand({

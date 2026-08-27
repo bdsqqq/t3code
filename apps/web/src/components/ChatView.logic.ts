@@ -1,4 +1,5 @@
 import {
+  type CommandId,
   type EnvironmentId,
   isProviderDriverKind,
   ProjectId,
@@ -12,7 +13,11 @@ import {
   type TurnId,
 } from "@t3tools/contracts";
 import { type ChatMessage, type SessionPhase, type Thread, type ThreadShell } from "../types";
-import { type ComposerImageAttachment, type DraftThreadState } from "../composerDraftStore";
+import {
+  type ComposerImageAttachment,
+  type DraftThreadState,
+  type TakeoverRetryIdentity,
+} from "../composerDraftStore";
 import * as Schema from "effect/Schema";
 import { appAtomRegistry } from "../rpc/atomRegistry";
 import { environmentThreadDetails } from "../state/threads";
@@ -317,6 +322,67 @@ export function readFileAsDataUrl(file: File): Promise<string> {
     });
     reader.readAsDataURL(file);
   });
+}
+
+export function createTakeoverRetryIdentity(
+  input: Omit<TakeoverRetryIdentity, "externalResume">,
+): TakeoverRetryIdentity {
+  return { ...input, externalResume: "takeover" };
+}
+
+export function matchTakeoverRetryIdentity(
+  retained: TakeoverRetryIdentity | null,
+  payload: Pick<TakeoverRetryIdentity, "threadKey" | "outgoingText">,
+): TakeoverRetryIdentity | null {
+  return retained?.threadKey === payload.threadKey && retained.outgoingText === payload.outgoingText
+    ? retained
+    : null;
+}
+
+export function rotateTakeoverRetryCommandId(
+  identity: TakeoverRetryIdentity,
+  commandId: CommandId,
+): TakeoverRetryIdentity {
+  return { ...identity, commandId };
+}
+
+export function isTakeoverDeliveryIndeterminate(
+  identity: TakeoverRetryIdentity | null | undefined,
+  result: { readonly deliveryStatus?: "completed" | "indeterminate" | undefined },
+): boolean {
+  return identity !== null && identity !== undefined && result.deliveryStatus === "indeterminate";
+}
+
+export function isPiNativeCommandRejected(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) {
+    return false;
+  }
+  const candidate = error as { readonly _tag?: unknown; readonly code?: unknown };
+  return candidate._tag === "PiNativeError" && candidate.code === "command_rejected";
+}
+
+export type ExternalResumeSendDecision =
+  | { proceed: false }
+  | { proceed: true; externalResume?: "takeover" };
+
+export async function resolveExternalResumeForSend(
+  backing: { readonly kind: string; readonly control: string } | undefined,
+  confirm: (message: string, options: { variant: "destructive" }) => Promise<boolean>,
+): Promise<ExternalResumeSendDecision> {
+  if (backing?.kind !== "external" || backing.control !== "resumable") {
+    return { proceed: true };
+  }
+
+  const confirmed = await confirm(
+    [
+      "Take over this Pi thread?",
+      "T3 will start a new Pi writer for this thread.",
+      "Continue only if this session is not open in another terminal. T3 cannot detect unbridged writers.",
+    ].join("\n\n"),
+    { variant: "destructive" },
+  );
+
+  return confirmed ? { proceed: true, externalResume: "takeover" } : { proceed: false };
 }
 
 export function resolveSendEnvMode(input: {

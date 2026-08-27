@@ -192,7 +192,7 @@ import {
   nextProjectScriptId,
   projectScriptIdFromCommand,
 } from "~/projectScripts";
-import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
+import { newCommandId, newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { useBrowserHistoryStore } from "~/browserHistoryStore";
 import { registerFaviconProjectForThread } from "~/browserFaviconStore";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
@@ -225,9 +225,11 @@ import {
   type ComposerImageAttachment,
   type DraftThreadEnvMode,
   finalizePromotedDraftThreadByRef,
+  flushComposerDraftStorage,
   markPromotedDraftThreadByRef,
   useComposerDraftStore,
   type DraftId,
+  type TakeoverRetryIdentity,
 } from "../composerDraftStore";
 import {
   appendTerminalContextsToPrompt,
@@ -322,12 +324,16 @@ import {
   buildThreadTurnInterruptInput,
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
+  createTakeoverRetryIdentity,
   deriveComposerSendState,
   dismissBranchMismatchForSession,
   hasEnvironmentReconnectWarningGraceElapsed,
   scheduleEnvironmentReconnectWarning,
   hasServerAcknowledgedLocalDispatch,
   isBranchMismatchDismissedForSession,
+  isPiNativeCommandRejected,
+  isTakeoverDeliveryIndeterminate,
+  matchTakeoverRetryIdentity,
   shouldDockDraftHeroForSubmission,
   shouldReleaseTimelineAnchorForToolActivity,
   shouldShowBranchMismatchBanner,
@@ -342,8 +348,10 @@ import {
   reconcileMountedTerminalThreadIds,
   resolveBackgroundDraftWorkspaceOptions,
   resolveDraftHeroState,
+  resolveExternalResumeForSend,
   resolveThreadMetadataUpdateForNextTurn,
   resolveSendEnvMode,
+  rotateTakeoverRetryCommandId,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   shouldWriteThreadErrorToCurrentServerThread,
@@ -391,6 +399,8 @@ const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
 const EMPTY_PENDING_USER_INPUT_ANSWERS: Record<string, PendingUserInputDraftAnswer> = {};
+const PI_TAKEOVER_DELIVERY_UNKNOWN_ERROR =
+  "Pi delivery is unknown. Inspect the thread history before changing or retrying this message.";
 function useDraftHeroLayoutTransition(isDraftHeroState: boolean) {
   const transitionGroupRef = useRef<HTMLDivElement | null>(null);
   const composerAnchorRef = useRef<HTMLDivElement | null>(null);
@@ -1369,6 +1379,9 @@ function ChatViewContent(props: ChatViewProps) {
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
   );
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
+  const setComposerDraftTakeoverRetryIdentity = useComposerDraftStore(
+    (store) => store.setTakeoverRetryIdentity,
+  );
   const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
   const setComposerDraftTerminalContexts = useComposerDraftStore(
     (store) => store.setTerminalContexts,
@@ -1475,6 +1488,8 @@ function ChatViewContent(props: ChatViewProps) {
   const attachmentPreviewHandoffByMessageIdRef = useRef<Record<string, string[]>>({});
   const attachmentPreviewPromotionInFlightByMessageIdRef = useRef<Record<string, true>>({});
   const sendInFlightRef = useRef(false);
+  const externalTakeoverConfirmationInFlightRef = useRef(false);
+  const takeoverRetryIdentityRef = useRef<TakeoverRetryIdentity | null>(null);
   const feedbackUploadsInFlightRef = useRef(new Set<string>());
   const terminalUiOpenByThreadRef = useRef<Record<string, boolean>>({});
 
@@ -5164,6 +5179,56 @@ function ChatViewContent(props: ChatViewProps) {
       );
       return;
     }
+    const confirmExternalResumeForSend = () =>
+      resolveExternalResumeForSend(activeThread.backing, async (message, options) => {
+        if (externalTakeoverConfirmationInFlightRef.current) {
+          return false;
+        }
+        externalTakeoverConfirmationInFlightRef.current = true;
+        try {
+          return (await readLocalApi()?.dialogs.confirm(message, options)) ?? false;
+        } finally {
+          externalTakeoverConfirmationInFlightRef.current = false;
+        }
+      });
+    const prepareTakeoverRetryForSend = async (outgoingText: string) => {
+      const threadKey = scopedThreadKey(
+        scopeThreadRef(activeThread.environmentId, activeThread.id),
+      );
+      const persistedIdentity =
+        useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)
+          ?.takeoverRetryIdentity ?? null;
+      takeoverRetryIdentityRef.current = persistedIdentity;
+      const retainedIdentity = matchTakeoverRetryIdentity(persistedIdentity, {
+        threadKey,
+        outgoingText,
+      });
+      if (retainedIdentity) {
+        return { proceed: true as const, identity: retainedIdentity };
+      }
+
+      takeoverRetryIdentityRef.current = null;
+      setComposerDraftTakeoverRetryIdentity(composerDraftTarget, null);
+      const externalResumeDecision = await confirmExternalResumeForSend();
+      if (!externalResumeDecision.proceed) {
+        return { proceed: false as const };
+      }
+      if (!externalResumeDecision.externalResume) {
+        return { proceed: true as const, identity: null };
+      }
+
+      const identity = createTakeoverRetryIdentity({
+        threadKey,
+        outgoingText,
+        commandId: newCommandId(),
+        messageId: newMessageId(),
+        createdAt: new Date().toISOString(),
+      });
+      takeoverRetryIdentityRef.current = identity;
+      setComposerDraftTakeoverRetryIdentity(composerDraftTarget, identity);
+      flushComposerDraftStorage();
+      return { proceed: true as const, identity };
+    };
     if (activePendingProgress) {
       if (directAnnotation) {
         notifyDirectAnnotationAttached();
@@ -5334,12 +5399,19 @@ function ChatViewContent(props: ChatViewProps) {
       if (composerRef.current?.validateProviderInput(outgoingFollowUpText) === false) {
         return;
       }
+      const takeoverRetry = await prepareTakeoverRetryForSend(outgoingFollowUpText);
+      if (!takeoverRetry.proceed) {
+        return;
+      }
       promptRef.current = "";
       clearComposerDraftContent(composerDraftTarget);
       composerRef.current?.resetCursorState();
       await onSubmitPlanFollowUp({
         text: followUp.text,
+        originalDraftText: promptForSend,
+        outgoingMessageText: outgoingFollowUpText,
         interactionMode: followUp.interactionMode,
+        ...(takeoverRetry.identity ? { takeoverRetryIdentity: takeoverRetry.identity } : {}),
       });
       return;
     }
@@ -5431,6 +5503,11 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
+    const takeoverRetry = await prepareTakeoverRetryForSend(outgoingMessageText);
+    if (!takeoverRetry.proceed) {
+      return;
+    }
+    const takeoverRetryIdentity = takeoverRetry.identity;
     sendInFlightRef.current = true;
     if (supportsAttachmentUploads && composerImagesSnapshot.length > 0) {
       for (const image of composerImagesSnapshot) {
@@ -5473,8 +5550,8 @@ function ChatViewContent(props: ChatViewProps) {
       submissionIntent: resolvedSubmissionIntent,
     });
 
-    const messageIdForSend = newMessageId();
-    const messageCreatedAt = new Date().toISOString();
+    const messageIdForSend = takeoverRetryIdentity?.messageId ?? newMessageId();
+    const messageCreatedAt = takeoverRetryIdentity?.createdAt ?? new Date().toISOString();
     const turnAttachmentsPromise = Promise.all(
       composerImagesSnapshot.map(async (image) => {
         if (supportsAttachmentUploads) {
@@ -5614,6 +5691,7 @@ function ChatViewContent(props: ChatViewProps) {
     }
 
     let turnStartSucceeded = false;
+    let takeoverDeliveryIndeterminate = false;
     if (failure === null && turnAttachmentsResult._tag === "Success") {
       const bootstrap =
         isLocalDraftThread || baseBranchForWorktree
@@ -5667,6 +5745,12 @@ function ChatViewContent(props: ChatViewProps) {
           titleSeed: title,
           runtimeMode,
           interactionMode,
+          ...(takeoverRetryIdentity
+            ? {
+                commandId: takeoverRetryIdentity.commandId,
+                externalResume: takeoverRetryIdentity.externalResume,
+              }
+            : {}),
           ...(bootstrap ? { bootstrap } : {}),
           ...(phase === "running" && threadAllows(activeThread, "steer")
             ? { streamingBehavior: "steer" as const }
@@ -5680,8 +5764,27 @@ function ChatViewContent(props: ChatViewProps) {
         if (backgroundThreadRef) {
           clearBackgroundDraftSubmissionByRef(backgroundThreadRef);
         }
+        if (
+          takeoverRetryIdentity &&
+          takeoverRetryIdentityRef.current === takeoverRetryIdentity &&
+          isPiNativeCommandRejected(squashAtomCommandFailure(startResult))
+        ) {
+          const rotatedIdentity = rotateTakeoverRetryCommandId(
+            takeoverRetryIdentity,
+            newCommandId(),
+          );
+          takeoverRetryIdentityRef.current = rotatedIdentity;
+          setComposerDraftTakeoverRetryIdentity(composerDraftTarget, rotatedIdentity);
+          flushComposerDraftStorage();
+        }
         failure = startResult;
+      } else if (isTakeoverDeliveryIndeterminate(takeoverRetryIdentity, startResult.value)) {
+        takeoverDeliveryIndeterminate = true;
       } else {
+        if (takeoverRetryIdentityRef.current === takeoverRetryIdentity) {
+          takeoverRetryIdentityRef.current = null;
+          setComposerDraftTakeoverRetryIdentity(composerDraftTarget, null);
+        }
         turnStartSucceeded = true;
         if (supportsAttachmentUploads) {
           releaseAttachmentUploads(composerImagesSnapshot);
@@ -5737,17 +5840,8 @@ function ChatViewContent(props: ChatViewProps) {
       }
     }
 
-    if (failure !== null) {
-      if (
-        promptRef.current.length === 0 &&
-        composerImagesRef.current.length === 0 &&
-        composerTerminalContextsRef.current.length === 0 &&
-        composerElementContextsRef.current.length === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.previewAnnotations
-          .length ?? 0) === 0 &&
-        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.reviewComments
-          .length ?? 0) === 0
-      ) {
+    if (failure !== null || takeoverDeliveryIndeterminate) {
+      const removeOptimisticMessage = () => {
         setOptimisticUserMessages((existing) => {
           const removed = existing.filter((message) => message.id === messageIdForSend);
           for (const message of removed) {
@@ -5756,6 +5850,23 @@ function ChatViewContent(props: ChatViewProps) {
           const next = existing.filter((message) => message.id !== messageIdForSend);
           return next.length === existing.length ? existing : next;
         });
+      };
+      const composerIsEmpty =
+        promptRef.current.length === 0 &&
+        composerImagesRef.current.length === 0 &&
+        composerTerminalContextsRef.current.length === 0 &&
+        composerElementContextsRef.current.length === 0 &&
+        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.previewAnnotations
+          .length ?? 0) === 0 &&
+        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.reviewComments
+          .length ?? 0) === 0;
+      if (takeoverDeliveryIndeterminate) {
+        removeOptimisticMessage();
+      }
+      if (composerIsEmpty) {
+        if (!takeoverDeliveryIndeterminate) {
+          removeOptimisticMessage();
+        }
         promptRef.current = promptForSend;
         const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
         composerImagesRef.current = retryComposerImages;
@@ -5773,7 +5884,9 @@ function ChatViewContent(props: ChatViewProps) {
           detectTrigger: true,
         });
       }
-      if (!isAtomCommandInterrupted(failure)) {
+      if (takeoverDeliveryIndeterminate) {
+        setThreadError(threadIdForSend, PI_TAKEOVER_DELIVERY_UNKNOWN_ERROR);
+      } else if (failure !== null && !isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         if (isLocalDraftThread && draftId && wasBootstrapThreadDeleted(error)) {
           const failedDraftSession = getDraftSession(draftId);
@@ -6004,10 +6117,16 @@ function ChatViewContent(props: ChatViewProps) {
   const onSubmitPlanFollowUp = useCallback(
     async ({
       text,
+      originalDraftText,
+      outgoingMessageText,
       interactionMode: nextInteractionMode,
+      takeoverRetryIdentity,
     }: {
       text: string;
+      originalDraftText: string;
+      outgoingMessageText: string;
       interactionMode: "default" | "plan";
+      takeoverRetryIdentity?: TakeoverRetryIdentity;
     }) => {
       if (
         !activeThread ||
@@ -6028,24 +6147,11 @@ function ChatViewContent(props: ChatViewProps) {
       if (!sendCtx?.providerAvailable) {
         return;
       }
-      const {
-        selectedProvider: ctxSelectedProvider,
-        selectedModel: ctxSelectedModel,
-        selectedProviderModels: ctxSelectedProviderModels,
-        selectedPromptEffort: ctxSelectedPromptEffort,
-        selectedModelSelection: ctxSelectedModelSelection,
-      } = sendCtx;
+      const { selectedModelSelection: ctxSelectedModelSelection } = sendCtx;
 
       const threadIdForSend = activeThread.id;
-      const messageIdForSend = newMessageId();
-      const messageCreatedAt = new Date().toISOString();
-      const outgoingMessageText = formatOutgoingPrompt({
-        provider: ctxSelectedProvider,
-        model: ctxSelectedModel,
-        models: ctxSelectedProviderModels,
-        effort: ctxSelectedPromptEffort,
-        text: trimmed,
-      });
+      const messageIdForSend = takeoverRetryIdentity?.messageId ?? newMessageId();
+      const messageCreatedAt = takeoverRetryIdentity?.createdAt ?? new Date().toISOString();
 
       sendInFlightRef.current = true;
       beginLocalDispatch({ preparingWorktree: false });
@@ -6078,6 +6184,7 @@ function ChatViewContent(props: ChatViewProps) {
       });
       let failure: AtomCommandResult<unknown, unknown> | null =
         settingsResult._tag === "Failure" ? settingsResult : null;
+      let takeoverDeliveryIndeterminate = false;
 
       if (failure === null) {
         // Keep the mode toggle and plan-follow-up banner in sync immediately
@@ -6101,6 +6208,12 @@ function ChatViewContent(props: ChatViewProps) {
             titleSeed: activeThread.title,
             runtimeMode,
             interactionMode: nextInteractionMode,
+            ...(takeoverRetryIdentity
+              ? {
+                  commandId: takeoverRetryIdentity.commandId,
+                  externalResume: takeoverRetryIdentity.externalResume,
+                }
+              : {}),
             ...(nextInteractionMode === "default" && activeProposedPlan
               ? {
                   sourceProposedPlan: {
@@ -6112,10 +6225,30 @@ function ChatViewContent(props: ChatViewProps) {
             createdAt: messageCreatedAt,
           },
         });
-        failure = startResult._tag === "Failure" ? startResult : null;
+        if (startResult._tag === "Failure") {
+          if (
+            takeoverRetryIdentity &&
+            takeoverRetryIdentityRef.current === takeoverRetryIdentity &&
+            isPiNativeCommandRejected(squashAtomCommandFailure(startResult))
+          ) {
+            const rotatedIdentity = rotateTakeoverRetryCommandId(
+              takeoverRetryIdentity,
+              newCommandId(),
+            );
+            takeoverRetryIdentityRef.current = rotatedIdentity;
+            setComposerDraftTakeoverRetryIdentity(composerDraftTarget, rotatedIdentity);
+            flushComposerDraftStorage();
+          }
+          failure = startResult;
+        } else if (isTakeoverDeliveryIndeterminate(takeoverRetryIdentity, startResult.value)) {
+          takeoverDeliveryIndeterminate = true;
+        } else if (takeoverRetryIdentityRef.current === takeoverRetryIdentity) {
+          takeoverRetryIdentityRef.current = null;
+          setComposerDraftTakeoverRetryIdentity(composerDraftTarget, null);
+        }
       }
 
-      if (failure === null) {
+      if (failure === null && !takeoverDeliveryIndeterminate) {
         acknowledgeActiveThreadWoke();
         sendInFlightRef.current = false;
         return;
@@ -6124,7 +6257,27 @@ function ChatViewContent(props: ChatViewProps) {
       setOptimisticUserMessages((existing) =>
         existing.filter((message) => message.id !== messageIdForSend),
       );
-      if (!isAtomCommandInterrupted(failure)) {
+      const composerIsEmpty =
+        promptRef.current.length === 0 &&
+        composerImagesRef.current.length === 0 &&
+        composerTerminalContextsRef.current.length === 0 &&
+        composerElementContextsRef.current.length === 0 &&
+        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.previewAnnotations
+          .length ?? 0) === 0 &&
+        (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.reviewComments
+          .length ?? 0) === 0;
+      if (takeoverRetryIdentity && composerIsEmpty) {
+        promptRef.current = originalDraftText;
+        setComposerDraftPrompt(composerDraftTarget, originalDraftText);
+        composerRef.current?.resetCursorState({
+          cursor: collapseExpandedComposerCursor(originalDraftText, originalDraftText.length),
+          prompt: originalDraftText,
+          detectTrigger: true,
+        });
+      }
+      if (takeoverDeliveryIndeterminate) {
+        setThreadError(threadIdForSend, PI_TAKEOVER_DELIVERY_UNKNOWN_ERROR);
+      } else if (failure !== null && !isAtomCommandInterrupted(failure)) {
         const error = squashAtomCommandFailure(failure);
         setThreadError(
           threadIdForSend,
@@ -6139,6 +6292,7 @@ function ChatViewContent(props: ChatViewProps) {
       activeProposedPlan,
       acknowledgeActiveThreadWoke,
       beginLocalDispatch,
+      composerDraftTarget,
       isConnecting,
       isSendBusy,
       isServerThread,
@@ -6148,6 +6302,8 @@ function ChatViewContent(props: ChatViewProps) {
       runtimeMode,
       scrollToEnd,
       setComposerDraftInteractionMode,
+      setComposerDraftPrompt,
+      setComposerDraftTakeoverRetryIdentity,
       setThreadError,
       startThreadTurn,
       environmentId,
