@@ -27,7 +27,7 @@
     "@effect/sql-sqlite-wasm": "workspace:*",
     "@effect/vitest": "workspace:*",
     "effect": "workspace:*",
-    "hono": "^4.12.28",
+    "hono": "^4.12.34",
     "nodemailer": "^9.0.3"
   },
   "devDependencies": {
