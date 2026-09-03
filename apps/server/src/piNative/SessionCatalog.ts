@@ -28,10 +28,16 @@ export interface SessionCatalogOptions {
 const SESSION_ENTRY_LIMIT = 1_000;
 const SESSION_HEAD_BYTES = 256 * 1024;
 const SESSION_TAIL_BYTES = 16 * 1024 * 1024;
-const SESSION_CATALOG_FILE_LIMIT = 5_000;
+const SESSION_CATALOG_THREAD_LIMIT = 5_000;
+// Child sessions are filtered after their bounded headers are read. Inspecting
+// more files than the visible-thread ceiling prevents a burst of newer
+// subagents from crowding older root sessions out of the catalog while keeping
+// reconciliation work explicitly bounded.
+const SESSION_CATALOG_FILE_INSPECTION_LIMIT = 10_000;
 const SESSION_LIST_ENTRY_LIMIT = 50;
 const SESSION_LIST_HEAD_BYTES = 64 * 1024;
 const SESSION_LIST_TAIL_BYTES = 64 * 1024;
+const SESSION_CATALOG_HEADER_BYTES = 64 * 1024;
 const SESSION_TITLE_MAX_CHARS = 512;
 const SESSION_METADATA_LINE_MAX_CHARS = 1024 * 1024;
 const keyFor = (file: string) =>
@@ -70,6 +76,11 @@ interface CachedCatalogMetadata {
   readonly mtimeMs: number;
   readonly row: PiSessionCatalogMetadata;
 }
+interface CachedCatalogEligibility {
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly isRoot: boolean;
+}
 
 function textFrom(value: unknown): string | undefined {
   if (typeof value === "string" && value.trim()) return value.trim();
@@ -107,7 +118,7 @@ async function walk(root: string): Promise<{
   };
   const retain = (file: string) => {
     total += 1;
-    if (newest.length < SESSION_CATALOG_FILE_LIMIT) {
+    if (newest.length < SESSION_CATALOG_FILE_INSPECTION_LIMIT) {
       newest.push(file);
       let index = newest.length - 1;
       while (index > 0) {
@@ -154,6 +165,64 @@ function parseEntry(line: string): PiNativeJsonlEntry | undefined {
     return undefined;
   }
 }
+
+async function readCatalogHeadEntries(
+  file: string,
+  size: number,
+): Promise<{
+  readonly entries: ReadonlyArray<PiNativeJsonlEntry>;
+  readonly hasDelegatedTaskMarker: boolean;
+}> {
+  const handle = await NodeFS.promises.open(file, "r");
+  try {
+    const length = Math.min(size, SESSION_CATALOG_HEADER_BYTES);
+    const buffer = Buffer.alloc(length);
+    const { bytesRead } = await handle.read(buffer, 0, length, 0);
+    const raw = buffer.subarray(0, bytesRead).toString("utf8");
+    const lastLineStart = raw.lastIndexOf("\n") + 1;
+    const incompleteLine = length < size && !raw.endsWith("\n") ? raw.slice(lastLineStart) : "";
+    const complete = length < size && !raw.endsWith("\n") ? raw.slice(0, lastLineStart) : raw;
+    return {
+      entries: parseEntries(complete),
+      // The marker sits at the start of the first user message, so it remains
+      // visible even when a large delegated prompt crosses the read boundary
+      // and cannot be parsed as complete JSON.
+      hasDelegatedTaskMarker:
+        incompleteLine.includes(
+          '"role":"user","content":[{"type":"text","text":"Delegated task:',
+        ) || incompleteLine.includes('"role":"user","content":"Delegated task:'),
+    };
+  } finally {
+    await handle.close();
+  }
+}
+
+type PiSessionHeader = PiNativeJsonlEntry & {
+  readonly type: "session";
+  readonly id: string;
+  readonly cwd: string;
+};
+
+const isRootSessionHeader = (header: PiNativeJsonlEntry | undefined): header is PiSessionHeader =>
+  header?.type === "session" &&
+  typeof header.id === "string" &&
+  typeof header.cwd === "string" &&
+  !(typeof header.parentSession === "string" && header.parentSession.trim().length > 0);
+
+const isDelegatedSession = (entries: ReadonlyArray<PiNativeJsonlEntry>): boolean => {
+  const firstUserMessage = entries.find(isUserMessageEntry);
+  if (!firstUserMessage) return false;
+  const content = record(firstUserMessage.message)
+    ? firstUserMessage.message.content
+    : firstUserMessage.content;
+  return textFrom(content)?.startsWith("Delegated task:") === true;
+};
+
+const isCatalogRootSession = (
+  entries: ReadonlyArray<PiNativeJsonlEntry>,
+  hasDelegatedTaskMarker = false,
+): boolean =>
+  isRootSessionHeader(entries[0]) && !hasDelegatedTaskMarker && !isDelegatedSession(entries);
 
 function modelFromEntry(entry: PiNativeJsonlEntry): string | undefined {
   if (entry.type === "model_change" && typeof entry.modelId === "string") {
@@ -438,6 +507,7 @@ export class SessionCatalog extends Context.Service<
 export function makeSessionCatalog(options: SessionCatalogOptions = {}): SessionCatalog["Service"] {
   const configuredRoot = NodePath.resolve(options.root ?? defaultPiSessionsRoot());
   let metadataByFile = new Map<string, CachedCatalogMetadata>();
+  let eligibilityByFile = new Map<string, CachedCatalogEligibility>();
   let omittedFileCount = 0;
   const scan = async (priorityFiles: ReadonlyArray<string> = []) => {
     let root: string;
@@ -448,10 +518,10 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
       throw cause;
     }
     const discoveredPaths = await walk(root);
-    omittedFileCount = discoveredPaths.omittedCount;
+    let nextOmittedFileCount = discoveredPaths.omittedCount;
     const selectedCandidates = [...discoveredPaths.files];
     const selectedCandidateSet = new Set(selectedCandidates);
-    for (const priorityFile of priorityFiles.slice(0, SESSION_CATALOG_FILE_LIMIT)) {
+    for (const priorityFile of priorityFiles.slice(0, SESSION_CATALOG_FILE_INSPECTION_LIMIT)) {
       const accepted = await (async () => {
         const canonical = await NodeFS.promises.realpath(priorityFile);
         if (!canonical.startsWith(`${root}${NodePath.sep}`)) return undefined;
@@ -459,7 +529,7 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
         return stat.isFile() ? canonical : undefined;
       })().catch(() => undefined);
       if (!accepted || selectedCandidateSet.has(accepted)) continue;
-      if (selectedCandidates.length >= SESSION_CATALOG_FILE_LIMIT) {
+      if (selectedCandidates.length >= SESSION_CATALOG_FILE_INSPECTION_LIMIT) {
         const removed = selectedCandidates.pop();
         if (removed) selectedCandidateSet.delete(removed);
       }
@@ -489,8 +559,35 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
     );
     const rows: PiSessionCatalogMetadata[] = [];
     const nextMetadataByFile = new Map<string, CachedCatalogMetadata>();
-    for (const { canonical, stat } of files) {
+    const nextEligibilityByFile = new Map<string, CachedCatalogEligibility>();
+    const classifyRoot = async (canonical: string, stat: NodeFS.Stats) => {
+      const cached = eligibilityByFile.get(canonical);
+      if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
+        nextEligibilityByFile.set(canonical, cached);
+        return cached.isRoot;
+      }
+      // Pi normally links child sessions through `parentSession`. Remote
+      // delegate runtimes cannot preserve that path, but retain the
+      // extension's initial "Delegated task:" protocol marker instead.
+      const head = await readCatalogHeadEntries(canonical, stat.size);
+      const isRoot = isCatalogRootSession(head.entries, head.hasDelegatedTaskMarker);
+      nextEligibilityByFile.set(canonical, {
+        size: stat.size,
+        mtimeMs: stat.mtimeMs,
+        isRoot,
+      });
+      return isRoot;
+    };
+    for (let fileIndex = 0; fileIndex < files.length; fileIndex += 1) {
+      if (rows.length >= SESSION_CATALOG_THREAD_LIMIT) {
+        for (const { canonical, stat } of files.slice(fileIndex)) {
+          if (await classifyRoot(canonical, stat).catch(() => false)) nextOmittedFileCount += 1;
+        }
+        break;
+      }
+      const { canonical, stat } = files[fileIndex]!;
       const row = await (async () => {
+        if (!(await classifyRoot(canonical, stat))) return undefined;
         const cached = metadataByFile.get(canonical);
         if (cached && cached.size === stat.size && cached.mtimeMs === stat.mtimeMs) {
           nextMetadataByFile.set(canonical, cached);
@@ -502,13 +599,7 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
           tailBytes: SESSION_LIST_TAIL_BYTES,
         });
         const header = bounded.metadataEntries[0];
-        if (
-          !header ||
-          header.type !== "session" ||
-          typeof header.id !== "string" ||
-          typeof header.cwd !== "string"
-        )
-          return undefined;
+        if (!isRootSessionHeader(header)) return undefined;
         const created =
           typeof header.timestamp === "string" ? header.timestamp : stat.birthtime.toISOString();
         const headerCwd = header.cwd;
@@ -542,6 +633,8 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
       if (row) rows.push(row);
     }
     metadataByFile = nextMetadataByFile;
+    eligibilityByFile = nextEligibilityByFile;
+    omittedFileCount = nextOmittedFileCount;
     return rows
       .map((row) => ({
         ...row,

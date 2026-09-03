@@ -10,8 +10,8 @@ and composer.
 
 pi tools that run delegated agents also appear in the normal **agents** panel,
 including live progress, completion state, model, and usage when the tool reports
-them. the underlying child or forked pi session remains an independent thread;
-t3 does not turn pi's general-purpose session ancestry into sidebar nesting.
+them. child and forked pi session files do not add separate sidebar threads; t3
+keeps the root conversation in the sidebar and its delegated work in Agents.
 
 on web, choose **new native pi session** from the command palette while a
 project is active. on mobile, choose **native pi** as the run target in the

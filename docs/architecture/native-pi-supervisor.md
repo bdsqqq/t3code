@@ -137,6 +137,13 @@ timeline items.
 the catalog reads bounded jsonl metadata and emits lightweight shells. it
 associates each session in this order:
 
+sessions whose header declares `parentSession` are excluded. remote delegate
+runtimes that cannot preserve that path are recognized by the delegate
+extension's initial `Delegated task:` protocol marker. recognized agent-backed
+tool calls are represented by task activities on the root conversation; other
+fork, clone, or extension-created descendants remain hidden rather than
+becoming top-level sidebar threads.
+
 1. exact canonical cwd match to an internal project root
 2. exact match to an existing thread worktree
 3. longest path-boundary internal project ancestor

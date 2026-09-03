@@ -294,13 +294,15 @@ describe("SessionCatalog", () => {
       (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),
   );
-  it.effect("catalogs Pi forks as independent threads", () =>
+  it.effect("keeps Pi child sessions out of the root thread catalog", () =>
     Effect.acquireUseRelease(
       Effect.tryPromise(() => NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-"))),
       (root) =>
         Effect.gen(function* () {
           const parentFile = NodePath.join(root, "parent.jsonl");
           const childFile = NodePath.join(root, "child.jsonl");
+          const detachedDelegateFile = NodePath.join(root, "detached-delegate.jsonl");
+          const ordinaryFile = NodePath.join(root, "ordinary.jsonl");
           yield* Effect.tryPromise(() =>
             Promise.all([
               NodeFS.promises.writeFile(
@@ -316,15 +318,47 @@ describe("SessionCatalog", () => {
                   parentSession: parentFile,
                 }) + "\n",
               ),
+              NodeFS.promises.writeFile(
+                detachedDelegateFile,
+                [
+                  { type: "session", id: "detached-delegate", cwd: root },
+                  {
+                    type: "message",
+                    role: "user",
+                    content: `Delegated task: inspect the parent\n${"x".repeat(70 * 1024)}`,
+                  },
+                ]
+                  .map((entry) => JSON.stringify(entry))
+                  .join("\n") + "\n",
+              ),
+              NodeFS.promises.writeFile(
+                ordinaryFile,
+                [
+                  { type: "session", id: "ordinary", cwd: root },
+                  { type: "message", role: "user", content: "Discuss delegated task syntax" },
+                  {
+                    type: "message",
+                    role: "user",
+                    content: "Delegated task: quoted in a later message",
+                  },
+                ]
+                  .map((entry) => JSON.stringify(entry))
+                  .join("\n") + "\n",
+              ),
             ]),
           );
 
           const listed = yield* makeSessionCatalog({ root }).list();
           const parent = listed.find((record) => record.sessionId === "parent");
           const child = listed.find((record) => record.sessionId === "child");
+          const detachedDelegate = listed.find(
+            (record) => record.sessionId === "detached-delegate",
+          );
+          const ordinary = listed.find((record) => record.sessionId === "ordinary");
           expect(parent?.threadId).toBeDefined();
-          expect(child?.threadId).toBeDefined();
-          expect(child?.threadId).not.toBe(parent?.threadId);
+          expect(ordinary?.threadId).toBeDefined();
+          expect(child).toBeUndefined();
+          expect(detachedDelegate).toBeUndefined();
         }),
       (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),
