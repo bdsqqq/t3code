@@ -4,7 +4,6 @@ import {
   PiNativeRuntimeId,
   PiNativeSessionKey,
   ProjectId,
-  ProviderDriverKind,
   ThreadId,
   type ClientOrchestrationCommand,
   type OrchestrationProjectShell,
@@ -18,18 +17,17 @@ import {
   boundExternalCatalog,
   catalogUpdateAfterRead,
   CatalogRuntimeAttachmentGate,
+  PiSubagentStreamTracker,
   runtimeSnapshotAtSequence,
   runtimeSequenceStable,
   runtimeCatalogSignature,
   isRuntimeLifecycleEvent,
-  managedPiBindingSignature,
   planPiExternalTurnStart,
   receiptSessionFile,
-  resolveManagedPiParentThreadIds,
   shutdownCreatedRuntime,
   validExternalLifecycleOverride,
 } from "./PiExternalThreadSource.ts";
-import type { SupervisorRuntimeState } from "./SupervisorProtocol.ts";
+import type { SupervisorRuntimeState, SupervisorStreamEvent } from "./SupervisorProtocol.ts";
 
 const takeoverRecord = {
   sourceKey: PiNativeSessionKey.make("source-key"),
@@ -202,6 +200,57 @@ describe("PiExternalThreadSource hardening", () => {
     expect(isRuntimeLifecycleEvent("message_update")).toBe(false);
   });
 
+  it("retains sub-agent metadata through a metadata-free terminal event", () => {
+    const tracker = new PiSubagentStreamTracker();
+    const update = (sequence: number, text: string) =>
+      ({
+        type: "event",
+        runtimeId: PiNativeRuntimeId.make("runtime-1"),
+        sequence,
+        eventId: `runtime:${sequence}`,
+        event: {
+          type: "tool_execution_update",
+          toolCallId: "delegate-1",
+          toolName: "delegate",
+          partialResult: {
+            content: [{ type: "text", text }],
+            details: {
+              agent: "delegate",
+              task: "Audit auth",
+              lifecycle: { status: "running" },
+            },
+          },
+        },
+      }) as SupervisorStreamEvent;
+    const terminal = {
+      type: "event",
+      runtimeId: PiNativeRuntimeId.make("runtime-1"),
+      sequence: 3,
+      eventId: "runtime:3",
+      event: {
+        type: "tool_execution_end",
+        toolCallId: "delegate-1",
+        toolName: "delegate",
+        result: { content: [{ type: "text", text: "done" }] },
+      },
+    } as SupervisorStreamEvent;
+
+    expect(tracker.observe(update(1, "starting"))).toEqual({
+      snapshot: true,
+      retainedEvents: [expect.objectContaining({ eventId: "runtime:1" })],
+    });
+    expect(tracker.observe(update(2, "still working"))).toEqual({
+      snapshot: false,
+      retainedEvents: [],
+    });
+    const decision = tracker.observe(terminal);
+    expect(decision.snapshot).toBe(true);
+    expect(decision.retainedEvents.map((event) => event.eventId)).toEqual([
+      "runtime:2",
+      "runtime:3",
+    ]);
+  });
+
   it("recovers a created session after its runtime is evicted", () => {
     expect(
       receiptSessionFile({
@@ -227,66 +276,6 @@ describe("PiExternalThreadSource hardening", () => {
     );
     expect(runtimeCatalogSignature([{ ...runtime, status: "idle" }])).not.toBe(
       runtimeCatalogSignature([runtime]),
-    );
-  });
-
-  it.effect("places delegated Pi sessions under their managed T3 parent", () =>
-    Effect.gen(function* () {
-      const parentThreadId = ThreadId.make("thread-parent");
-      const child = {
-        sourceKey: PiNativeSessionKey.make("child-source"),
-        threadId: ThreadId.make("external:pi:path:child"),
-        canonicalFile: "/sessions/child.jsonl",
-        sessionId: "child-session",
-        parentSessionFile: "/managed/parent.jsonl",
-        parentThreadId: ThreadId.make("external:pi:path:missing-parent"),
-        cwd: "/workspace",
-        title: "child",
-        createdAt: "2026-08-06T00:00:00.000Z",
-        updatedAt: "2026-08-06T00:01:00.000Z",
-        fileSize: 1,
-        fileMtimeMs: 1,
-        historyTruncation: { truncated: false },
-      } as const;
-
-      const resolved = yield* Effect.promise(() =>
-        resolveManagedPiParentThreadIds(
-          [child],
-          [
-            {
-              threadId: parentThreadId,
-              provider: ProviderDriverKind.make("pi"),
-              resumeCursor: {
-                schemaVersion: 1,
-                sessionFile: "/managed/parent.jsonl",
-                sessionId: "parent-session",
-              },
-              lastSeenAt: "2026-08-06T00:01:00.000Z",
-            },
-          ],
-        ),
-      );
-
-      expect(resolved[0]?.parentThreadId).toBe(parentThreadId);
-      expect(resolved[0]?.parentSessionFile).toBe(child.parentSessionFile);
-    }),
-  );
-
-  it("invalidates the catalog when a managed Pi parent binding appears", () => {
-    const binding = {
-      threadId: ThreadId.make("thread-parent"),
-      provider: ProviderDriverKind.make("pi"),
-      resumeCursor: {
-        schemaVersion: 1,
-        sessionFile: "/managed/parent.jsonl",
-        sessionId: "parent-session",
-      },
-      lastSeenAt: "2026-08-06T00:01:00.000Z",
-    } as const;
-
-    expect(managedPiBindingSignature([binding])).not.toBe(managedPiBindingSignature([]));
-    expect(managedPiBindingSignature([{ ...binding, lastSeenAt: "later" }])).toBe(
-      managedPiBindingSignature([binding]),
     );
   });
 

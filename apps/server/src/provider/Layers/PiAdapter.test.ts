@@ -776,7 +776,9 @@ describe("PiAdapter", () => {
       Effect.gen(function* () {
         yield* start(adapter);
         const collected = yield* adapter.streamEvents.pipe(
-          Stream.takeUntil(completesToolCall("agent-1")),
+          Stream.takeUntil(
+            (event) => event.type === "task.completed" && event.payload.toolUseId === "agent-1",
+          ),
           Stream.runCollect,
           Effect.forkChild,
         );
@@ -798,7 +800,13 @@ describe("PiAdapter", () => {
             toolName: "security_scout",
             partialResult: {
               content: [{ type: "text", text: "Searching" }],
-              details: { agent: "security_scout", task: "Locate the authentication flow" },
+              details: {
+                agent: "security_scout",
+                task: "Locate the authentication flow",
+                sessionId: "child-session",
+                lifecycle: { status: "running" },
+                usage: { input: 10, output: 2, cacheRead: 3, cacheWrite: 0 },
+              },
             },
           },
           {
@@ -807,7 +815,14 @@ describe("PiAdapter", () => {
             toolName: "security_scout",
             result: {
               content: [{ type: "text", text: "Found the flow" }],
-              details: { agent: "security_scout", task: "Locate the authentication flow" },
+              details: {
+                agent: "security_scout",
+                task: "Locate the authentication flow",
+                sessionId: "child-session",
+                output: "Found the flow",
+                lifecycle: { status: "succeeded" },
+                usage: { input: 20, output: 5, cacheRead: 4, cacheWrite: 0 },
+              },
             },
             isError: false,
           },
@@ -828,6 +843,157 @@ describe("PiAdapter", () => {
         assert.equal(
           (completed?.payload.data as Record<string, unknown> | undefined)?.toolName,
           "security_scout",
+        );
+        const taskEvents = events.filter((event) => event.type.startsWith("task."));
+        assert.deepEqual(
+          taskEvents.map((event) => event.type),
+          ["task.started", "task.progress", "task.completed"],
+        );
+        assert.deepEqual(taskEvents[0]?.payload, {
+          taskId: "pi-agent:pi-generated-session-id:agent-1",
+          description: "Locate the authentication flow",
+          taskType: "local_agent",
+          title: "Locate the authentication flow",
+          role: "security scout",
+          toolUseId: "agent-1",
+        });
+        assert.deepEqual(taskEvents.at(-1)?.payload, {
+          taskId: "pi-agent:pi-generated-session-id:agent-1",
+          status: "completed",
+          taskType: "local_agent",
+          title: "Locate the authentication flow",
+          role: "security scout",
+          toolUseId: "agent-1",
+          summary: "Found the flow",
+          typedUsage: {
+            totalTokens: 29,
+            inputTokens: 20,
+            cachedInputTokens: 4,
+            outputTokens: 5,
+          },
+        });
+      }),
+    );
+  });
+
+  it.effect("maps Pi sub-agent failure and cancellation into native task completion", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil(
+            (event) =>
+              event.type === "task.completed" && event.payload.toolUseId === "cancelled-agent",
+          ),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          input: "delegate twice",
+          modelSelection,
+        });
+        yield* Queue.offerAll(h.client.input, [
+          {
+            type: "tool_execution_update",
+            toolCallId: "failed-agent",
+            toolName: "delegate",
+            partialResult: {
+              content: [{ type: "text", text: "child failed" }],
+              details: {
+                agent: "delegate",
+                task: "fail",
+                sessionId: "failed-child",
+                errorMessage: "child failed",
+                lifecycle: { status: "failed" },
+              },
+            },
+          },
+          {
+            type: "tool_execution_end",
+            toolCallId: "failed-agent",
+            toolName: "delegate",
+            result: { content: [{ type: "text", text: "child failed" }] },
+            isError: true,
+          },
+          {
+            type: "tool_execution_update",
+            toolCallId: "cancelled-agent",
+            toolName: "delegate",
+            partialResult: {
+              content: [{ type: "text", text: "child cancelled" }],
+              details: {
+                agent: "delegate",
+                task: "cancel",
+                sessionId: "cancelled-child",
+                lifecycle: { status: "cancelled" },
+              },
+            },
+          },
+          {
+            type: "tool_execution_end",
+            toolCallId: "cancelled-agent",
+            toolName: "delegate",
+            result: { content: [{ type: "text", text: "child cancelled" }] },
+            isError: true,
+          },
+        ]);
+
+        const events = Array.from(yield* Fiber.join(collected));
+        const updates = events.filter((event) => event.type === "task.updated");
+        const completions = events.filter((event) => event.type === "task.completed");
+        assert.deepEqual(
+          updates.map((event) => event.payload.status),
+          ["failed", "cancelled"],
+        );
+        assert.deepEqual(
+          completions.map((event) => event.payload.status),
+          ["failed", "stopped"],
+        );
+      }),
+    );
+  });
+
+  it.effect("stops an unfinished Pi sub-agent when its parent turn settles", () => {
+    const h = makeHarness();
+    return withAdapter(h, (adapter) =>
+      Effect.gen(function* () {
+        yield* start(adapter);
+        const collected = yield* adapter.streamEvents.pipe(
+          Stream.takeUntil((event) => event.type === "turn.completed"),
+          Stream.runCollect,
+          Effect.forkChild,
+        );
+        yield* adapter.sendTurn({
+          threadId: ThreadId.make("thread"),
+          input: "delegate this",
+          modelSelection,
+        });
+        yield* Queue.offerAll(h.client.input, [
+          {
+            type: "tool_execution_update",
+            toolCallId: "agent-1",
+            toolName: "delegate",
+            partialResult: {
+              content: [{ type: "text", text: "still working" }],
+              details: {
+                agent: "delegate",
+                task: "unfinished",
+                sessionId: "unfinished-child",
+                lifecycle: { status: "running" },
+              },
+            },
+          },
+          { type: "agent_settled" },
+        ]);
+
+        const events = Array.from(yield* Fiber.join(collected));
+        const completion = events.find((event) => event.type === "task.completed");
+        assert.equal(completion?.payload.status, "stopped");
+        assert.ok(
+          events.findIndex((event) => event.type === "task.completed") <
+            events.findIndex((event) => event.type === "turn.completed"),
         );
       }),
     );

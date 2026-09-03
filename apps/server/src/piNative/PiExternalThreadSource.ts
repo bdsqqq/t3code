@@ -36,7 +36,6 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as PubSub from "effect/PubSub";
 import * as Schedule from "effect/Schedule";
-import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
@@ -44,15 +43,14 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
 import type { PiExternalLifecycleOverride } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
 import { PiExternalLifecycleOverrideRepository } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
-import type { ProviderRuntimeBindingWithMetadata } from "../provider/Services/ProviderSessionDirectory.ts";
-import { ProviderSessionDirectory } from "../provider/Services/ProviderSessionDirectory.ts";
-import { PiSessionCursor } from "../provider/pi/PiSessionFile.ts";
 import {
   defaultPiSessionsRoot,
   type PiSessionCatalogRecord,
   SessionCatalog,
 } from "./SessionCatalog.ts";
 import {
+  isPiSubagentLiveEvent,
+  piLiveToolCallId,
   projectPiExternalProject,
   projectPiLiveEvent,
   projectPiThread,
@@ -144,6 +142,58 @@ const supervisorEventType = (item: SupervisorStreamEvent): string | undefined =>
       ? payload.type
       : undefined;
 };
+
+export class PiSubagentStreamTracker {
+  readonly #latestByToolCallId = new Map<string, SupervisorStreamEvent>();
+
+  clear(): void {
+    this.#latestByToolCallId.clear();
+  }
+
+  reset(events: ReadonlyArray<SupervisorStreamEvent>): void {
+    this.clear();
+    for (const event of events) {
+      const toolCallId = piLiveToolCallId(event.event);
+      if (!toolCallId) continue;
+      if (
+        isPiSubagentLiveEvent(event.event) &&
+        supervisorEventType(event) !== "tool_execution_end"
+      ) {
+        this.#latestByToolCallId.set(toolCallId, event);
+      }
+      if (supervisorEventType(event) === "tool_execution_end") {
+        this.#latestByToolCallId.delete(toolCallId);
+      }
+    }
+  }
+
+  observe(item: SupervisorStreamEvent): {
+    readonly snapshot: boolean;
+    readonly retainedEvents: ReadonlyArray<SupervisorStreamEvent>;
+  } {
+    const toolCallId = piLiveToolCallId(item.event);
+    if (!toolCallId) return { snapshot: false, retainedEvents: [] };
+    const retained = this.#latestByToolCallId.get(toolCallId);
+    const recognized = isPiSubagentLiveEvent(item.event);
+    if (
+      supervisorEventType(item) === "tool_execution_end" &&
+      (retained !== undefined || recognized)
+    ) {
+      this.#latestByToolCallId.delete(toolCallId);
+      return {
+        snapshot: true,
+        retainedEvents: retained === undefined ? [item] : [retained, item],
+      };
+    }
+    if (!recognized) return { snapshot: false, retainedEvents: [] };
+    this.#latestByToolCallId.set(toolCallId, item);
+    return {
+      snapshot: retained === undefined,
+      retainedEvents: retained === undefined ? [item] : [],
+    };
+  }
+}
+
 export function boundExternalCatalog(input: {
   readonly projects: ReadonlyArray<OrchestrationProjectShell>;
   readonly threads: ReadonlyArray<ReturnType<typeof projectPiThreadShell>>;
@@ -216,54 +266,6 @@ const canonical = (value: string) =>
 interface Association {
   readonly projectIdByThread: ReadonlyMap<ThreadId, ProjectId>;
   readonly externalProjects: ReadonlyArray<OrchestrationProjectShell>;
-}
-
-/**
- * Delegated Pi sessions point at the managed parent session file, while the
- * sidebar identifies that parent by its internal T3 thread id. The provider
- * cursor is the durable bridge between those two identities.
- */
-export async function resolveManagedPiParentThreadIds(
-  records: ReadonlyArray<PiSessionCatalogRecord>,
-  bindings: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
-): Promise<ReadonlyArray<PiSessionCatalogRecord>> {
-  const managedThreadIdBySessionFile = new Map<string, ThreadId>();
-  await Promise.all(
-    bindings.map(async (binding) => {
-      if (binding.provider !== "pi") return;
-      const cursor = Schema.decodeUnknownOption(PiSessionCursor)(binding.resumeCursor);
-      if (Option.isNone(cursor)) return;
-      managedThreadIdBySessionFile.set(await canonical(cursor.value.sessionFile), binding.threadId);
-    }),
-  );
-  if (managedThreadIdBySessionFile.size === 0) return records;
-  return records.map((record) => {
-    if (record.parentSessionFile === undefined) return record;
-    const managedParentThreadId = managedThreadIdBySessionFile.get(record.parentSessionFile);
-    return managedParentThreadId === undefined
-      ? record
-      : { ...record, parentThreadId: managedParentThreadId };
-  });
-}
-
-export function managedPiBindingSignature(
-  bindings: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
-): string {
-  return JSON.stringify(
-    bindings
-      .flatMap((binding) => {
-        if (binding.provider !== "pi") return [];
-        const cursor = Schema.decodeUnknownOption(PiSessionCursor)(binding.resumeCursor);
-        return Option.isNone(cursor)
-          ? []
-          : [{ sessionFile: cursor.value.sessionFile, threadId: binding.threadId }];
-      })
-      .toSorted(
-        (left, right) =>
-          left.sessionFile.localeCompare(right.sessionFile) ||
-          left.threadId.localeCompare(right.threadId),
-      ),
-  );
 }
 
 async function associate(
@@ -482,7 +484,6 @@ export class PiExternalThreadSource extends Context.Service<
       const catalog = yield* SessionCatalog;
       const supervisor = yield* SupervisorClient;
       const snapshots = yield* ProjectionSnapshotQuery;
-      const providerSessions = yield* ProviderSessionDirectory;
       const lifecycleOverrides = yield* PiExternalLifecycleOverrideRepository;
       const catalogBuildSemaphore = yield* Semaphore.make(1);
       let catalogSequence = 0;
@@ -493,7 +494,6 @@ export class PiExternalThreadSource extends Context.Service<
       let cachedAssociation: Association | undefined;
       let lastCatalogRuntimeSignature = "";
       let lastInternalAssociationSignature = "";
-      let lastManagedPiBindingSignature = "";
       let lastGuardedResumeSupported = false;
 
       const probeGuardedResume = (refresh = false) =>
@@ -511,7 +511,6 @@ export class PiExternalThreadSource extends Context.Service<
       const buildCatalogUnlocked = Effect.fn("PiExternalThreadSource.catalogSnapshot")(function* (
         refreshCatalog = true,
         runtimeOverride?: ReadonlyArray<SupervisorRuntimeState>,
-        providerBindingsOverride?: ReadonlyArray<ProviderRuntimeBindingWithMetadata>,
         guardedResumeOverride?: boolean,
       ) {
         const runtimes =
@@ -531,19 +530,12 @@ export class PiExternalThreadSource extends Context.Service<
         }
         const records = cachedRecords;
         const internal = cachedInternal;
-        const providerBindings =
-          providerBindingsOverride ??
-          (yield* providerSessions.listBindings().pipe(Effect.orElseSucceed(() => [])));
-        const resolvedRecords = yield* Effect.promise(() =>
-          resolveManagedPiParentThreadIds(records, providerBindings),
-        );
         lastInternalAssociationSignature = internalAssociationSignature(internal);
         lastCatalogRuntimeSignature = runtimeCatalogSignature(runtimes);
-        lastManagedPiBindingSignature = managedPiBindingSignature(providerBindings);
         lastGuardedResumeSupported = catalogResumeSupported;
         if (cachedAssociation === undefined) {
           cachedAssociation = yield* Effect.tryPromise({
-            try: () => associate(resolvedRecords, internal),
+            try: () => associate(records, internal),
             catch: () =>
               privateSourceError("catalog_association", "Thread catalog association failed."),
           });
@@ -561,7 +553,7 @@ export class PiExternalThreadSource extends Context.Service<
               ),
             )).map((value) => [value.sourceKey, value] as const),
         );
-        const projectedThreads = resolvedRecords.slice(0, CATALOG_MAX_THREADS).map((record) => {
+        const projectedThreads = records.slice(0, CATALOG_MAX_THREADS).map((record) => {
           const projectId = association.projectIdByThread.get(record.threadId)!;
           const lifecycle = validExternalLifecycleOverride(
             record,
@@ -583,7 +575,7 @@ export class PiExternalThreadSource extends Context.Service<
           {
             projects: association.externalProjects,
             threads: projectedThreads,
-            totalThreadCount: resolvedRecords.length + cachedOmittedThreadCount,
+            totalThreadCount: records.length + cachedOmittedThreadCount,
           },
         );
         const signature = JSON.stringify({
@@ -615,20 +607,16 @@ export class PiExternalThreadSource extends Context.Service<
         function* () {
           return yield* catalogBuildSemaphore.withPermit(
             Effect.gen(function* () {
-              const [runtimes, internal, providerBindings, catalogResumeSupported] =
-                yield* Effect.all([
-                  supervisor.list().pipe(Effect.orElseSucceed(() => [])),
-                  internalShell,
-                  providerSessions.listBindings().pipe(Effect.orElseSucceed(() => [])),
-                  projectedGuardedResume,
-                ]);
+              const [runtimes, internal, catalogResumeSupported] = yield* Effect.all([
+                supervisor.list().pipe(Effect.orElseSucceed(() => [])),
+                internalShell,
+                projectedGuardedResume,
+              ]);
               const runtimeSignature = runtimeCatalogSignature(runtimes);
               const internalSignature = internalAssociationSignature(internal);
-              const bindingSignature = managedPiBindingSignature(providerBindings);
               if (
                 runtimeSignature === lastCatalogRuntimeSignature &&
                 internalSignature === lastInternalAssociationSignature &&
-                bindingSignature === lastManagedPiBindingSignature &&
                 catalogResumeSupported === lastGuardedResumeSupported
               ) {
                 return undefined;
@@ -637,12 +625,7 @@ export class PiExternalThreadSource extends Context.Service<
                 cachedInternal = internal;
                 cachedAssociation = undefined;
               }
-              return yield* buildCatalogUnlocked(
-                false,
-                runtimes,
-                providerBindings,
-                catalogResumeSupported,
-              );
+              return yield* buildCatalogUnlocked(false, runtimes, catalogResumeSupported);
             }),
           );
         },
@@ -715,7 +698,11 @@ export class PiExternalThreadSource extends Context.Service<
 
       const projectSupervisorSnapshot = Effect.fn(
         "PiExternalThreadSource.projectSupervisorSnapshot",
-      )(function* (record: PiSessionCatalogRecord, runtime: SupervisorRuntimeState) {
+      )(function* (
+        record: PiSessionCatalogRecord,
+        runtime: SupervisorRuntimeState,
+        retainedSubagentEvents: ReadonlyArray<SupervisorStreamEvent> = [],
+      ) {
         const first = yield* supervisor
           .subscribe(runtime.runtimeId)
           .pipe(Stream.take(1), Stream.runHead);
@@ -727,10 +714,17 @@ export class PiExternalThreadSource extends Context.Service<
           first.value.runtime,
           first.value.entries,
         );
+        const overlayEvents = [...first.value.events];
+        for (const event of retainedSubagentEvents) {
+          if (!overlayEvents.some((candidate) => candidate.eventId === event.eventId)) {
+            overlayEvents.push(event);
+          }
+        }
+        overlayEvents.sort((a, b) => a.sequence - b.sequence);
         return projectPiThreadOverlay(
           snapshot,
           record,
-          first.value.events,
+          overlayEvents,
           yield* DateTime.now.pipe(Effect.map(DateTime.formatIso)),
           first.value.omittedOverlayEventCount,
         );
@@ -742,6 +736,8 @@ export class PiExternalThreadSource extends Context.Service<
         item: SupervisorStreamItem,
         liveTurnId?: TurnId,
         liveUserEvent?: SupervisorStreamEvent,
+        snapshotSubagentEvent = false,
+        retainedSubagentEvents: ReadonlyArray<SupervisorStreamEvent> = [],
       ): Effect.fn.Return<OrchestrationThreadStreamItem | null, PiNativeError> {
         if (item.type === "synchronized") return { kind: "synchronized" };
         if (item.type === "snapshot") {
@@ -814,6 +810,12 @@ export class PiExternalThreadSource extends Context.Service<
             snapshot: yield* projectSupervisorSnapshot(record, runtime),
           };
         }
+        if (snapshotSubagentEvent) {
+          return {
+            kind: "snapshot",
+            snapshot: yield* projectSupervisorSnapshot(record, runtime, retainedSubagentEvents),
+          };
+        }
         const eventRuntime = {
           ...runtime,
           sequence: item.sequence,
@@ -832,6 +834,7 @@ export class PiExternalThreadSource extends Context.Service<
         let liveTurnId: TurnId | undefined;
         let liveUserEvent: SupervisorStreamEvent | undefined;
         let projectedThrough = -1;
+        const subagentTracker = new PiSubagentStreamTracker();
         // Common thread cursors do not carry a runtime generation. A fresh
         // supervisor snapshot prevents a replacement runtime from interpreting
         // the prior runtime's numeric sequence as its own.
@@ -842,6 +845,7 @@ export class PiExternalThreadSource extends Context.Service<
             if (item.type === "entries" || item.type === "exited") {
               liveUserEvent = undefined;
               liveTurnId = undefined;
+              subagentTracker.clear();
             }
             if (
               item.type === "event" &&
@@ -859,6 +863,7 @@ export class PiExternalThreadSource extends Context.Service<
               return Effect.succeed(null);
             }
             if (item.type === "snapshot") {
+              subagentTracker.reset(item.events);
               liveUserEvent = item.events.findLast(
                 (event) => supervisorEventType(event) === "message_start",
               );
@@ -870,7 +875,22 @@ export class PiExternalThreadSource extends Context.Service<
               liveUserEvent = item;
               liveTurnId = TurnIdSchema.make(`${record.sessionId}:live-user:${item.eventId}`);
             }
-            return projectRuntimeItem(record, runtime, item, liveTurnId, liveUserEvent).pipe(
+            let snapshotSubagentEvent = false;
+            let retainedSubagentEvents: ReadonlyArray<SupervisorStreamEvent> = [];
+            if (item.type === "event") {
+              const decision = subagentTracker.observe(item);
+              snapshotSubagentEvent = decision.snapshot;
+              retainedSubagentEvents = decision.retainedEvents;
+            }
+            return projectRuntimeItem(
+              record,
+              runtime,
+              item,
+              liveTurnId,
+              liveUserEvent,
+              snapshotSubagentEvent,
+              retainedSubagentEvents,
+            ).pipe(
               Effect.tap((projected) =>
                 Effect.sync(() => {
                   if (projected?.kind === "snapshot") {

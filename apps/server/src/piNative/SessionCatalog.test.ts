@@ -294,7 +294,7 @@ describe("SessionCatalog", () => {
       (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),
   );
-  it.effect("resolves Pi parent session paths to parent thread ids", () =>
+  it.effect("catalogs Pi forks as independent threads", () =>
     Effect.acquireUseRelease(
       Effect.tryPromise(() => NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-"))),
       (root) =>
@@ -322,8 +322,9 @@ describe("SessionCatalog", () => {
           const listed = yield* makeSessionCatalog({ root }).list();
           const parent = listed.find((record) => record.sessionId === "parent");
           const child = listed.find((record) => record.sessionId === "child");
-          expect(child?.parentThreadId).toBe(parent?.threadId);
-          expect(child?.parentSessionFile).toBe(parent?.canonicalFile);
+          expect(parent?.threadId).toBeDefined();
+          expect(child?.threadId).toBeDefined();
+          expect(child?.threadId).not.toBe(parent?.threadId);
         }),
       (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
     ),

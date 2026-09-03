@@ -11,6 +11,7 @@ import type {
   OrchestrationThreadDetailSnapshot,
   OrchestrationThreadShell,
   ProjectId,
+  RuntimeTaskId,
   TurnId,
 } from "@t3tools/contracts";
 import {
@@ -22,6 +23,12 @@ import {
 
 import type { PiSessionCatalogRecord } from "./SessionCatalog.ts";
 import type { SupervisorRuntimeState, SupervisorStreamEvent } from "./SupervisorProtocol.ts";
+import {
+  parsePiSubagent,
+  piSubagentCompletionStatus,
+  piSubagentTaskId,
+  type PiSubagentMetadata,
+} from "../provider/pi/PiSubagent.ts";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 
@@ -173,7 +180,6 @@ export function projectPiBacking(
   return {
     ...backingFor(runtime, catalogResumeSupported),
     sourceKey: record.sourceKey,
-    ...(record.parentThreadId === undefined ? {} : { parentThreadId: record.parentThreadId }),
   };
 }
 
@@ -182,8 +188,11 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
   const path = trimmedString(args.path) ?? trimmedString(args.file_path);
   const command = trimmedString(args.command) ?? trimmedString(args.cmd);
   const rawOutput = toolOutput(output);
-  const title =
-    normalized === "bash"
+  const outputRecord = isRecord(output) ? output : undefined;
+  const subagent = parsePiSubagent(args, outputRecord);
+  const title = subagent
+    ? `${subagent.role.charAt(0).toUpperCase()}${subagent.role.slice(1)} agent`
+    : normalized === "bash"
       ? "Ran command"
       : normalized === "read"
         ? "Read file"
@@ -198,8 +207,9 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
                 : normalized === "ls"
                   ? "Listed directory"
                   : toolName;
-  const detail =
-    normalized === "grep"
+  const detail = subagent
+    ? subagent.title
+    : normalized === "grep"
       ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? trimmedString(args.glob) ?? "."}`
       : normalized === "find"
         ? `${trimmedString(args.filePattern) ?? trimmedString(args.pattern) ?? "files"} in ${path ?? "."}`
@@ -210,8 +220,9 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
     (normalized === "write" || normalized === "edit") && path ? [{ path }] : undefined;
 
   return {
-    itemType:
-      normalized === "bash"
+    itemType: subagent
+      ? "collab_agent_tool_call"
+      : normalized === "bash"
         ? "command_execution"
         : normalized === "write" || normalized === "edit"
           ? "file_change"
@@ -237,6 +248,75 @@ function toolPresentation(toolName: string, args: JsonRecord, output?: unknown) 
       },
     },
   };
+}
+
+const subagentLinkage = (metadata: PiSubagentMetadata, toolUseId: string) => ({
+  taskType: "local_agent",
+  agentKind: "agent",
+  title: metadata.title,
+  role: metadata.role,
+  toolUseId,
+  ...(metadata.model ? { model: metadata.model } : {}),
+});
+
+function subagentCompletionPresentation(
+  metadata: PiSubagentMetadata,
+  isError: boolean,
+): {
+  readonly status: "completed" | "failed" | "stopped";
+  readonly tone: "info" | "error";
+  readonly summary: string;
+} {
+  const status = piSubagentCompletionStatus(metadata, isError);
+  return status === "failed"
+    ? { status, tone: "error", summary: "Sub-agent failed" }
+    : status === "stopped"
+      ? { status, tone: "info", summary: "Sub-agent stopped" }
+      : { status, tone: "info", summary: "Sub-agent completed" };
+}
+
+function projectedSubagentActivities(input: {
+  readonly record: PiSessionCatalogRecord;
+  readonly toolCallId: string;
+  readonly turnId: TurnId | null;
+  readonly startedAt: string;
+  readonly completedAt: string;
+  readonly metadata: PiSubagentMetadata;
+  readonly isError: boolean;
+}): ReadonlyArray<OrchestrationThreadActivity> {
+  const taskId = piSubagentTaskId(input.record.sessionId, input.toolCallId);
+  const linkage = subagentLinkage(input.metadata, input.toolCallId);
+  const completion = subagentCompletionPresentation(input.metadata, input.isError);
+  return [
+    {
+      id: activityId(input.record, `task:${input.toolCallId}:started`),
+      tone: "info",
+      kind: "task.started",
+      summary: "Sub-agent started",
+      payload: {
+        taskId,
+        detail: input.metadata.title,
+        ...linkage,
+      },
+      turnId: input.turnId,
+      createdAt: input.startedAt,
+    },
+    {
+      id: activityId(input.record, `task:${input.toolCallId}:completed`),
+      tone: completion.tone,
+      kind: "task.completed",
+      summary: completion.summary,
+      payload: {
+        taskId,
+        status: completion.status,
+        ...linkage,
+        ...(input.metadata.summary ? { summary: input.metadata.summary } : {}),
+        ...(input.metadata.typedUsage ? { typedUsage: input.metadata.typedUsage } : {}),
+      },
+      turnId: input.turnId,
+      createdAt: input.completedAt,
+    },
+  ];
 }
 
 function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<JsonRecord>) {
@@ -340,6 +420,7 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
       const priorData = isRecord(priorPayload?.data) ? priorPayload.data : undefined;
       const priorArgs = isRecord(priorData?.rawInput) ? priorData.rawInput : {};
       const presentation = toolPresentation(message.toolName, priorArgs, message);
+      const metadata = parsePiSubagent(priorArgs, message);
       const completed: OrchestrationThreadActivity = {
         id: prior?.id ?? activityId(record, `tool:${message.toolCallId}`),
         tone: message.isError === true ? "error" : "tool",
@@ -355,6 +436,19 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
       };
       if (index === undefined) activities.push(completed);
       else activities[index] = completed;
+      if (metadata) {
+        activities.push(
+          ...projectedSubagentActivities({
+            record,
+            toolCallId: message.toolCallId,
+            turnId: prior?.turnId ?? currentTurnId,
+            startedAt: prior?.createdAt ?? createdAt,
+            completedAt: createdAt,
+            metadata,
+            isError: message.isError === true,
+          }),
+        );
+      }
     }
     if (role === "bashExecution") {
       activities.push({
@@ -490,6 +584,8 @@ export function projectPiThreadOverlay(
   const session = snapshot.thread.session;
   let liveSessionTurnId: TurnId | null = null;
   let activeTurnId = snapshot.thread.latestTurn?.turnId ?? null;
+  const subagentMetadataByToolCallId = new Map<string, PiSubagentMetadata>();
+  const subagentTaskIdByToolCallId = new Map<string, RuntimeTaskId>();
   for (const item of events) {
     const payload = livePayload(item.event);
     if (!payload?.type) continue;
@@ -585,15 +681,18 @@ export function projectPiThreadOverlay(
           ? payload.data.toolCallId
           : `sequence-${item.sequence}`;
       const toolName = typeof payload.data.toolName === "string" ? payload.data.toolName : "tool";
-      const args = isRecord(payload.data.args) ? payload.data.args : {};
-      const presentation = toolPresentation(
-        toolName,
-        args,
-        payload.data.result ?? payload.data.partialResult,
-      );
-      const completed = payload.type === "tool_execution_end";
       const id = activityId(record, `tool:${toolCallId}`);
       const prior = activities.find((activity) => activity.id === id);
+      const priorPayload = isRecord(prior?.payload) ? prior.payload : undefined;
+      const priorData = isRecord(priorPayload?.data) ? priorPayload.data : undefined;
+      const priorArgs = isRecord(priorData?.rawInput) ? priorData.rawInput : {};
+      const args = isRecord(payload.data.args) ? payload.data.args : priorArgs;
+      const output = payload.data.result ?? payload.data.partialResult;
+      const presentation = toolPresentation(toolName, args, output);
+      const parsedMetadata = parsePiSubagent(args, isRecord(output) ? output : undefined);
+      if (parsedMetadata) subagentMetadataByToolCallId.set(toolCallId, parsedMetadata);
+      const metadata = parsedMetadata ?? subagentMetadataByToolCallId.get(toolCallId);
+      const completed = payload.type === "tool_execution_end";
       const activity: OrchestrationThreadActivity = {
         id,
         tone: payload.data.isError === true ? "error" : "tool",
@@ -617,6 +716,66 @@ export function projectPiThreadOverlay(
         createdAt: prior?.createdAt ?? occurredAt,
       };
       activities = [...activities.filter((candidate) => candidate.id !== id), activity];
+      if (metadata) {
+        const taskId =
+          subagentTaskIdByToolCallId.get(toolCallId) ??
+          piSubagentTaskId(record.sessionId, toolCallId);
+        subagentTaskIdByToolCallId.set(toolCallId, taskId);
+        const linkage = subagentLinkage(metadata, toolCallId);
+        const startedId = activityId(record, `task:${toolCallId}:started`);
+        if (!activities.some((candidate) => candidate.id === startedId)) {
+          activities.push({
+            id: startedId,
+            tone: "info",
+            kind: "task.started",
+            summary: "Sub-agent started",
+            payload: { taskId, detail: metadata.title, ...linkage },
+            turnId: activeTurnId,
+            sequence: item.sequence,
+            createdAt: prior?.createdAt ?? occurredAt,
+          });
+        }
+        const completion = subagentCompletionPresentation(metadata, payload.data.isError === true);
+        const taskActivity: OrchestrationThreadActivity = completed
+          ? {
+              id: activityId(record, `task:${toolCallId}:completed`),
+              tone: completion.tone,
+              kind: "task.completed",
+              summary: completion.summary,
+              payload: {
+                taskId,
+                status: completion.status,
+                ...linkage,
+                ...(metadata.summary ? { summary: metadata.summary } : {}),
+                ...(metadata.typedUsage ? { typedUsage: metadata.typedUsage } : {}),
+              },
+              turnId: activeTurnId,
+              sequence: item.sequence,
+              createdAt: occurredAt,
+            }
+          : {
+              id: activityId(record, `task:${toolCallId}:progress`),
+              tone: metadata.status === "failed" ? "error" : "info",
+              kind: "task.progress",
+              summary: metadata.progress ?? metadata.title,
+              payload: {
+                taskId,
+                detail: metadata.progress ?? metadata.title,
+                ...linkage,
+                ...(metadata.progress ? { summary: metadata.progress } : {}),
+                ...(metadata.typedUsage ? { typedUsage: metadata.typedUsage } : {}),
+                ...(metadata.status ? { status: metadata.status } : {}),
+                ...(metadata.error ? { error: metadata.error } : {}),
+              },
+              turnId: activeTurnId,
+              sequence: item.sequence,
+              createdAt: occurredAt,
+            };
+        activities = [
+          ...activities.filter((candidate) => candidate.id !== taskActivity.id),
+          taskActivity,
+        ];
+      }
     }
   }
   return {
@@ -714,6 +873,21 @@ function livePayload(event: unknown) {
     data: event,
   };
 }
+
+export function isPiSubagentLiveEvent(event: unknown): boolean {
+  const payload = livePayload(event);
+  if (!payload?.type || !payload.type.startsWith("tool_execution_")) return false;
+  const args = isRecord(payload.data.args) ? payload.data.args : {};
+  const output = payload.data.result ?? payload.data.partialResult;
+  return parsePiSubagent(args, isRecord(output) ? output : undefined) !== undefined;
+}
+
+export function piLiveToolCallId(event: unknown): string | undefined {
+  const payload = livePayload(event);
+  if (!payload?.type || !payload.type.startsWith("tool_execution_")) return undefined;
+  return typeof payload.data.toolCallId === "string" ? payload.data.toolCallId : undefined;
+}
+
 function liveUserMessage(payload: NonNullable<ReturnType<typeof livePayload>>) {
   const message = isRecord(payload.data.message)
     ? payload.data.message
@@ -806,7 +980,36 @@ export function projectPiLiveEvent(input: {
     const args = isRecord(payload.data.args) ? payload.data.args : {};
     const output = payload.data.result ?? payload.data.partialResult;
     const presentation = toolPresentation(toolName, args, output);
+    const metadata = parsePiSubagent(args, isRecord(output) ? output : undefined);
     const completed = payload.type === "tool_execution_end";
+    if (metadata && !completed) {
+      const taskId = piSubagentTaskId(input.record.sessionId, toolCallId);
+      return {
+        ...base,
+        type: "thread.activity-appended",
+        payload: {
+          threadId: input.record.threadId,
+          activity: {
+            id: activityId(input.record, `task:${toolCallId}:progress`),
+            tone: metadata.status === "failed" ? "error" : "info",
+            kind: "task.progress",
+            summary: metadata.progress ?? metadata.title,
+            payload: {
+              taskId,
+              detail: metadata.progress ?? metadata.title,
+              ...subagentLinkage(metadata, toolCallId),
+              ...(metadata.progress ? { summary: metadata.progress } : {}),
+              ...(metadata.typedUsage ? { typedUsage: metadata.typedUsage } : {}),
+              ...(metadata.status ? { status: metadata.status } : {}),
+              ...(metadata.error ? { error: metadata.error } : {}),
+            },
+            turnId: input.activeTurnId,
+            sequence: input.item.sequence,
+            createdAt: occurredAt,
+          },
+        },
+      };
+    }
     return {
       ...base,
       type: "thread.activity-appended",

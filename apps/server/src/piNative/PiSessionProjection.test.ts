@@ -7,6 +7,7 @@ import { describe, expect } from "vite-plus/test";
 import { SqlitePersistenceMemory } from "../persistence/Layers/Sqlite.ts";
 import type { PiSessionCatalogRecord } from "./SessionCatalog.ts";
 import {
+  isPiSubagentLiveEvent,
   projectPiActiveBranch,
   projectPiBacking,
   projectPiLiveEvent,
@@ -236,6 +237,162 @@ describe("PiSessionProjection", () => {
       itemType: "file_change",
       data: { item: { changes: [{ path: "src/app.ts" }] } },
     });
+  });
+
+  it("projects historical Pi sub-agents into native task activities", () => {
+    const subagentEntries = [
+      {
+        type: "message",
+        id: "user",
+        parentId: null,
+        timestamp: "2026-07-30T00:00:01.000Z",
+        message: { role: "user", content: "delegate this" },
+      },
+      {
+        type: "message",
+        id: "assistant",
+        parentId: "user",
+        timestamp: "2026-07-30T00:00:02.000Z",
+        message: {
+          role: "assistant",
+          content: [
+            {
+              type: "toolCall",
+              id: "delegate-1",
+              name: "delegate",
+              arguments: { description: "Audit auth" },
+            },
+          ],
+        },
+      },
+      {
+        type: "message",
+        id: "result",
+        parentId: "assistant",
+        timestamp: "2026-07-30T00:00:03.000Z",
+        message: {
+          role: "toolResult",
+          toolCallId: "delegate-1",
+          toolName: "delegate",
+          content: [{ type: "text", text: "Found the issue" }],
+          details: {
+            agent: "delegate",
+            task: "Audit auth",
+            sessionId: "child-session",
+            output: "Found the issue",
+            lifecycle: { status: "succeeded" },
+            usage: { input: 8, output: 3, cacheRead: 2, cacheWrite: 0 },
+          },
+          isError: false,
+        },
+      },
+    ];
+
+    const snapshot = projectPiThread({
+      record,
+      entries: subagentEntries,
+      projectId: ProjectId.make("project-1"),
+    });
+    expect(snapshot.thread.activities.map((activity) => activity.kind)).toEqual([
+      "item.completed",
+      "task.started",
+      "task.completed",
+    ]);
+    expect(snapshot.thread.activities.at(-1)).toMatchObject({
+      tone: "info",
+      summary: "Sub-agent completed",
+      payload: {
+        taskId: "pi-agent:session-1:delegate-1",
+        status: "completed",
+        taskType: "local_agent",
+        agentKind: "agent",
+        toolUseId: "delegate-1",
+        role: "delegate",
+        summary: "Found the issue",
+        typedUsage: {
+          totalTokens: 13,
+          inputTokens: 8,
+          cachedInputTokens: 2,
+          outputTokens: 3,
+        },
+      },
+    });
+  });
+
+  it("projects live Pi sub-agent progress and cancellation without replacing its tool row", () => {
+    const snapshot = projectPiThread({
+      record,
+      entries,
+      projectId: ProjectId.make("project-1"),
+    });
+    const events = [
+      {
+        type: "event",
+        sequence: 9,
+        eventId: "runtime:9",
+        event: {
+          type: "tool_execution_start",
+          toolCallId: "delegate-live",
+          toolName: "delegate",
+          args: { description: "Audit live auth" },
+        },
+      },
+      {
+        type: "event",
+        sequence: 10,
+        eventId: "runtime:10",
+        event: {
+          type: "tool_execution_update",
+          toolCallId: "delegate-live",
+          toolName: "delegate",
+          partialResult: {
+            content: [{ type: "text", text: "Inspecting routes" }],
+            details: {
+              agent: "delegate",
+              task: "Audit live auth",
+              sessionId: "live-child",
+              lifecycle: { status: "cancelled" },
+            },
+          },
+        },
+      },
+      {
+        type: "event",
+        sequence: 11,
+        eventId: "runtime:11",
+        event: {
+          type: "tool_execution_end",
+          toolCallId: "delegate-live",
+          toolName: "delegate",
+          result: {
+            content: [{ type: "text", text: "Cancelled" }],
+          },
+          isError: true,
+        },
+      },
+    ] as const;
+    const projected = projectPiThreadOverlay(snapshot, record, events as never);
+    const liveActivities = projected.thread.activities.filter((activity) =>
+      String(activity.id).includes("delegate-live"),
+    );
+
+    expect(liveActivities.map((activity) => activity.kind)).toEqual([
+      "task.started",
+      "task.progress",
+      "item.completed",
+      "task.completed",
+    ]);
+    expect(liveActivities.at(-1)).toMatchObject({
+      tone: "info",
+      summary: "Sub-agent stopped",
+      payload: {
+        taskId: "pi-agent:session-1:delegate-live",
+        status: "stopped",
+        toolUseId: "delegate-live",
+      },
+    });
+    expect(isPiSubagentLiveEvent(events[1]?.event)).toBe(true);
+    expect(isPiSubagentLiveEvent(events[2]?.event)).toBe(false);
   });
 
   it("projects a persisted external lifecycle override", () => {

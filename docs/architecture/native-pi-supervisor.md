@@ -163,6 +163,8 @@ historical projection:
 - exclude abandoned branches
 - map user and assistant entries to existing message models
 - map tool calls and results to existing activity payloads
+- map agent-backed tool results to native `task.started` and `task.completed`
+  activities for the shared agents panel
 - derive title, model, timestamps, and settled state from pi entries
 - preserve explicit truncation metadata when a configured history ceiling is
   reached
@@ -172,6 +174,8 @@ live projection:
 - jsonl plus a bounded in-progress overlay forms the authoritative snapshot
 - one stable assistant message id receives streaming deltas
 - tool lifecycle maps to existing activity stream items
+- agent-backed tool overlays add native task progress and completion alongside
+  the ordinary tool row
 - `agent_start` and `agent_settled` map to existing session state
 - queue updates map to pending composer intent state, not persisted timeline
   history

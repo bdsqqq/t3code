@@ -7,6 +7,7 @@ import {
   type ProviderRuntimeEvent,
   type ProviderSession,
   RuntimeItemId,
+  RuntimeTaskId,
   type ThreadId,
   TurnId,
 } from "@t3tools/contracts";
@@ -37,6 +38,12 @@ import {
   type ProviderAdapterError,
 } from "../Errors.ts";
 import { decodePiModelSlug } from "../pi/PiModel.ts";
+import {
+  parsePiSubagent,
+  piSubagentCompletionStatus,
+  piSubagentTaskId,
+  type PiSubagentMetadata,
+} from "../pi/PiSubagent.ts";
 import {
   makePiRpcClient,
   type PiRpcClient,
@@ -80,6 +87,8 @@ interface ActiveTurn {
   readonly reasoningItemId: RuntimeItemId;
   readonly toolItemIds: Map<string, RuntimeItemId>;
   readonly toolArgs: Map<string, Record<string, unknown>>;
+  readonly activeSubagents: Map<RuntimeTaskId, PiSubagentMetadata>;
+  readonly subagentTaskIds: Map<string, RuntimeTaskId>;
   assistantText: string;
   assistantStarted: boolean;
   reasoningStarted: boolean;
@@ -135,39 +144,13 @@ const piToolCommand = (args: Record<string, unknown>): string | undefined =>
  * Pi's agent-backed extensions share `details.agent` and `details.task`.
  * Classifying that result metadata keeps new agents working without a T3 tool-name allowlist.
  */
-const piSubagentPresentation = (
-  args: Record<string, unknown>,
-  output: Record<string, unknown> | undefined,
-) => {
-  const outputDetails = isRecord(output?.details) ? output.details : undefined;
-  const agent = trimmedString(outputDetails?.agent);
-  if (!agent) return undefined;
-  const label = agent.replace(/[_-]+/gu, " ");
-  const detail =
-    trimmedString(outputDetails?.task) ??
-    trimmedString(args.description) ??
-    trimmedString(args.task) ??
-    trimmedString(args.query) ??
-    trimmedString(args.objective) ??
-    trimmedString(args.goal) ??
-    trimmedString(args.prompt) ??
-    trimmedString(args.diff_description) ??
-    trimmedString(args.name) ??
-    trimmedString(args.scriptPath);
-
-  return {
-    title: `${label.charAt(0).toUpperCase()}${label.slice(1)} agent`,
-    detail,
-  };
-};
-
 const piToolPresentation = (event: Record<string, unknown>) => {
   const toolName = string(event.toolName) ?? "tool";
   const normalizedName = toolName.toLowerCase();
   const args = isRecord(event.args) ? event.args : {};
   const output = event.result ?? event.partialResult;
   const outputRecord = isRecord(output) ? output : undefined;
-  const subagent = piSubagentPresentation(args, outputRecord);
+  const subagent = parsePiSubagent(args, outputRecord);
   const outputText = piToolText(output);
   const path = piToolPath(args);
   const toolCallId = string(event.toolCallId) ?? string(event.toolCallID);
@@ -179,7 +162,7 @@ const piToolPresentation = (event: Record<string, unknown>) => {
         ? ("file_change" as const)
         : ("dynamic_tool_call" as const);
   const title = subagent
-    ? subagent.title
+    ? `${subagent.role.charAt(0).toUpperCase()}${subagent.role.slice(1)} agent`
     : normalizedName === "bash"
       ? "Ran command"
       : normalizedName === "read"
@@ -196,7 +179,7 @@ const piToolPresentation = (event: Record<string, unknown>) => {
                   ? "Listed directory"
                   : toolName;
   const invocationDetail = subagent
-    ? subagent.detail
+    ? subagent.title
     : normalizedName === "grep"
       ? `${trimmedString(args.pattern) ? `/${trimmedString(args.pattern)}/` : "pattern"} in ${path ?? trimmedString(args.glob) ?? "."}`
       : normalizedName === "find"
@@ -302,6 +285,32 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
     method: isRecord(event) ? string(event.type) : undefined,
     payload: event,
   });
+  const taskLinkage = (metadata: PiSubagentMetadata, toolUseId: string) => ({
+    taskType: "local_agent" as const,
+    title: metadata.title,
+    role: metadata.role,
+    toolUseId,
+    ...(metadata.model ? { model: metadata.model } : {}),
+  });
+  const startSubagent = Effect.fn("PiAdapter.startSubagent")(function* (
+    ctx: SessionContext,
+    turn: ActiveTurn,
+    taskId: RuntimeTaskId,
+    toolUseId: string,
+    metadata: PiSubagentMetadata,
+  ) {
+    if (turn.activeSubagents.has(taskId)) return;
+    turn.activeSubagents.set(taskId, metadata);
+    yield* offer({
+      type: "task.started",
+      ...(yield* base(ctx, turn)),
+      payload: {
+        taskId,
+        description: metadata.title,
+        ...taskLinkage(metadata, toolUseId),
+      },
+    });
+  });
 
   const publishTerminal = Effect.fn("PiAdapter.publishTerminal")(function* (
     ctx: SessionContext,
@@ -315,6 +324,38 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
         if (ctx.activeTurn !== expected || expected.terminal) return false;
         expected.terminal = true;
         ctx.activeTurn = undefined;
+        const completedTaskIds = new Set<RuntimeTaskId>();
+        for (const [toolUseId, taskId] of expected.subagentTaskIds) {
+          if (completedTaskIds.has(taskId)) continue;
+          completedTaskIds.add(taskId);
+          const metadata = expected.activeSubagents.get(taskId);
+          if (!metadata) continue;
+          const completionStatus =
+            metadata.status === "completed"
+              ? "completed"
+              : metadata.status === "failed" || status === "error"
+                ? "failed"
+                : "stopped";
+          const completionSummary =
+            completionStatus === "failed"
+              ? "Pi stopped before the sub-agent completed."
+              : completionStatus === "completed"
+                ? metadata.summary
+                : "Sub-agent stopped with its parent turn.";
+          yield* offer({
+            type: "task.completed",
+            ...(yield* base(ctx, expected)),
+            payload: {
+              taskId,
+              status: completionStatus,
+              ...(completionSummary ? { summary: completionSummary } : {}),
+              ...taskLinkage(metadata, toolUseId),
+              ...(metadata.typedUsage ? { typedUsage: metadata.typedUsage } : {}),
+            },
+          });
+        }
+        expected.activeSubagents.clear();
+        expected.subagentTaskIds.clear();
         yield* Effect.forEach(terminalEvents, offer, { discard: true });
         const { activeTurnId: _, ...session } = ctx.session;
         ctx.session = {
@@ -462,8 +503,6 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
       // pi's partial result is a cumulative snapshot, not a delta. persisting
       // every snapshot duplicates all prior output and can outrun the serial
       // ingestion worker; start/end preserve lifecycle and final output.
-      if (type === "tool_execution_update") return;
-      const lifecycle = type === "tool_execution_start" ? "item.started" : "item.completed";
       const itemId = yield* itemForTool(turn, event);
       const toolKey = toolEventKey(event);
       const eventArgs = isRecord(event.args) ? event.args : undefined;
@@ -472,6 +511,55 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
         eventArgs || !turn.toolArgs.has(toolKey)
           ? event
           : { ...event, args: turn.toolArgs.get(toolKey) };
+      const presentationArgs = isRecord(presentationEvent.args) ? presentationEvent.args : {};
+      const output = presentationEvent.result ?? presentationEvent.partialResult;
+      const metadata = parsePiSubagent(presentationArgs, isRecord(output) ? output : undefined);
+      const taskId =
+        turn.subagentTaskIds.get(toolKey) ?? piSubagentTaskId(ctx.cursor.sessionId, toolKey);
+      if (metadata) {
+        turn.subagentTaskIds.set(toolKey, taskId);
+        yield* startSubagent(ctx, turn, taskId, toolKey, metadata);
+      }
+      const activeMetadata = metadata ?? turn.activeSubagents.get(taskId);
+      if (type === "tool_execution_update") {
+        if (activeMetadata) {
+          turn.activeSubagents.set(taskId, activeMetadata);
+          yield* offer({
+            type: "task.progress",
+            ...(yield* base(ctx, turn)),
+            payload: {
+              taskId,
+              description: activeMetadata.title,
+              ...taskLinkage(activeMetadata, toolKey),
+              ...(activeMetadata.progress ? { summary: activeMetadata.progress } : {}),
+              ...(activeMetadata.typedUsage ? { typedUsage: activeMetadata.typedUsage } : {}),
+              ...(activeMetadata.status === "pending" || activeMetadata.status === "running"
+                ? { status: activeMetadata.status }
+                : {}),
+            },
+          });
+          if (
+            activeMetadata.status === "completed" ||
+            activeMetadata.status === "failed" ||
+            activeMetadata.status === "cancelled" ||
+            activeMetadata.status === "interrupted"
+          ) {
+            yield* offer({
+              type: "task.updated",
+              ...(yield* base(ctx, turn)),
+              payload: {
+                taskId,
+                status: activeMetadata.status,
+                description: activeMetadata.title,
+                ...taskLinkage(activeMetadata, toolKey),
+                ...(activeMetadata.error ? { error: activeMetadata.error } : {}),
+              },
+            });
+          }
+        }
+        return;
+      }
+      const lifecycle = type === "tool_execution_start" ? "item.started" : "item.completed";
       const isError = event.isError === true;
       yield* offer({
         type: lifecycle,
@@ -484,6 +572,22 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
         },
         raw: raw(native),
       } as ProviderRuntimeEvent);
+      if (activeMetadata && lifecycle === "item.completed") {
+        yield* offer({
+          type: "task.completed",
+          ...(yield* base(ctx, turn)),
+          payload: {
+            taskId,
+            status: piSubagentCompletionStatus(activeMetadata, isError),
+            ...taskLinkage(activeMetadata, toolKey),
+            ...(activeMetadata.summary ? { summary: activeMetadata.summary } : {}),
+            ...(activeMetadata.typedUsage ? { typedUsage: activeMetadata.typedUsage } : {}),
+          },
+          raw: raw(native),
+        });
+        turn.activeSubagents.delete(taskId);
+        turn.subagentTaskIds.delete(toolKey);
+      }
       return;
     }
     if (type === "agent_settled") {
@@ -796,6 +900,8 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
     reasoningItemId: RuntimeItemId.make(`pi-reasoning:${turnId}`),
     toolItemIds: new Map(),
     toolArgs: new Map(),
+    activeSubagents: new Map(),
+    subagentTaskIds: new Map(),
     assistantText: "",
     assistantStarted: false,
     reasoningStarted: false,
