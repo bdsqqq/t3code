@@ -3,7 +3,8 @@
  *
  * Each environment scans the provider CLIs' own on-disk session transcripts
  * (`~/.claude/projects/**\/*.jsonl`, `~/.codex/sessions/**\/*.jsonl`,
- * `~/.pi/agent/sessions/**\/*.jsonl`) rather than relying on T3 Code's own
+ * `~/.grok/sessions/**\/updates.jsonl`, `~/.pi/agent/sessions/**\/*.jsonl`)
+ * rather than relying on T3 Code's own
  * orchestration projections, so usage stays complete even for turns that were
  * never driven through T3 Code. This mirrors the approach `ccusage` takes.
  *
@@ -22,9 +23,18 @@ import { NonNegativeInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
  * client renders partial coverage when an environment reports an older version
  * rather than failing the whole page.
  */
-export const USAGE_CONTRACT_VERSION = 5 as const;
+export const USAGE_CONTRACT_VERSION = 6 as const;
 
-export const UsageProviderKind = Schema.Literals(["claude", "codex", "pi"]);
+/**
+ * Oldest {@link UsageSummary} version a current client will still merge.
+ *
+ * v4 contains Claude/Codex buckets without source attribution. The two v5
+ * lineages add either Grok or source-attributed Pi usage. Current clients can
+ * merge all of them while reserving v6 for the combined provider domain.
+ */
+export const USAGE_MERGE_COMPATIBLE_SINCE = 4 as const;
+
+export const UsageProviderKind = Schema.Literals(["claude", "codex", "grok", "pi"]);
 export type UsageProviderKind = typeof UsageProviderKind.Type;
 
 /**
@@ -82,10 +92,8 @@ export type UsageTokenTotals = typeof UsageTokenTotals.Type;
  */
 export const UsageBucket = Schema.Struct({
   /**
-   * Transcript root that contributed this bucket. This links the bucket to a
-   * {@link UsageSource}, allowing clients to deduplicate shared roots without
-   * dropping another root for the same provider. Optional on the wire so a
-   * current client can decode and reject older contract versions cleanly.
+   * Transcript root that contributed this bucket. Current servers always send
+   * it; optional decoding keeps v4 and both v5 lineages mergeable.
    */
   sourcePath: Schema.optional(TrimmedNonEmptyString),
   day: UsageDay,
@@ -101,7 +109,7 @@ export const UsageBucket = Schema.Struct({
    */
   cacheSavingsUsd: Schema.Number,
   costSource: UsageCostSource,
-  /** Distinct model responses, after de-duplication. */
+  /** Distinct billable provider records, after de-duplication. */
   records: NonNegativeInt,
   unpricedRecords: NonNegativeInt,
   /** Distinct transcript sessions that contributed to this cell. */

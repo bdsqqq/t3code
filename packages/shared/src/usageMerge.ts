@@ -6,12 +6,13 @@
  *
  * @module usageMerge
  */
-import type {
-  EnvironmentId,
-  UsageBucket,
-  UsageProviderKind,
-  UsageSourceFingerprint,
-  UsageSummary,
+import {
+  USAGE_MERGE_COMPATIBLE_SINCE,
+  type EnvironmentId,
+  type UsageBucket,
+  type UsageProviderKind,
+  type UsageSourceFingerprint,
+  type UsageSummary,
 } from "@t3tools/contracts";
 
 export interface EnvironmentUsage {
@@ -141,12 +142,14 @@ function ownedContribution(
   readonly sessionsByProvider: ReadonlyMap<UsageProviderKind, number>;
 } {
   const ownedSourceKeys = new Set<string>();
+  const ownedProviders = new Set<UsageProviderKind>();
   const sessionsByProvider = new Map<UsageProviderKind, number>();
   for (const source of environment.summary.sources) {
     if (source.status === "missing") continue;
     const key = fingerprintKey(source.fingerprint);
     if (ownerByFingerprint.get(key) === environment.environmentId) {
       const provider = source.fingerprint.provider;
+      ownedProviders.add(provider);
       ownedSourceKeys.add(`${provider}\u0000${source.fingerprint.resolvedHomePath}`);
       // Distinct within a directory. Summing per-bucket session counts instead
       // would count a session once per day and model it spans.
@@ -158,7 +161,11 @@ function ownedContribution(
   }
   return {
     buckets: environment.summary.buckets.filter((bucket) =>
-      ownedSourceKeys.has(`${bucket.provider}\u0000${bucket.sourcePath ?? ""}`),
+      // Legacy summaries had one root per provider and no sourcePath. Current
+      // summaries need path-level ownership because Pi can expose two roots.
+      bucket.sourcePath === undefined
+        ? ownedProviders.has(bucket.provider)
+        : ownedSourceKeys.has(`${bucket.provider}\u0000${bucket.sourcePath}`),
     ),
     sessionsByProvider,
   };
@@ -172,6 +179,10 @@ function bucketTokens(bucket: UsageBucket): number {
     bucket.totals.cacheCreationTokens +
     bucket.totals.outputTokens
   );
+}
+
+function isCompatibleContractVersion(version: number, expected: number): boolean {
+  return version >= USAGE_MERGE_COMPATIBLE_SINCE && version <= expected;
 }
 
 const EMPTY_MERGED: MergedUsage = {
@@ -203,8 +214,10 @@ const EMPTY_MERGED: MergedUsage = {
  * Merges every connected environment's summary.
  *
  * `expectedContractVersion` guards against an environment running older server
- * code: rather than blocking the page, its data is excluded and its id is
- * reported so the UI can say coverage is partial.
+ * code: rather than blocking the page, incompatible data is excluded and its
+ * id is reported so the UI can say coverage is partial. Versions in
+ * [{@link USAGE_MERGE_COMPATIBLE_SINCE}, expected] still merge, so an additive
+ * provider expansion does not drop Claude/Codex totals from older servers.
  */
 export function mergeUsage(
   environments: readonly EnvironmentUsage[],
@@ -215,7 +228,7 @@ export function mergeUsage(
   const current: EnvironmentUsage[] = [];
   const staleEnvironments: EnvironmentId[] = [];
   for (const environment of environments) {
-    if (environment.summary.contractVersion === expectedContractVersion) {
+    if (isCompatibleContractVersion(environment.summary.contractVersion, expectedContractVersion)) {
       current.push(environment);
     } else {
       staleEnvironments.push(environment.environmentId);

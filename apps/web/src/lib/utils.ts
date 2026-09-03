@@ -16,8 +16,8 @@ export function isWindowsPlatform(platform: string): boolean {
   return /^win(dows)?/i.test(platform);
 }
 
-export function isLinuxPlatform(platform: string): boolean {
-  return /linux/i.test(platform);
+export function normalizeSearchText(value: string): string {
+  return value.normalize("NFKD").replace(/\p{M}/gu, "").toLowerCase().replace(/\s+/g, " ").trim();
 }
 
 export function getLocalFileManagerName(platform: string): string {
@@ -42,12 +42,12 @@ export function randomUUID(): string {
   return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
 
-export const newCommandId = (): CommandId => CommandId.make(randomUUID());
-
 export const newProjectId = (): ProjectId => ProjectId.make(randomUUID());
 
 export const newThreadId = (): ThreadId => ThreadId.make(randomUUID());
 
 export const newDraftId = (): DraftId => DraftId.make(randomUUID());
+
+export const newCommandId = (): CommandId => CommandId.make(randomUUID());
 
 export const newMessageId = (): MessageId => MessageId.make(randomUUID());

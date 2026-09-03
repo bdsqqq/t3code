@@ -5,7 +5,9 @@ import * as Cause from "effect/Cause";
 
 import {
   CommandId,
+  DEFAULT_PROVIDER_INTERACTION_MODE,
   MessageId,
+  PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
   type EnvironmentId,
   type ModelSelection,
   type ProviderInteractionMode,
@@ -25,10 +27,13 @@ import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
 
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
 import { uuidv4 } from "../lib/uuid";
+import { isModelSelectionUnavailable } from "../lib/modelOptions";
+import { resolveProviderInteractionMode } from "../features/threads/legacy-plan-mode";
 import {
   convertPastedImagesToAttachments,
   pasteComposerClipboard,
-  pickComposerImages,
+  pickComposerFiles,
+  pickComposerMedia,
 } from "../lib/composerImages";
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
@@ -44,6 +49,7 @@ import {
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   removeComposerDraftAttachment,
+  scheduleUnusedComposerAttachmentCleanup,
   setComposerDraftText,
   updateComposerDraftSettings,
   useComposerDraft,
@@ -51,15 +57,16 @@ import {
 import { setPendingConnectionError } from "../state/use-remote-environment-registry";
 import { useSelectedThreadDetail } from "../state/use-thread-detail";
 import { useThreadSelection } from "../state/use-thread-selection";
-import {
-  enqueueThreadOutboxMessage,
-  removeThreadOutboxMessage,
-  updateThreadOutboxMessage,
-} from "./thread-outbox";
+import { enqueueThreadOutboxMessage, updateThreadOutboxMessage } from "./thread-outbox";
+import { removeThreadOutboxMessage } from "./thread-outbox-removal";
 import { useThreadOutboxMessages } from "./use-thread-outbox";
 import { renewQueuedExternalResumeTakeover, threadComposerQueueCount } from "./thread-outbox-model";
 import { environmentThreadShells, threadEnvironment } from "./threads";
 import { useAtomCommand } from "./use-atom-command";
+import {
+  composerAttachmentUploadBlockReason,
+  composerAttachmentUploadsAtom,
+} from "./composer-attachment-uploads";
 
 function confirmExternalPiTakeover(): Promise<boolean> {
   return new Promise((resolve) => {
@@ -97,7 +104,14 @@ export function appendReviewCommentToDraft(input: {
     input.attachments &&
     input.attachments.length > 0
   ) {
-    appendComposerDraftAttachments(threadKey, input.attachments);
+    // Capped: a review comment is new content, not a send-failure restore, so
+    // it must not push the draft over the send limit. Overflow is released.
+    const rejectedCount = appendComposerDraftAttachments(threadKey, input.attachments);
+    if (rejectedCount > 0) {
+      setPendingConnectionError(
+        `${rejectedCount} comment attachment${rejectedCount === 1 ? " was" : "s were"} not added. Messages can contain at most ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} attachments.`,
+      );
+    }
   }
 }
 
@@ -177,7 +191,15 @@ export function useThreadComposerState() {
   ).length;
   const modelSelection = selectedDraft?.modelSelection ?? selectedThread?.modelSelection ?? null;
   const runtimeMode = selectedDraft?.runtimeMode ?? selectedThread?.runtimeMode ?? null;
-  const interactionMode = selectedDraft?.interactionMode ?? selectedThread?.interactionMode ?? null;
+  const selectedProvider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
+    (provider) => provider.instanceId === modelSelection?.instanceId,
+  );
+  const interactionMode = selectedThread
+    ? resolveProviderInteractionMode(
+        selectedProvider,
+        selectedDraft?.interactionMode ?? selectedThread.interactionMode,
+      )
+    : null;
 
   const selectedThreadSessionActivity = useMemo(() => {
     const selectedThread = selectedThreadDetail ?? selectedThreadShell;
@@ -213,28 +235,67 @@ export function useThreadComposerState() {
       const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
       const draft = getComposerDraftSnapshot(threadKey);
       const thread = selectedThreadDetail ?? selectedThreadShell;
-      if (!threadAllows(thread, "send")) {
-        return null;
-      }
       const text = draft.text.trim();
       const attachments = draft.attachments;
-      if (text.length === 0 && attachments.length === 0) {
+      if (!threadAllows(thread, "send")) {
         return null;
       }
       if (attachments.length > 0 && !threadAllows(thread, "attachments")) {
         return null;
       }
+      if (
+        composerAttachmentUploadBlockReason({
+          environmentId: selectedThreadShell.environmentId,
+          attachments,
+          connected: selectedEnvironmentRuntime?.connectionState === "connected",
+          serverConfig: selectedEnvironmentRuntime?.serverConfig ?? null,
+          states: appAtomRegistry.get(composerAttachmentUploadsAtom),
+        }) !== null
+      )
+        return null;
+      if (text.length === 0 && attachments.length === 0) {
+        return null;
+      }
+      // A send-failure restore appends with allowOverflow so it never drops the
+      // user's files, which can leave the draft over the cap. Sending it anyway
+      // would enqueue a message that outbox recovery rejects forever, so block
+      // here until the user removes attachments.
+      if (attachments.length > PROVIDER_SEND_TURN_MAX_ATTACHMENTS) {
+        Alert.alert(
+          "Too many attachments",
+          `Remove attachments until there are at most ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS}.`,
+        );
+        return null;
+      }
 
+      const modelSelection = draft.modelSelection ?? thread.modelSelection;
+      const serverConfig = selectedEnvironmentRuntime?.serverConfig;
+      if (
+        selectedEnvironmentRuntime?.connectionState === "connected" &&
+        isModelSelectionUnavailable(serverConfig, modelSelection)
+      ) {
+        Alert.alert(
+          "Antigravity model unavailable",
+          "Open model settings to finish setup or choose another model.",
+        );
+        return null;
+      }
+      const provider = serverConfig?.providers.find(
+        (entry) => entry.instanceId === modelSelection.instanceId,
+      );
       const isResumableExternalThread =
         thread.backing?.kind === "external" && thread.backing.control === "resumable";
       if (isResumableExternalThread && !(await confirmExternalPiTakeover())) {
         return null;
       }
       const externalResume = isResumableExternalThread ? ("takeover" as const) : undefined;
-
-      const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
-        (entry) => entry.instanceId === thread.modelSelection.instanceId,
-      );
+      const streamingBehavior =
+        thread.backing?.kind === "external" && thread.session?.status === "running"
+          ? (requestedBehavior ?? "steer")
+          : undefined;
+      if (streamingBehavior !== undefined && !threadAllows(thread, streamingBehavior)) {
+        return null;
+      }
       const feedbackCommand =
         attachments.length === 0 &&
         (provider?.driver === "codex" || thread.session?.providerName === "codex")
@@ -298,13 +359,11 @@ export function useThreadComposerState() {
 
       const metadata = makeQueuedMessageMetadata();
       const messageId = MessageId.make(metadata.messageId);
-      const streamingBehavior =
-        thread.backing?.kind === "external" && thread.session?.status === "running"
-          ? (requestedBehavior ?? "steer")
-          : undefined;
-      if (streamingBehavior !== undefined && !threadAllows(thread, streamingBehavior)) {
-        return null;
-      }
+      // Enqueue publishes the queued atom synchronously (the durable write
+      // happens behind it), so clearing the draft here gives send feedback on
+      // the tap frame instead of after file I/O. If the write fails the message
+      // is rolled out of the queue and the content is merged back into the
+      // draft, preserving anything typed since.
       const enqueuePromise = enqueueThreadOutboxMessage({
         environmentId: selectedThreadShell.environmentId,
         threadId: selectedThreadShell.id,
@@ -312,25 +371,41 @@ export function useThreadComposerState() {
         commandId: CommandId.make(metadata.commandId),
         text,
         attachments,
-        modelSelection: draft.modelSelection ?? thread.modelSelection,
+        modelSelection,
         runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
-        interactionMode: draft.interactionMode ?? thread.interactionMode,
+        interactionMode: resolveProviderInteractionMode(
+          provider,
+          draft.interactionMode ?? thread.interactionMode,
+        ),
         ...(streamingBehavior === undefined ? {} : { streamingBehavior }),
         ...(externalResume === undefined ? {} : { externalResume }),
         createdAt: metadata.createdAt,
       });
-      clearComposerDraftContent(threadKey);
-      enqueuePromise.catch((error: unknown) => {
-        void mergeComposerDraftContent(threadKey, { text, attachments: [] });
-        appendComposerDraftAttachments(threadKey, attachments);
-        setPendingConnectionError(
-          error instanceof Error ? error.message : "Failed to save the queued message.",
-        );
-      });
+      clearComposerDraftContent(threadKey, { deferAttachmentCleanup: true });
+      enqueuePromise.then(
+        () => {
+          // The queued message owns the files now; the sweep sees that and
+          // spares them. Deferred to here so a failed write cannot roll the
+          // message out of the queue mid-sweep and lose the bytes.
+          scheduleUnusedComposerAttachmentCleanup(attachments);
+        },
+        (error: unknown) => {
+          // Restore text via merge (idempotent) but attachments via the uncapped
+          // append: the merge path slots existing attachments first and truncates
+          // at the send limit, which would silently drop this message's images if
+          // the user attached new ones while the write was in flight.
+          void mergeComposerDraftContent(threadKey, { text, attachments: [] });
+          appendComposerDraftAttachments(threadKey, attachments, { allowOverflow: true });
+          setPendingConnectionError(
+            error instanceof Error ? error.message : "Failed to save the queued message.",
+          );
+        },
+      );
       return messageId;
     },
     [
-      selectedEnvironmentRuntime?.serverConfig?.providers,
+      selectedEnvironmentRuntime?.connectionState,
+      selectedEnvironmentRuntime?.serverConfig,
       selectedThreadDetail,
       selectedThreadShell,
       uploadThreadFeedback,
@@ -349,22 +424,73 @@ export function useThreadComposerState() {
     [selectedThreadShell],
   );
 
-  const onPickDraftImages = useCallback(async () => {
+  const onPickDraftMedia = useCallback(async () => {
     if (!selectedThreadShell || !allowsAttachments) {
       return;
     }
 
     const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
-    const result = await pickComposerImages({
+    const capabilities = selectedEnvironmentRuntime?.serverConfig?.environment.capabilities;
+    const result = await pickComposerMedia({
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+      maxVideoBytes:
+        capabilities?.attachmentUploads === true
+          ? capabilities.fileAttachments?.maxUploadBytes
+          : undefined,
     });
-    if (result.images.length > 0) {
-      appendComposerDraftAttachments(threadKey, result.images);
+    const rejectedCount = appendComposerDraftAttachments(threadKey, result.attachments);
+    const problems = [
+      ...(result.error ? [result.error] : []),
+      ...(rejectedCount > 0
+        ? [`You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} attachments per message.`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      Alert.alert("Could not attach photo or video", problems.join("\n\n"));
     }
-    if (result.error) {
-      setPendingConnectionError(result.error);
+  }, [
+    allowsAttachments,
+    composerDrafts,
+    selectedEnvironmentRuntime?.serverConfig,
+    selectedThreadShell,
+  ]);
+
+  const onPickDraftFiles = useCallback(async () => {
+    if (!selectedThreadShell || !allowsAttachments) {
+      return;
     }
-  }, [allowsAttachments, composerDrafts, selectedThreadShell]);
+    const maxBytes =
+      selectedEnvironmentRuntime?.serverConfig?.environment.capabilities.fileAttachments
+        ?.maxUploadBytes;
+    if (maxBytes === undefined) {
+      Alert.alert("Could not attach file", "This server does not support file attachments.");
+      return;
+    }
+
+    const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+    // pickComposerFiles clamps the advertised limit to the contract maximum.
+    const result = await pickComposerFiles({
+      existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+      maxBytes,
+    });
+    const rejectedCount = appendComposerDraftAttachments(threadKey, result.files);
+    // The picker error and the live-cap rejection can both happen in one
+    // pick; report both in a single alert.
+    const problems = [
+      ...(result.error ? [result.error] : []),
+      ...(rejectedCount > 0
+        ? [`You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`]
+        : []),
+    ];
+    if (problems.length > 0) {
+      Alert.alert("Could not attach file", problems.join("\n\n"));
+    }
+  }, [
+    allowsAttachments,
+    composerDrafts,
+    selectedEnvironmentRuntime?.serverConfig,
+    selectedThreadShell,
+  ]);
 
   const onPasteIntoDraft = useCallback(async () => {
     if (!selectedThreadShell) {
@@ -375,14 +501,18 @@ export function useThreadComposerState() {
     const result = await pasteComposerClipboard({
       existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
     });
-    if (allowsAttachments && result.images.length > 0) {
-      appendComposerDraftAttachments(threadKey, result.images);
-    }
+    const rejectedPasteCount = allowsAttachments
+      ? appendComposerDraftAttachments(threadKey, result.images)
+      : 0;
     if (result.text) {
       appendComposerDraftText(threadKey, result.text);
     }
     if (result.error) {
       setPendingConnectionError(result.error);
+    } else if (rejectedPasteCount > 0) {
+      setPendingConnectionError(
+        `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
+      );
     }
   }, [allowsAttachments, composerDrafts, selectedThreadShell]);
 
@@ -424,6 +554,7 @@ export function useThreadComposerState() {
     },
     [selectedThreadShell],
   );
+
   const onDiscardIndeterminateMessages = useCallback(async () => {
     await Promise.all(
       selectedThreadQueuedMessages
@@ -431,6 +562,7 @@ export function useThreadComposerState() {
         .map((message) => removeThreadOutboxMessage(message)),
     );
   }, [selectedThreadQueuedMessages]);
+
   const onReviewQueuedExternalResumeMessages = useCallback(async () => {
     const messages = selectedThreadQueuedMessages.filter(
       (message) =>
@@ -462,9 +594,17 @@ export function useThreadComposerState() {
       if (!selectedThreadKey) {
         return;
       }
-      updateComposerDraftSettings(selectedThreadKey, { modelSelection: value });
+      const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
+        (candidate) => candidate.instanceId === value.instanceId,
+      );
+      updateComposerDraftSettings(selectedThreadKey, {
+        modelSelection: value,
+        ...(provider?.showInteractionModeToggle === false
+          ? { interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE }
+          : {}),
+      });
     },
-    [selectedThreadKey],
+    [selectedEnvironmentRuntime?.serverConfig, selectedThreadKey],
   );
 
   const onUpdateRuntimeMode = useCallback(
@@ -482,9 +622,17 @@ export function useThreadComposerState() {
       if (!selectedThreadKey) {
         return;
       }
-      updateComposerDraftSettings(selectedThreadKey, { interactionMode: value });
+      const modelSelection =
+        getComposerDraftSnapshot(selectedThreadKey).modelSelection ??
+        selectedThread?.modelSelection;
+      const provider = selectedEnvironmentRuntime?.serverConfig?.providers.find(
+        (candidate) => candidate.instanceId === modelSelection?.instanceId,
+      );
+      updateComposerDraftSettings(selectedThreadKey, {
+        interactionMode: resolveProviderInteractionMode(provider, value),
+      });
     },
-    [selectedThreadKey],
+    [selectedEnvironmentRuntime?.serverConfig, selectedThread?.modelSelection, selectedThreadKey],
   );
 
   return {
@@ -500,7 +648,8 @@ export function useThreadComposerState() {
     runtimeMode,
     interactionMode,
     onChangeDraftMessage,
-    onPickDraftImages,
+    onPickDraftMedia,
+    onPickDraftFiles,
     onPasteIntoDraft,
     onNativePasteImages,
     onRemoveDraftImage,

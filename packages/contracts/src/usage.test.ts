@@ -1,12 +1,16 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { UsageSummary } from "./usage.ts";
+import { USAGE_CONTRACT_VERSION, type UsageProviderKind, UsageSummary } from "./usage.ts";
 
 const decodeUsageSummary = Schema.decodeUnknownSync(UsageSummary);
 
-const summary = (provider: "codex" | "pi", sourcePath?: string) => ({
-  contractVersion: sourcePath === undefined ? 4 : 5,
+const summary = (
+  provider: UsageProviderKind,
+  sourcePath?: string,
+  contractVersion: number = USAGE_CONTRACT_VERSION,
+) => ({
+  contractVersion,
   readAt: "2026-08-24T22:00:00.000Z",
   timeZone: "UTC",
   sinceDay: "2026-08-24",
@@ -59,7 +63,9 @@ const summary = (provider: "codex" | "pi", sourcePath?: string) => ({
 
 describe("UsageSummary", () => {
   it("decodes a legacy v4 bucket before the client rejects its contract version", () => {
-    expect(decodeUsageSummary(summary("codex")).buckets[0]?.sourcePath).toBeUndefined();
+    expect(
+      decodeUsageSummary(summary("codex", undefined, 4)).buckets[0]?.sourcePath,
+    ).toBeUndefined();
   });
 
   it("decodes Pi buckets with source attribution", () => {
@@ -68,6 +74,15 @@ describe("UsageSummary", () => {
     expect(decoded.buckets[0]).toMatchObject({
       provider: "pi",
       sourcePath: "/home/test/.pi/agent/sessions",
+    });
+  });
+
+  it("decodes Grok buckets in the combined contract", () => {
+    const decoded = decodeUsageSummary(summary("grok", "/home/test/.grok/sessions"));
+
+    expect(decoded.buckets[0]).toMatchObject({
+      provider: "grok",
+      sourcePath: "/home/test/.grok/sessions",
     });
   });
 });

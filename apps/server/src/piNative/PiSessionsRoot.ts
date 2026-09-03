@@ -46,10 +46,12 @@ function readSettingsSessionDir(settingsPath: string): string | undefined {
   }
 }
 
-export const defaultPiSessionsRoot = () => {
-  const homeDir = NodeOS.homedir();
-  const cwd = process.cwd();
-  const environment = process.env;
+export const defaultPiSessionsRoot = (
+  options: Partial<Pick<PiSessionsRootOptions, "environment" | "homeDir" | "cwd">> = {},
+) => {
+  const homeDir = options.homeDir ?? NodeOS.homedir();
+  const cwd = options.cwd ?? process.cwd();
+  const environment = options.environment ?? process.env;
   const agentDir = resolvePiPath(
     environment.PI_CODING_AGENT_DIR ?? NodePath.join(homeDir, ".pi", "agent"),
     homeDir,

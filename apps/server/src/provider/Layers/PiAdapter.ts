@@ -1,5 +1,6 @@
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
+  type ChatImageAttachment,
   EventId,
   ProviderDriverKind,
   type ProviderInstanceId,
@@ -816,6 +817,11 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
             return yield* validation("sendTurn", "Managed Pi turns require a stable operation id.");
           if (!input.input && (!input.attachments || input.attachments.length === 0))
             return yield* validation("sendTurn", "Pi requires non-empty text or attachments.");
+          const imageAttachments = (input.attachments ?? []).filter(
+            (attachment): attachment is ChatImageAttachment => attachment.type === "image",
+          );
+          if (imageAttachments.length !== (input.attachments?.length ?? 0))
+            return yield* validation("sendTurn", "Pi only supports image attachments.");
           const selection = input.modelSelection;
           if (selection && selection.instanceId !== options.providerInstanceId)
             return yield* validation(
@@ -857,7 +863,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
                 threadId: input.threadId,
                 session: ctx.cursor,
                 message: input.input ?? "",
-                attachments: input.attachments ?? [],
+                attachments: imageAttachments,
                 model: { provider: parsed.provider, modelId: parsed.modelId },
                 thinkingLevel: thinking ?? null,
                 interactionMode: input.interactionMode ?? DEFAULT_PROVIDER_INTERACTION_MODE,
@@ -941,7 +947,7 @@ export const makePiAdapter = Effect.fn("makePiAdapter")(function* (options: PiAd
             });
 
           const materializedImages = yield* Effect.forEach(
-            input.attachments ?? [],
+            imageAttachments,
             (attachment) => {
               const attachmentPath = resolveAttachmentPath({
                 attachmentsDir: options.attachmentsDir,
