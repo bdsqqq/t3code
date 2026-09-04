@@ -7,6 +7,7 @@ import {
   ThreadId,
   type ClientOrchestrationCommand,
   type OrchestrationProjectShell,
+  type OrchestrationThreadStreamItem,
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
@@ -14,9 +15,11 @@ import * as Effect from "effect/Effect";
 import { describe, expect } from "vite-plus/test";
 
 import {
+  applyPiExternalAutoSettlement,
   boundExternalCatalog,
   catalogUpdateAfterRead,
   CatalogRuntimeAttachmentGate,
+  PiThreadStreamSequenceGate,
   PiSubagentStreamTracker,
   runtimeSnapshotAtSequence,
   runtimeSequenceStable,
@@ -27,6 +30,7 @@ import {
   shutdownCreatedRuntime,
   validExternalLifecycleOverride,
 } from "./PiExternalThreadSource.ts";
+import { projectPiThread } from "./PiSessionProjection.ts";
 import type { SupervisorRuntimeState, SupervisorStreamEvent } from "./SupervisorProtocol.ts";
 
 const takeoverRecord = {
@@ -186,6 +190,27 @@ describe("PiExternalThreadSource hardening", () => {
     expect(runtimeSequenceStable(current, { ...current })).toBe(true);
   });
 
+  it("drops catalog snapshots that race behind newer runtime items", () => {
+    const gate = new PiThreadStreamSequenceGate();
+    const snapshot = (snapshotSequence: number) =>
+      ({
+        kind: "snapshot",
+        snapshot: { snapshotSequence },
+      }) as unknown as OrchestrationThreadStreamItem;
+    const event = (sequence: number) =>
+      ({
+        kind: "event",
+        event: { sequence },
+      }) as unknown as OrchestrationThreadStreamItem;
+
+    expect(gate.allows(snapshot(5))).toBe(true);
+    expect(gate.allows(event(6))).toBe(true);
+    expect(gate.allows(snapshot(5))).toBe(false);
+    // Equal-sequence authoritative snapshots can still carry lifecycle
+    // changes while preserving the same supervisor overlay.
+    expect(gate.allows(snapshot(6))).toBe(true);
+  });
+
   it("stops catalog replacements after a runtime attaches", () => {
     const gate = new CatalogRuntimeAttachmentGate();
     expect(gate.allowsCatalogUpdate()).toBe(true);
@@ -276,6 +301,88 @@ describe("PiExternalThreadSource hardening", () => {
     );
     expect(runtimeCatalogSignature([{ ...runtime, status: "idle" }])).not.toBe(
       runtimeCatalogSignature([runtime]),
+    );
+  });
+
+  it("settles inactive Pi history using the configured inactivity window", () => {
+    const snapshot = projectPiThread({
+      record: {
+        ...takeoverRecord,
+        lastActivityAt: "2026-08-01T00:00:00.000Z",
+      },
+      entries: [],
+      projectId: ProjectId.make("project-1"),
+    });
+
+    expect(
+      applyPiExternalAutoSettlement({
+        snapshot,
+        now: "2026-08-06T00:00:00.000Z",
+        autoSettleAfterDays: 3,
+      }).thread,
+    ).toMatchObject({
+      settledOverride: "settled",
+      settledAt: "2026-08-01T00:00:00.000Z",
+    });
+    expect(
+      applyPiExternalAutoSettlement({
+        snapshot,
+        now: "2026-08-06T00:00:00.000Z",
+        autoSettleAfterDays: null,
+      }).thread.settledOverride,
+    ).toBeNull();
+  });
+
+  it("does not auto-settle active overrides or running Pi sessions", () => {
+    const record = {
+      ...takeoverRecord,
+      lastActivityAt: "2026-08-01T00:00:00.000Z",
+    };
+    const input = {
+      now: "2026-08-06T00:00:00.000Z",
+      autoSettleAfterDays: 3,
+    } as const;
+    const explicitlyActive = projectPiThread({
+      record,
+      entries: [],
+      projectId: ProjectId.make("project-1"),
+      lifecycle: {
+        override: "active",
+        updatedAt: "2026-08-05T00:00:00.000Z",
+      },
+    });
+    const running = projectPiThread({
+      record,
+      entries: [],
+      projectId: ProjectId.make("project-1"),
+      runtime: {
+        runtimeId: PiNativeRuntimeId.make("runtime-1"),
+        writerKind: "rpc",
+        status: "streaming",
+        sequence: 1,
+      },
+    });
+    const idle = projectPiThread({
+      record,
+      entries: [],
+      projectId: ProjectId.make("project-1"),
+      runtime: {
+        runtimeId: PiNativeRuntimeId.make("runtime-2"),
+        writerKind: "rpc",
+        status: "idle",
+        sequence: 1,
+      },
+    });
+
+    expect(
+      applyPiExternalAutoSettlement({ snapshot: explicitlyActive, ...input }).thread
+        .settledOverride,
+    ).toBe("active");
+    expect(
+      applyPiExternalAutoSettlement({ snapshot: running, ...input }).thread.settledOverride,
+    ).toBeNull();
+    expect(applyPiExternalAutoSettlement({ snapshot: idle, ...input }).thread.settledOverride).toBe(
+      "settled",
     );
   });
 

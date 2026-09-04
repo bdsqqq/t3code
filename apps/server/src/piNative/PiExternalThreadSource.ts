@@ -24,6 +24,7 @@ import type {
 } from "@t3tools/contracts";
 import {
   CommandId as CommandIdSchema,
+  DEFAULT_SERVER_SETTINGS,
   PiNativeError,
   PROVIDER_SEND_TURN_MAX_IMAGE_BYTES,
   ProjectId as ProjectIdSchema,
@@ -41,8 +42,10 @@ import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import { resolveAutoSettlementAt } from "../orchestration/ThreadSettlementPolicy.ts";
 import type { PiExternalLifecycleOverride } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
 import { PiExternalLifecycleOverrideRepository } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
+import { ServerSettingsService } from "../serverSettings.ts";
 import {
   defaultPiSessionsRoot,
   type PiSessionCatalogRecord,
@@ -88,6 +91,34 @@ export function validExternalLifecycleOverride(
   if (jsonl === undefined) return local;
   return Date.parse(local.updatedAt) >= Date.parse(jsonl.updatedAt) ? local : jsonl;
 }
+
+/**
+ * Imported Pi history has no orchestration aggregate to receive
+ * `thread.auto-settle`. Derive only the automatic state here; explicit
+ * settle/un-settle overrides still flow through the external lifecycle store.
+ */
+export function applyPiExternalAutoSettlement(input: {
+  readonly snapshot: OrchestrationThreadDetailSnapshot;
+  readonly now: string;
+  readonly autoSettleAfterDays: number | null;
+}): OrchestrationThreadDetailSnapshot {
+  const settledAt = resolveAutoSettlementAt({
+    thread: projectPiThreadShell(input.snapshot),
+    pullRequest: null,
+    now: input.now,
+    autoSettleAfterDays: input.autoSettleAfterDays,
+    autoSettleOnMerge: false,
+  });
+  if (settledAt === null) return input.snapshot;
+  return {
+    ...input.snapshot,
+    thread: {
+      ...input.snapshot.thread,
+      settledOverride: "settled",
+      settledAt,
+    },
+  };
+}
 export function shutdownCreatedRuntime(
   supervisor: Pick<SupervisorClient["Service"], "dispatch">,
   runtimeId: SupervisorRuntimeState["runtimeId"],
@@ -109,6 +140,20 @@ export class CatalogRuntimeAttachmentGate {
     return !this.#attached;
   }
 }
+
+export class PiThreadStreamSequenceGate {
+  #projectedThrough = -1;
+
+  allows(item: OrchestrationThreadStreamItem): boolean {
+    if (item.kind === "synchronized") return true;
+    const sequence =
+      item.kind === "snapshot" ? item.snapshot.snapshotSequence : item.event.sequence;
+    if (sequence < this.#projectedThrough) return false;
+    this.#projectedThrough = Math.max(this.#projectedThrough, sequence);
+    return true;
+  }
+}
+
 export function catalogUpdateAfterRead<T>(
   gate: CatalogRuntimeAttachmentGate,
   snapshot: T,
@@ -485,6 +530,9 @@ export class PiExternalThreadSource extends Context.Service<
       const supervisor = yield* SupervisorClient;
       const snapshots = yield* ProjectionSnapshotQuery;
       const lifecycleOverrides = yield* PiExternalLifecycleOverrideRepository;
+      const settingsService = Option.getOrUndefined(
+        yield* Effect.serviceOption(ServerSettingsService),
+      );
       const catalogBuildSemaphore = yield* Semaphore.make(1);
       let catalogSequence = 0;
       let catalogSignature = "";
@@ -507,6 +555,29 @@ export class PiExternalThreadSource extends Context.Service<
             privateSourceError("internal_shell", "Thread catalog access failed."),
           ),
         );
+
+      const currentSettings = (
+        settingsService?.getSettings ?? Effect.succeed(DEFAULT_SERVER_SETTINGS)
+      ).pipe(
+        Effect.mapError(() =>
+          privateSourceError(
+            "settings_unavailable",
+            "Thread settlement settings could not be loaded.",
+          ),
+        ),
+      );
+      const autoSettlementInput = Effect.fn("PiExternalThreadSource.autoSettlementInput")(
+        function* () {
+          const [settings, now] = yield* Effect.all([
+            currentSettings,
+            DateTime.now.pipe(Effect.map(DateTime.formatIso)),
+          ]);
+          return {
+            now,
+            autoSettleAfterDays: settings.sidebarAutoSettleAfterDays,
+          };
+        },
+      );
 
       const buildCatalogUnlocked = Effect.fn("PiExternalThreadSource.catalogSnapshot")(function* (
         refreshCatalog = true,
@@ -541,6 +612,7 @@ export class PiExternalThreadSource extends Context.Service<
           });
         }
         const association = cachedAssociation;
+        const autoSettlement = yield* autoSettlementInput();
         const lifecycleBySourceKey = new Map(
           (yield* lifecycleOverrides
             .list()
@@ -559,15 +631,18 @@ export class PiExternalThreadSource extends Context.Service<
             record,
             lifecycleBySourceKey.get(record.sourceKey),
           );
-          const detail = projectPiThread({
-            record,
-            entries: [],
-            projectId,
-            catalogResumeSupported,
-            ...(runtimeFor(record, runtimes) === undefined
-              ? {}
-              : { runtime: runtimeFor(record, runtimes)! }),
-            ...(lifecycle === undefined ? {} : { lifecycle }),
+          const detail = applyPiExternalAutoSettlement({
+            snapshot: projectPiThread({
+              record,
+              entries: [],
+              projectId,
+              catalogResumeSupported,
+              ...(runtimeFor(record, runtimes) === undefined
+                ? {}
+                : { runtime: runtimeFor(record, runtimes)! }),
+              ...(lifecycle === undefined ? {} : { lifecycle }),
+            }),
+            ...autoSettlement,
           });
           return projectPiThreadShell(detail);
         });
@@ -686,13 +761,16 @@ export class PiExternalThreadSource extends Context.Service<
               ),
           ),
         );
-        return projectPiThread({
-          record: result.record,
-          entries: entriesOverride ?? result.entries,
-          projectId: association.projectIdByThread.get(threadId)!,
-          catalogResumeSupported: yield* projectedGuardedResume,
-          ...(runtime === undefined ? {} : { runtime }),
-          ...(lifecycle === undefined ? {} : { lifecycle }),
+        return applyPiExternalAutoSettlement({
+          snapshot: projectPiThread({
+            record: result.record,
+            entries: entriesOverride ?? result.entries,
+            projectId: association.projectIdByThread.get(threadId)!,
+            catalogResumeSupported: yield* projectedGuardedResume,
+            ...(runtime === undefined ? {} : { runtime }),
+            ...(lifecycle === undefined ? {} : { lifecycle }),
+          }),
+          ...(yield* autoSettlementInput()),
         });
       });
 
@@ -981,7 +1059,7 @@ export class PiExternalThreadSource extends Context.Service<
               );
             }
             const snapshot = yield* buildCatalog(true);
-            yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+            yield* publishCatalogSnapshot(snapshot, true);
             yield* PubSub.publish(catalogInvalidations, undefined);
             yield* PubSub.publish(lifecycleInvalidations, command.threadId);
             return {
@@ -1027,7 +1105,7 @@ export class PiExternalThreadSource extends Context.Service<
               );
             }
             const snapshot = yield* buildCatalog(true);
-            yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+            yield* publishCatalogSnapshot(snapshot, true);
             yield* PubSub.publish(catalogInvalidations, undefined);
             yield* PubSub.publish(lifecycleInvalidations, command.threadId);
             return {
@@ -1111,7 +1189,7 @@ export class PiExternalThreadSource extends Context.Service<
           // Reconcile on replays too: the first attempt may have committed its
           // receipt before a disconnect prevented publication to subscribers.
           const snapshot = yield* buildCatalog(true);
-          yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+          yield* publishCatalogSnapshot(snapshot, true);
           yield* PubSub.publish(catalogInvalidations, undefined);
           yield* PubSub.publish(lifecycleInvalidations, command.threadId);
           return {
@@ -1218,7 +1296,12 @@ export class PiExternalThreadSource extends Context.Service<
         } satisfies DispatchResult;
       });
 
-      const initialCatalogSnapshot = yield* buildCatalog(true).pipe(
+      // Subscribe before the initial read so a settings change cannot land
+      // between the snapshot and the lazily started stream.
+      const settingsChanges =
+        settingsService === undefined ? Stream.empty : yield* settingsService.subscribeChanges;
+      let lastAutoSettleAfterDays = (yield* currentSettings).sidebarAutoSettleAfterDays;
+      const initialCatalogSnapshot: PiExternalCatalogSnapshot = yield* buildCatalog(true).pipe(
         Effect.catch(() =>
           DateTime.now.pipe(
             Effect.map(
@@ -1238,8 +1321,23 @@ export class PiExternalThreadSource extends Context.Service<
       const catalogSnapshots = yield* SubscriptionRef.make(initialCatalogSnapshot);
       const catalogInvalidations = yield* PubSub.sliding<void>(1);
       const lifecycleInvalidations = yield* PubSub.sliding<ThreadId>(16);
+      const catalogPublicationSemaphore = yield* Semaphore.make(1);
       yield* Effect.addFinalizer(() => PubSub.shutdown(catalogInvalidations));
       yield* Effect.addFinalizer(() => PubSub.shutdown(lifecycleInvalidations));
+      const publishCatalogSnapshot = Effect.fn("PiExternalThreadSource.publishCatalogSnapshot")(
+        function* (snapshot: PiExternalCatalogSnapshot, detailInvalidated = false) {
+          yield* catalogPublicationSemaphore.withPermit(
+            Effect.gen(function* () {
+              const current = yield* SubscriptionRef.get(catalogSnapshots);
+              if (snapshot.snapshotSequence <= current.snapshotSequence) return;
+              yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+              if (!detailInvalidated) {
+                yield* PubSub.publish(catalogInvalidations, undefined);
+              }
+            }),
+          );
+        },
+      );
       const runtimeStreamWithLifecycle = (
         record: PiSessionCatalogRecord,
         runtime: SupervisorRuntimeState,
@@ -1252,9 +1350,22 @@ export class PiExternalThreadSource extends Context.Service<
             snapshot,
           })),
         );
-        return Stream.merge(runtimeStream(record, runtime), lifecycleUpdates, {
-          haltStrategy: "left",
-        });
+        const catalogUpdates = Stream.fromPubSub(catalogInvalidations).pipe(
+          // Preserve the supervisor's in-progress overlay. A plain catalog
+          // projection would replace streamed text and tools with JSONL-only
+          // history until the next authoritative runtime snapshot.
+          Stream.mapEffect(() => projectSupervisorSnapshot(record, runtime)),
+          Stream.map((snapshot) => ({
+            kind: "snapshot" as const,
+            snapshot,
+          })),
+        );
+        const sequenceGate = new PiThreadStreamSequenceGate();
+        return Stream.merge(
+          runtimeStream(record, runtime),
+          Stream.merge(lifecycleUpdates, catalogUpdates),
+          { haltStrategy: "left" },
+        ).pipe(Stream.filter((item) => sequenceGate.allows(item)));
       };
       const replacementRuntimeStreams = (record: PiSessionCatalogRecord) =>
         awaitRuntime(record).pipe(
@@ -1266,14 +1377,38 @@ export class PiExternalThreadSource extends Context.Service<
       ).pipe(
         Stream.tap(() => PubSub.publish(catalogInvalidations, undefined)),
         Stream.mapEffect(() => buildCatalog(true)),
+        Stream.map((snapshot) => ({ snapshot, detailInvalidated: true as const })),
       );
       const runtimeUpdates = Stream.fromEffect(buildCatalogForRuntimeChange()).pipe(
         Stream.repeat(Schedule.spaced("1 second")),
         Stream.filter((snapshot) => snapshot !== undefined),
+        Stream.map((snapshot) => ({ snapshot, detailInvalidated: false as const })),
       );
-      yield* Stream.merge(filesystemUpdates, runtimeUpdates).pipe(
+      const settingsUpdates = settingsChanges.pipe(
+        Stream.filter((settings) => {
+          if (settings.sidebarAutoSettleAfterDays === lastAutoSettleAfterDays) return false;
+          lastAutoSettleAfterDays = settings.sidebarAutoSettleAfterDays;
+          return true;
+        }),
+        Stream.mapEffect(() => buildCatalog(false)),
+        Stream.map((snapshot) => ({ snapshot, detailInvalidated: false as const })),
+      );
+      // The ordinary settlement reactor sweeps every minute. External Pi
+      // history is not in its sqlite snapshot, so re-evaluate the same policy
+      // here without rereading JSONL.
+      const inactivityUpdates = Stream.fromEffect(buildCatalog(false)).pipe(
+        Stream.repeat(Schedule.spaced("1 minute")),
+        Stream.drop(1),
+        Stream.map((snapshot) => ({ snapshot, detailInvalidated: false as const })),
+      );
+      yield* Stream.merge(
+        Stream.merge(filesystemUpdates, runtimeUpdates),
+        Stream.merge(settingsUpdates, inactivityUpdates),
+      ).pipe(
         Stream.retry(Schedule.spaced("1 second")),
-        Stream.runForEach((snapshot) => SubscriptionRef.set(catalogSnapshots, snapshot)),
+        Stream.runForEach(({ snapshot, detailInvalidated }) => {
+          return publishCatalogSnapshot(snapshot, detailInvalidated);
+        }),
         Effect.forkScoped,
       );
 
@@ -1408,7 +1543,7 @@ export class PiExternalThreadSource extends Context.Service<
               }
             }
             const snapshot = yield* buildCatalog(true);
-            yield* SubscriptionRef.set(catalogSnapshots, snapshot);
+            yield* publishCatalogSnapshot(snapshot, true);
             yield* PubSub.publish(catalogInvalidations, undefined);
             return { threadId: record.threadId };
           }),

@@ -176,6 +176,16 @@ historical projection:
 - preserve explicit truncation metadata when a configured history ceiling is
   reached
 
+external pi shells reuse `resolveAutoSettlementAt` with the server's
+`sidebarAutoSettleAfterDays` setting. explicit settle or un-settle overrides and
+actively running runtimes win over the derived inactivity state. idle attached
+runtimes follow the ordinary thread policy and may settle. because imported
+history has no orchestration aggregate to receive `thread.auto-settle`,
+automatic settlement is recomputed from jsonl activity rather than persisted;
+changing or disabling the inactivity window therefore reclassifies those
+shells. a once-per-minute cached catalog pass handles threshold crossings
+without rereading jsonl.
+
 live projection:
 
 - jsonl plus a bounded in-progress overlay forms the authoritative snapshot
