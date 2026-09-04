@@ -535,6 +535,7 @@ describe("PiSessionProjection", () => {
         eventId: "runtime:9" as never,
         event: {
           type: "message_start",
+          messageId: "client-message",
           message: { role: "user", content: [{ type: "text", text: "new prompt" }] },
         },
       },
@@ -542,8 +543,11 @@ describe("PiSessionProjection", () => {
       occurredAt: record.updatedAt,
     });
 
-    expect(event?.type).toBe("thread.message-sent");
-    expect(event?.payload).not.toHaveProperty("attachments");
+    if (event?.type !== "thread.message-sent") {
+      throw new Error("expected projected user message");
+    }
+    expect(event.payload.messageId).toBe("client-message");
+    expect(event.payload).not.toHaveProperty("attachments");
   });
 
   it("keeps a delivered user prompt visible during streaming before jsonl settles", () => {
@@ -565,6 +569,7 @@ describe("PiSessionProjection", () => {
         eventId: "runtime:9",
         event: {
           type: "message_start",
+          messageId: "client-message",
           message: {
             role: "user",
             content: [{ type: "text", text: "new prompt" }],
@@ -598,6 +603,130 @@ describe("PiSessionProjection", () => {
     const persistedEntries = [
       ...entries,
       {
+        type: "custom",
+        customType: "t3.message-id.v1",
+        data: { version: 1, messageId: "client-message" },
+        id: "message-id",
+        parentId: "tool-result",
+        timestamp: "2026-07-30T00:00:05.500Z",
+      },
+      {
+        type: "custom",
+        customType: "other-extension",
+        data: { value: true },
+        id: "intervening-custom",
+        parentId: "message-id",
+        timestamp: "2026-07-30T00:00:05.750Z",
+      },
+      {
+        type: "message",
+        id: "user-3",
+        parentId: "intervening-custom",
+        timestamp: "2026-07-30T00:00:06.000Z",
+        message: { role: "user", content: [{ type: "text", text: "same prompt" }] },
+      },
+    ];
+    const snapshot = projectPiThread({
+      record,
+      entries: persistedEntries,
+      projectId: ProjectId.make("project-1"),
+      runtime: {
+        runtimeId: PiNativeRuntimeId.make("runtime-1"),
+        writerKind: "rpc",
+        status: "streaming",
+        sequence: 9,
+      },
+    });
+    const projected = projectPiThreadOverlay(snapshot, record, [
+      {
+        type: "event",
+        sequence: 9,
+        eventId: "runtime:9",
+        event: {
+          type: "message_start",
+          messageId: "client-message",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "same prompt" }],
+          },
+        },
+      } as never,
+    ]);
+
+    expect(
+      projected.thread.messages.filter((message) => message.text === "same prompt"),
+    ).toHaveLength(1);
+    expect(projected.thread.messages.find((message) => message.text === "same prompt")?.id).toBe(
+      "client-message",
+    );
+    expect(projected.thread.latestTurn?.turnId).toBe(snapshot.thread.latestTurn?.turnId);
+  });
+
+  it("keeps correlated live and persisted prompts merged after assistant output", () => {
+    const persistedEntries = [
+      ...entries,
+      {
+        type: "custom",
+        customType: "t3.message-id.v1",
+        data: { version: 1, messageId: "client-message" },
+        id: "message-id",
+        parentId: "tool-result",
+        timestamp: "2026-07-30T00:00:05.500Z",
+      },
+      {
+        type: "message",
+        id: "user-3",
+        parentId: "message-id",
+        timestamp: "2026-07-30T00:00:06.000Z",
+        message: { role: "user", content: [{ type: "text", text: "same prompt" }] },
+      },
+      {
+        type: "message",
+        id: "assistant-3",
+        parentId: "user-3",
+        timestamp: "2026-07-30T00:00:07.000Z",
+        message: { role: "assistant", content: [{ type: "text", text: "working" }] },
+      },
+    ];
+    const snapshot = projectPiThread({
+      record,
+      entries: persistedEntries,
+      projectId: ProjectId.make("project-1"),
+      runtime: {
+        runtimeId: PiNativeRuntimeId.make("runtime-1"),
+        writerKind: "rpc",
+        status: "streaming",
+        sequence: 9,
+      },
+    });
+    const projected = projectPiThreadOverlay(snapshot, record, [
+      {
+        type: "event",
+        sequence: 9,
+        eventId: "runtime:9",
+        event: {
+          type: "message_start",
+          messageId: "client-message",
+          message: {
+            role: "user",
+            content: [{ type: "text", text: "same prompt" }],
+          },
+        },
+      } as never,
+    ]);
+
+    expect(projected.thread.messages.filter((message) => message.text === "same prompt")).toEqual([
+      expect.objectContaining({
+        id: "client-message",
+        turnId: snapshot.thread.latestTurn?.turnId,
+      }),
+    ]);
+  });
+
+  it("keeps a correlated repeated prompt separate from an assistant-less turn", () => {
+    const persistedEntries = [
+      ...entries,
+      {
         type: "message",
         id: "user-3",
         parentId: "tool-result",
@@ -623,6 +752,7 @@ describe("PiSessionProjection", () => {
         eventId: "runtime:9",
         event: {
           type: "message_start",
+          messageId: "client-message",
           message: {
             role: "user",
             content: [{ type: "text", text: "same prompt" }],
@@ -633,8 +763,8 @@ describe("PiSessionProjection", () => {
 
     expect(
       projected.thread.messages.filter((message) => message.text === "same prompt"),
-    ).toHaveLength(1);
-    expect(projected.thread.latestTurn?.turnId).toBe(snapshot.thread.latestTurn?.turnId);
+    ).toHaveLength(2);
+    expect(projected.thread.messages.at(-1)?.id).toBe("client-message");
   });
 });
 

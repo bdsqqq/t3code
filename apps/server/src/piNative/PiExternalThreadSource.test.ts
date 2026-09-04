@@ -108,6 +108,7 @@ describe("PiExternalThreadSource hardening", () => {
         sessionFile: "/sessions/session.jsonl",
         cwd: "/workspace",
         message: "continue here",
+        messageId: "takeover-message",
         streamingBehavior: "steer",
       },
     } as const;

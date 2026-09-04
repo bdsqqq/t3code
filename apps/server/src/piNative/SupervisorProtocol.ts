@@ -1,5 +1,6 @@
 import type {
   CommandId,
+  MessageId,
   PiNativeEventId,
   PiNativeJsonlEntry,
   PiNativeRuntimeId,
@@ -106,6 +107,7 @@ export type SupervisorCommand =
       readonly sessionFile: string;
       readonly cwd: string;
       readonly message: string;
+      readonly messageId: MessageId;
       readonly streamingBehavior: "steer" | "followUp";
       readonly images?: ReadonlyArray<{
         readonly type: "image";
@@ -118,6 +120,7 @@ export type SupervisorCommand =
       readonly commandId: CommandId;
       readonly runtimeId: PiNativeRuntimeId;
       readonly message: string;
+      readonly messageId: MessageId;
       readonly images?: ReadonlyArray<{
         readonly type: "image";
         readonly data: string;

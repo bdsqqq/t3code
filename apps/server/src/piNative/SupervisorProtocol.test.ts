@@ -15,6 +15,7 @@ describe("SupervisorProtocol", () => {
       sessionFile: "/sessions/session.jsonl",
       cwd: "/workspace",
       message: "continue",
+      messageId: "message-1" as never,
       streamingBehavior: "steer",
     } satisfies SupervisorCommand;
 

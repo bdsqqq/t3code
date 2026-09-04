@@ -31,6 +31,7 @@ import {
 } from "../provider/pi/PiSubagent.ts";
 
 type JsonRecord = Readonly<Record<string, unknown>>;
+const MESSAGE_ID_CUSTOM_TYPE = "t3.message-id.v1";
 
 const isRecord = (value: unknown): value is JsonRecord =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -325,23 +326,39 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
   const activities: OrchestrationThreadActivity[] = [];
   const toolActivityIndex = new Map<string, number>();
   let currentTurnId: TurnId | null = null;
+  let nextUserMessageId: MessageId | undefined;
   let model: string | undefined;
 
   for (const entry of branch.entries) {
     const entryId = String(entry.id);
     const createdAt = timestamp(entry.timestamp, record.updatedAt);
+    if (
+      entry.type === "custom" &&
+      entry.customType === MESSAGE_ID_CUSTOM_TYPE &&
+      isRecord(entry.data) &&
+      entry.data.version === 1 &&
+      typeof entry.data.messageId === "string"
+    ) {
+      nextUserMessageId = MessageIdSchema.make(entry.data.messageId);
+      continue;
+    }
     if (entry.type === "model_change" && typeof entry.modelId === "string") {
+      nextUserMessageId = undefined;
       model =
         typeof entry.provider === "string" ? `${entry.provider}/${entry.modelId}` : entry.modelId;
       continue;
     }
-    if (entry.type !== "message" || !isRecord(entry.message)) continue;
+    if (entry.type === "custom") continue;
+    if (entry.type !== "message" || !isRecord(entry.message)) {
+      nextUserMessageId = undefined;
+      continue;
+    }
     const message = entry.message;
     const role = message.role;
     if (role === "user") {
       currentTurnId = turnId(record, entryId);
       messages.push({
-        id: messageId(record, entryId),
+        id: nextUserMessageId ?? messageId(record, entryId),
         role: "user",
         text: contentText(message.content),
         turnId: currentTurnId,
@@ -349,8 +366,10 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
         createdAt,
         updatedAt: createdAt,
       });
+      nextUserMessageId = undefined;
       continue;
     }
+    nextUserMessageId = undefined;
     if (role === "assistant") {
       if (typeof message.model === "string") {
         model =
@@ -594,15 +613,23 @@ export function projectPiThreadOverlay(
       if (!userMessage) continue;
       const liveTurnId = turnId(record, `live-user:${item.eventId}`);
       const userText = contentText(userMessage.content);
-      const persistedUser = messages.findLast((message) => message.role === "user");
+      const correlatedMessageId = liveMessageId(payload);
+      const persistedUserById =
+        correlatedMessageId === undefined
+          ? undefined
+          : messages.findLast((message) => message.id === correlatedMessageId);
+      const latestPersistedUser = messages.findLast((message) => message.role === "user");
       const persistedTurnId =
-        persistedUser?.text === userText &&
-        latestTurn?.turnId === persistedUser.turnId &&
-        latestTurn.assistantMessageId === null
-          ? persistedUser.turnId
-          : null;
+        persistedUserById !== undefined && latestTurn?.turnId === persistedUserById.turnId
+          ? persistedUserById.turnId
+          : correlatedMessageId === undefined &&
+              latestPersistedUser?.text === userText &&
+              latestTurn?.turnId === latestPersistedUser.turnId &&
+              latestTurn.assistantMessageId === null
+            ? latestPersistedUser.turnId
+            : null;
       activeTurnId = persistedTurnId ?? liveTurnId;
-      const id = messageId(record, `live-user:${item.eventId}`);
+      const id = correlatedMessageId ?? messageId(record, `live-user:${item.eventId}`);
       if (persistedTurnId === null) {
         messages = [
           ...messages.filter((candidate) => candidate.id !== id),
@@ -897,6 +924,14 @@ function liveUserMessage(payload: NonNullable<ReturnType<typeof livePayload>>) {
   return message?.role === "user" ? message : undefined;
 }
 
+function liveMessageId(
+  payload: NonNullable<ReturnType<typeof livePayload>>,
+): MessageId | undefined {
+  return typeof payload.data.messageId === "string"
+    ? MessageIdSchema.make(payload.data.messageId)
+    : undefined;
+}
+
 export function projectPiLiveEvent(input: {
   readonly record: PiSessionCatalogRecord;
   readonly runtime: SupervisorRuntimeState;
@@ -932,12 +967,14 @@ export function projectPiLiveEvent(input: {
     const userMessage = liveUserMessage(payload);
     if (!userMessage) return null;
     const liveTurnId = turnId(input.record, `live-user:${input.item.eventId}`);
+    const correlatedMessageId = liveMessageId(payload);
     return {
       ...base,
       type: "thread.message-sent",
       payload: {
         threadId: input.record.threadId,
-        messageId: messageId(input.record, `live-user:${input.item.eventId}`),
+        messageId:
+          correlatedMessageId ?? messageId(input.record, `live-user:${input.item.eventId}`),
         role: "user",
         text: contentText(userMessage.content),
         turnId: liveTurnId,

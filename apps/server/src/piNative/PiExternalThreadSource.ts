@@ -403,6 +403,7 @@ export function planPiExternalTurnStart(input: {
         sessionFile: input.record.canonicalFile,
         cwd: input.record.cwd,
         message: input.command.message.text,
+        messageId: input.command.message.messageId,
         streamingBehavior: input.command.streamingBehavior ?? "steer",
       },
     };
@@ -1258,6 +1259,7 @@ export class PiExternalThreadSource extends Context.Service<
               commandId: command.commandId,
               runtimeId: liveRuntime.runtimeId,
               message: command.message.text,
+              messageId: command.message.messageId,
             });
           }
         } else if (command.type === "thread.turn.interrupt") {

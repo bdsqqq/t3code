@@ -6,6 +6,7 @@ import * as NodePath from "node:path";
 
 const PROTOCOL = "t3-control-v2";
 const LIFECYCLE_CUSTOM_TYPE = "t3.thread-lifecycle.v1";
+const MESSAGE_ID_CUSTOM_TYPE = "t3.message-id.v1";
 const SOCKET_PATH = NodePath.join(NodeOS.homedir(), ".pi", "agent", PROTOCOL, "supervisor.sock");
 const RECONNECT_DELAYS_MS = [250, 500, 1_000, 2_000, 5_000] as const;
 
@@ -15,6 +16,7 @@ export type BridgeCommand =
       readonly commandId: string;
       readonly command: "send" | "steer" | "followUp";
       readonly text: string;
+      readonly messageId?: string;
     }
   | {
       readonly type: "command";
@@ -98,13 +100,16 @@ export function parseBridgeCommand(value: unknown): BridgeCommand | undefined {
   }
   if (
     (value.command === "send" || value.command === "steer" || value.command === "followUp") &&
-    typeof value.text === "string"
+    typeof value.text === "string" &&
+    (value.messageId === undefined ||
+      (typeof value.messageId === "string" && value.messageId.length > 0))
   ) {
     return {
       type: "command",
       commandId: value.commandId,
       command: value.command,
       text: value.text,
+      ...(typeof value.messageId === "string" ? { messageId: value.messageId } : {}),
     };
   }
 }
@@ -133,6 +138,26 @@ export function messageText(value: unknown): string | undefined {
     isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
   );
   return text.length > 0 ? text.join("") : undefined;
+}
+
+export function takePendingMessageId(
+  pending: Array<{
+    readonly messageId?: string;
+    text?: string;
+    readonly behavior: "send" | "steer" | "followUp";
+  }>,
+  text: string,
+  behavior?: "send" | "steer" | "followUp",
+): string | undefined {
+  let index = pending.findIndex(
+    (candidate) =>
+      candidate.text === text && (behavior === undefined || candidate.behavior === behavior),
+  );
+  if (index < 0 && behavior !== undefined) {
+    index = pending.findIndex((candidate) => candidate.behavior === behavior);
+  }
+  if (index < 0) return;
+  return pending.splice(index, 1)[0]?.messageId;
 }
 
 type SessionManager = {
@@ -173,6 +198,12 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
   let currentContext: ExtensionContext | undefined;
   let pendingSteering: string[] = [];
   let pendingFollowUp: string[] = [];
+  const pendingMessageIds: Array<{
+    readonly messageId?: string;
+    text?: string;
+    readonly behavior: "send" | "steer" | "followUp";
+  }> = [];
+  const pendingT3Inputs: typeof pendingMessageIds = [];
   let userMessageSeen = false;
   const deduper = new CommandDeduper();
 
@@ -201,12 +232,32 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
     }
     const ctx = currentContext;
     if (ctx === undefined) return;
+    const pendingMessage =
+      "text" in command && command.messageId !== undefined
+        ? { messageId: command.messageId, text: command.text, behavior: command.command }
+        : undefined;
+    if (pendingMessage) {
+      pendingMessageIds.push(pendingMessage);
+      pendingT3Inputs.push(pendingMessage);
+    }
+    const cleanupPendingMessage = () => {
+      if (!pendingMessage) return;
+      const index = pendingMessageIds.findIndex(
+        (candidate) => candidate.messageId === pendingMessage.messageId,
+      );
+      if (index >= 0) pendingMessageIds.splice(index, 1);
+      const inputIndex = pendingT3Inputs.indexOf(pendingMessage);
+      if (inputIndex >= 0) pendingT3Inputs.splice(inputIndex, 1);
+    };
+    const observeDelivery = (delivery: void | Promise<void>) => {
+      if (delivery) void delivery.catch(cleanupPendingMessage);
+    };
     try {
       if (command.command === "send") {
-        pi.sendUserMessage(command.text);
+        observeDelivery(pi.sendUserMessage(command.text));
         receipt(command.commandId, "submitted");
       } else if (command.command === "steer" || command.command === "followUp") {
-        pi.sendUserMessage(command.text, { deliverAs: command.command });
+        observeDelivery(pi.sendUserMessage(command.text, { deliverAs: command.command }));
         receipt(command.commandId, "submitted");
       } else if (command.command === "setLifecycle") {
         const error = lifecycleCommandError(
@@ -223,6 +274,7 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
         receipt(command.commandId, "accepted");
       }
     } catch (error) {
+      cleanupPendingMessage();
       receipt(command.commandId, "error", error instanceof Error ? error.message : String(error));
     }
   };
@@ -297,15 +349,34 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
   pi.on("agent_settled", (_event, ctx) => {
     pendingSteering = [];
     pendingFollowUp = [];
+    pendingMessageIds.length = 0;
+    pendingT3Inputs.length = 0;
     forward("queue_update", { steering: pendingSteering, followUp: pendingFollowUp });
     forward("agent_settled", { idle: ctx.isIdle(), pending: ctx.hasPendingMessages() });
   });
   pi.on("message_start", (event) => {
     const message = isRecord(event.message) ? event.message : undefined;
     const delivered = message?.role === "user" ? messageText(message) : undefined;
+    let messageId: string | undefined;
     if (delivered !== undefined) {
       const steeringIndex = pendingSteering.indexOf(delivered);
       const followUpIndex = pendingFollowUp.indexOf(delivered);
+      const behavior =
+        steeringIndex >= 0
+          ? "steer"
+          : followUpIndex >= 0
+            ? "followUp"
+            : pendingMessageIds.some((candidate) => candidate.behavior === "send")
+              ? "send"
+              : pendingMessageIds.some((candidate) => candidate.behavior === "steer")
+                ? "steer"
+                : pendingMessageIds.some((candidate) => candidate.behavior === "followUp")
+                  ? "followUp"
+                  : undefined;
+      messageId = takePendingMessageId(pendingMessageIds, delivered, behavior);
+      if (messageId !== undefined) {
+        pi.appendEntry(MESSAGE_ID_CUSTOM_TYPE, { version: 1, messageId });
+      }
       let reconciled = false;
       if (steeringIndex >= 0) {
         pendingSteering.splice(steeringIndex, 1);
@@ -324,7 +395,10 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
         forward("queue_update", { steering: pendingSteering, followUp: pendingFollowUp });
       userMessageSeen = true;
     }
-    forward("message_start", { message: event.message });
+    forward("message_start", {
+      message: event.message,
+      ...(messageId === undefined ? {} : { messageId }),
+    });
   });
   pi.on("message_update", (event) =>
     forward("message_update", { update: event.assistantMessageEvent }),
@@ -354,6 +428,21 @@ export default function t3ControlExtension(pi: ExtensionApi): void {
   );
   pi.on("input", (event) => {
     const text = typeof event.text === "string" ? event.text : "";
+    const behavior =
+      event.streamingBehavior === "steer" || event.streamingBehavior === "followUp"
+        ? event.streamingBehavior
+        : "send";
+    const t3InputIndex = pendingT3Inputs.findIndex(
+      (candidate) => candidate.behavior === behavior && candidate.text === text,
+    );
+    if (event.source === "extension" && t3InputIndex >= 0) {
+      pendingT3Inputs.splice(t3InputIndex, 1);
+    } else {
+      const nextT3Input = pendingT3Inputs.find((candidate) => candidate.behavior === behavior);
+      const before = nextT3Input === undefined ? -1 : pendingMessageIds.indexOf(nextT3Input);
+      if (before >= 0) pendingMessageIds.splice(before, 0, { text, behavior });
+      else pendingMessageIds.push({ text, behavior });
+    }
     if (event.streamingBehavior === "steer") pendingSteering.push(text);
     if (event.streamingBehavior === "followUp") pendingFollowUp.push(text);
     if (event.streamingBehavior !== undefined)

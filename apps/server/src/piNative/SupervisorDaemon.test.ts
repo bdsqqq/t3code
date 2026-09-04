@@ -10,8 +10,10 @@ import * as NodePath from "node:path";
 import {
   projectOverlayPayload,
   acquireResumeAndSendRuntime,
+  bridgeRegistrationIsSettled,
   bridgeCommandFrame,
   claimRpcSessionWriter,
+  correlateRuntimeUserMessage,
   projectListedRuntime,
   projectQueuePayload,
   projectQueueValues,
@@ -20,6 +22,7 @@ import {
   publishSettlementInOrder,
   releaseBridgeRegistration,
   releaseSessionWriterIfOwned,
+  RPC_MESSAGE_ID_EXTENSION_SOURCE,
   reserveBridgeRegistration,
   runCommandSingleFlight,
   runKeyedSerialQueue,
@@ -29,6 +32,8 @@ import {
   createBridgeRegistrationSocketGuard,
   existingWriterResumeAndSendCommand,
   makeManagedAdmissionController,
+  managedMessageIdCommandName,
+  messageIdCorrelationPrompt,
   type ManagedLedgerEntry,
   queuePayloadHasPending,
   shouldUseSnapshot,
@@ -113,16 +118,150 @@ describe("native Pi replay projection", () => {
     });
   });
 
+  it("forwards message identity to the Pi-owned TUI bridge writer", () => {
+    expect(
+      bridgeCommandFrame({
+        type: "send",
+        commandId: "operation-1",
+        runtimeId: "runtime-1",
+        message: "hello",
+        messageId: "message-1",
+      }),
+    ).toMatchObject({
+      command: "send",
+      text: "hello",
+      messageId: "message-1",
+    });
+  });
+
+  it("correlates bridge and rpc user events in command order", () => {
+    const pending = [
+      { messageId: "message-1", text: "same", behavior: "followUp" as const },
+      { messageId: "message-2", text: "same", behavior: "steer" as const },
+    ];
+    expect(
+      correlateRuntimeUserMessage(
+        {
+          type: "event",
+          event: "message_start",
+          data: { message: { role: "user", content: [{ type: "text", text: "same" }] } },
+        },
+        pending,
+      ),
+    ).toMatchObject({ data: { messageId: "message-2" } });
+    expect(
+      correlateRuntimeUserMessage(
+        {
+          type: "message_start",
+          messageId: "message-1",
+          message: { role: "user", content: [{ type: "text", text: "expanded prompt" }] },
+        },
+        pending,
+      ),
+    ).toMatchObject({ messageId: "message-1" });
+    expect(pending).toEqual([]);
+  });
+
+  it("encodes rpc message identity outside user-visible prompt text", () => {
+    const prompt = messageIdCorrelationPrompt({
+      messageId: "message-1",
+      text: "not encoded",
+      behavior: "steer",
+    });
+    const argument = prompt.slice(prompt.indexOf(" ") + 1);
+
+    expect(prompt).toMatch(/^\/__t3_managed_message_id_v1 /);
+    expect(JSON.parse(Buffer.from(argument, "base64url").toString("utf8"))).toEqual({
+      version: 1,
+      messageId: "message-1",
+      behavior: "steer",
+      operation: "enqueue",
+    });
+  });
+
+  it("tags the managed rpc event and durable entry with the client message id", async () => {
+    const extensionModule = (await import(
+      `data:text/javascript;base64,${Buffer.from(RPC_MESSAGE_ID_EXTENSION_SOURCE).toString("base64")}`
+    )) as {
+      default: (pi: {
+        registerCommand(
+          name: string,
+          options: { handler: (argument: string) => Promise<void> },
+        ): void;
+        on(name: string, handler: (event: Record<string, unknown>) => void): void;
+        appendEntry(customType: string, data: unknown): void;
+      }) => void;
+    };
+    const handlers = new Map<string, (event: Record<string, unknown>) => void>();
+    let commandHandler: ((argument: string) => Promise<void>) | undefined;
+    const entries: Array<{ customType: string; data: unknown }> = [];
+    extensionModule.default({
+      registerCommand: (_name, options) => {
+        commandHandler = options.handler;
+      },
+      on: (name, handler) => handlers.set(name, handler),
+      appendEntry: (customType, data) => entries.push({ customType, data }),
+    });
+    const argument = messageIdCorrelationPrompt({
+      messageId: "message-1",
+      text: "hello",
+      behavior: "send",
+    }).split(" ")[1]!;
+    await commandHandler!(argument);
+    handlers.get("input")!({ source: "rpc", text: "hello" });
+    const event: Record<string, unknown> = {
+      message: { role: "user", content: [{ type: "text", text: "expanded hello" }] },
+    };
+    handlers.get("message_start")!(event);
+
+    expect(event.messageId).toBe("message-1");
+    expect(entries).toEqual([
+      { customType: "t3.message-id.v1", data: { version: 1, messageId: "message-1" } },
+    ]);
+  });
+
+  it("recognizes a reconnected bridge with no surviving delivery work as settled", () => {
+    expect(bridgeRegistrationIsSettled(false, [], [])).toBe(true);
+    expect(bridgeRegistrationIsSettled(true, [], [])).toBe(false);
+    expect(bridgeRegistrationIsSettled(false, ["steer"], [])).toBe(false);
+  });
+
+  it("accepts only the message identity command loaded from the managed extension", () => {
+    expect(
+      managedMessageIdCommandName(
+        [
+          {
+            name: "__t3_managed_message_id_v1",
+            sourceInfo: { path: "/other/extension.mjs" },
+          },
+          {
+            name: "__t3_managed_message_id_v1:1",
+            sourceInfo: { path: "/managed/message-id.mjs" },
+          },
+        ],
+        "/managed/message-id.mjs",
+      ),
+    ).toBe("__t3_managed_message_id_v1:1");
+  });
+
   it("starts rpc sessions in the cataloged sessions root", () => {
-    expect(piRpcSpawnArgs({ sessionsRoot: "/isolated/sessions" })).toEqual([
+    expect(
+      piRpcSpawnArgs({
+        sessionsRoot: "/isolated/sessions",
+        extensionPath: "/isolated/managed-message-id.mjs",
+      }),
+    ).toEqual([
       "--mode",
       "rpc",
       "--session-dir",
       "/isolated/sessions",
+      "--extension",
+      "/isolated/managed-message-id.mjs",
     ]);
     expect(
       piRpcSpawnArgs({
         sessionsRoot: "/isolated/sessions",
+        extensionPath: "/isolated/managed-message-id.mjs",
         sessionFile: "/isolated/sessions/existing.jsonl",
       }),
     ).toContain("/isolated/sessions/existing.jsonl");
@@ -234,6 +373,7 @@ describe("native Pi replay projection", () => {
       sessionFile: "/sessions/session.jsonl",
       cwd: "/workspace",
       message: "continue",
+      messageId: "message-1",
       streamingBehavior: "steer",
     };
 
@@ -243,11 +383,13 @@ describe("native Pi replay projection", () => {
       commandId: "takeover-1",
       runtimeId: "runtime-1",
       message: "continue",
+      messageId: "message-1",
     });
     expect(bridgeCommandFrame(delivery)).toMatchObject({
       command: "steer",
       commandId: "takeover-1",
       text: "continue",
+      messageId: "message-1",
     });
     expect(outer.type).toBe("resumeAndSend");
 

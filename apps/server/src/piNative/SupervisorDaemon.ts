@@ -60,6 +60,93 @@ const PENDING_QUEUE_ENVELOPE_RESERVE_BYTES = 1_024;
 const SNAPSHOT_ENTRY_LIMIT = 1_000;
 const SNAPSHOT_HEAD_BYTES = 256 * 1024;
 const SNAPSHOT_TAIL_BYTES = 16 * 1024 * 1024;
+const MESSAGE_ID_COMMAND = "__t3_managed_message_id_v1";
+const RPC_MESSAGE_ID_EXTENSION_PATH = path.join(ROOT, "managed-message-id.mjs");
+export const RPC_MESSAGE_ID_EXTENSION_SOURCE = `const COMMAND = "${MESSAGE_ID_COMMAND}";
+const CUSTOM_TYPE = "t3.message-id.v1";
+const isRecord = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const messageText = (message) => {
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return;
+  const parts = message.content.flatMap((part) =>
+    isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+  );
+  return parts.length > 0 ? parts.join("") : undefined;
+};
+export default function managedMessageIdentity(pi) {
+  const pending = [];
+  pi.registerCommand(COMMAND, {
+    description: "Correlate a T3-delivered user message.",
+    handler: async (argument) => {
+      let value;
+      try {
+        value = JSON.parse(Buffer.from(argument.trim(), "base64url").toString("utf8"));
+      } catch {
+        throw new Error("invalid T3 message identity");
+      }
+      if (
+        !isRecord(value) ||
+        value.version !== 1 ||
+        typeof value.messageId !== "string" ||
+        !["send", "steer", "followUp"].includes(value.behavior) ||
+        !["enqueue", "cancel"].includes(value.operation)
+      ) throw new Error("invalid T3 message identity");
+      if (value.operation === "cancel") {
+        const index = pending.findIndex((candidate) => candidate.messageId === value.messageId);
+        if (index >= 0) pending.splice(index, 1);
+        return;
+      }
+      pending.push({ messageId: value.messageId, behavior: value.behavior });
+    },
+  });
+  pi.on("input", (event) => {
+    const behavior =
+      event.streamingBehavior === "steer" || event.streamingBehavior === "followUp"
+        ? event.streamingBehavior
+        : "send";
+    const candidate =
+      event.source === "rpc"
+        ? pending.find((item) => item.behavior === behavior && item.text === undefined)
+        : undefined;
+    if (candidate) candidate.text = typeof event.text === "string" ? event.text : "";
+    else {
+      const item = { behavior, text: typeof event.text === "string" ? event.text : "" };
+      const before = pending.findIndex(
+        (candidate) => candidate.behavior === behavior && candidate.text === undefined,
+      );
+      if (before >= 0) pending.splice(before, 0, item);
+      else pending.push(item);
+    }
+  });
+  pi.on("message_start", (event) => {
+    const message = isRecord(event.message) ? event.message : undefined;
+    if (message?.role !== "user") return;
+    const text = messageText(message);
+    let index = -1;
+    for (const behavior of ["send", "steer", "followUp"]) {
+      index = pending.findIndex(
+        (candidate) => candidate.behavior === behavior && candidate.text === text,
+      );
+      if (index >= 0) break;
+    }
+    if (index < 0) {
+      for (const behavior of ["send", "steer", "followUp"]) {
+        index = pending.findIndex((candidate) => candidate.behavior === behavior);
+        if (index >= 0) break;
+      }
+    }
+    const messageId = index >= 0 ? pending.splice(index, 1)[0]?.messageId : undefined;
+    if (messageId) {
+      event.messageId = messageId;
+      pi.appendEntry(CUSTOM_TYPE, { version: 1, messageId });
+    }
+  });
+  pi.on("agent_settled", () => {
+    pending.length = 0;
+  });
+}
+`;
+let rpcMessageIdExtensionReady: Promise<string> | undefined;
 class IndeterminateCommandError extends Error {}
 class RpcCommandRejectedError extends Error {}
 class SessionWriterClaimConflictError extends Error {
@@ -86,6 +173,11 @@ export type ManagedLedgerEntry = {
   readonly operation: Exclude<ManagedOperationState, { readonly status: "absent" }>;
 };
 type LedgerEntry = CommandLedgerEntry | ManagedLedgerEntry;
+type PendingMessageCorrelation = {
+  readonly messageId: string;
+  readonly text: string;
+  readonly behavior: "send" | "steer" | "followUp";
+};
 type Runtime = {
   state: SupervisorRuntimeState;
   child?: ChildProcessWithoutNullStreams;
@@ -112,6 +204,8 @@ type Runtime = {
     { resolve: (response: Record<string, unknown>) => void; reject: (cause: Error) => void }
   >;
   bridgePending: Map<string, (frame: Record<string, unknown>) => void>;
+  pendingMessageCorrelations: PendingMessageCorrelation[];
+  messageIdCommandName?: string | null;
 };
 const runtimes = new Map<string, Runtime>();
 const writers = new Map<string, string>();
@@ -120,6 +214,7 @@ const startingRuntimes = new Map<string, Promise<Runtime | undefined>>();
 const bridgeRegistrations = new Set<string>();
 const liveCommands = new Map<string, { hash: string; work: Promise<SupervisorCommandReceipt> }>();
 const resumeAndSendQueues = new Map<string, Promise<void>>();
+const runtimeDeliveryQueues = new Map<string, Promise<void>>();
 let ledger: Record<string, LedgerEntry> = {};
 let ledgerWrite = Promise.resolve();
 const socketWrites = new WeakMap<
@@ -277,6 +372,7 @@ const decodeManagedFinalization = (value: unknown): ManagedFinalizeRequest => {
 
 export function piRpcSpawnArgs(input: {
   readonly sessionsRoot: string;
+  readonly extensionPath: string;
   readonly sessionFile?: string;
 }): string[] {
   return [
@@ -284,6 +380,8 @@ export function piRpcSpawnArgs(input: {
     "rpc",
     "--session-dir",
     input.sessionsRoot,
+    "--extension",
+    input.extensionPath,
     ...(input.sessionFile ? ["--session", input.sessionFile] : []),
   ];
 }
@@ -701,10 +799,68 @@ export const shouldUseSnapshot = (
   cursor === undefined ||
   cursor <= ringEvictedThrough ||
   (cursor !== undefined && oldestSequence !== undefined && cursor < oldestSequence - 1);
+export const bridgeRegistrationIsSettled = (
+  isStreaming: boolean,
+  steering: readonly string[],
+  followUp: readonly string[],
+): boolean => !isStreaming && steering.length === 0 && followUp.length === 0;
 const overlayEventType = (payload: unknown): string | undefined => {
   if (!isRecord(payload)) return;
   if (payload.type === "event" && typeof payload.event === "string") return payload.event;
   return typeof payload.type === "string" ? payload.type : undefined;
+};
+const runtimeUserMessage = (payload: unknown): Record<string, unknown> | undefined => {
+  if (!isRecord(payload)) return;
+  const data =
+    payload.type === "event" && payload.event === "message_start" && isRecord(payload.data)
+      ? payload.data
+      : payload.type === "message_start"
+        ? payload
+        : undefined;
+  if (!data || !isRecord(data.message) || data.message.role !== "user") return;
+  return data;
+};
+const runtimeUserMessageText = (data: Record<string, unknown>): string | undefined => {
+  const message = data.message;
+  if (!isRecord(message)) return;
+  if (typeof message.content === "string") return message.content;
+  if (!Array.isArray(message.content)) return;
+  const text = message.content.flatMap((part) =>
+    isRecord(part) && part.type === "text" && typeof part.text === "string" ? [part.text] : [],
+  );
+  return text.length > 0 ? text.join("") : undefined;
+};
+export const correlateRuntimeUserMessage = (
+  payload: unknown,
+  pending: PendingMessageCorrelation[],
+): unknown => {
+  const data = runtimeUserMessage(payload);
+  if (!data) return payload;
+  const suppliedMessageId = typeof data.messageId === "string" ? data.messageId : undefined;
+  const text = runtimeUserMessageText(data);
+  const findByDeliveryOrder = (matches: (candidate: PendingMessageCorrelation) => boolean) => {
+    for (const behavior of ["send", "steer", "followUp"] as const) {
+      const index = pending.findIndex(
+        (candidate) => candidate.behavior === behavior && matches(candidate),
+      );
+      if (index >= 0) return index;
+    }
+    return -1;
+  };
+  let index =
+    suppliedMessageId === undefined
+      ? text === undefined
+        ? -1
+        : findByDeliveryOrder((candidate) => candidate.text === text)
+      : pending.findIndex((candidate) => candidate.messageId === suppliedMessageId);
+  const matchedMessageId = index >= 0 ? pending[index]?.messageId : undefined;
+  if (index >= 0) pending.splice(index, 1);
+  const messageId = suppliedMessageId ?? matchedMessageId;
+  if (messageId === undefined) return payload;
+  if (isRecord(payload) && payload.type === "event" && isRecord(payload.data)) {
+    return { ...payload, data: { ...payload.data, messageId } };
+  }
+  return isRecord(payload) ? { ...payload, messageId } : payload;
 };
 const encodedBytes = (value: unknown): number => Buffer.byteLength(JSON.stringify(value));
 export const projectQueueValues = (
@@ -951,6 +1107,7 @@ const publishSettledSnapshot = async (runtime: Runtime, settledSequence: number)
 };
 const setExited = (runtime: Runtime, exitCode?: number) => {
   if (runtime.state.status === "exited") return;
+  runtime.pendingMessageCorrelations.length = 0;
   if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
   const sequence = runtime.state.sequence + 1;
   runtime.state = { ...runtime.state, sequence, status: "exited" };
@@ -1030,21 +1187,31 @@ const attachRpc = (runtime: Runtime) => {
         runtime.pending.delete(value.id);
         pending?.resolve(value);
       } else {
+        const correlatedValue = correlateRuntimeUserMessage(
+          value,
+          runtime.pendingMessageCorrelations,
+        );
         if (
-          isRecord(value) &&
-          value.type === "extension_ui_request" &&
-          typeof value.id === "string" &&
-          (value.method === "select" ||
-            value.method === "confirm" ||
-            value.method === "input" ||
-            value.method === "editor")
+          isRecord(correlatedValue) &&
+          correlatedValue.type === "extension_ui_request" &&
+          typeof correlatedValue.id === "string" &&
+          (correlatedValue.method === "select" ||
+            correlatedValue.method === "confirm" ||
+            correlatedValue.method === "input" ||
+            correlatedValue.method === "editor")
         ) {
           runtime.child!.stdin.write(
-            encodeLine({ type: "extension_ui_response", id: value.id, cancelled: true }),
+            encodeLine({
+              type: "extension_ui_response",
+              id: correlatedValue.id,
+              cancelled: true,
+            }),
           );
         }
         const eventType =
-          isRecord(value) && typeof value.type === "string" ? value.type : undefined;
+          isRecord(correlatedValue) && typeof correlatedValue.type === "string"
+            ? correlatedValue.type
+            : undefined;
         if (eventType === "agent_start") clearOverlay(runtime);
         const pendingMessageCount =
           eventType === "queue_update" && isRecord(value)
@@ -1068,9 +1235,10 @@ const attachRpc = (runtime: Runtime) => {
           },
         };
         if (eventType === "agent_settled") {
+          runtime.pendingMessageCorrelations.length = 0;
           void publishSettledSnapshot(runtime, runtime.state.sequence);
         } else {
-          event(runtime, value);
+          event(runtime, correlatedValue);
         }
       }
     }
@@ -1161,6 +1329,23 @@ async function liveWriterForSession(sessionFile: string): Promise<Runtime | unde
 
 type ValidatedExistingPiSessionSpawn = Awaited<ReturnType<typeof validateExistingPiSessionSpawn>>;
 
+async function ensureRpcMessageIdExtension(): Promise<string> {
+  if (rpcMessageIdExtensionReady === undefined) {
+    rpcMessageIdExtensionReady = (async () => {
+      await fs.mkdir(ROOT, { recursive: true });
+      const existing = await fs.readFile(RPC_MESSAGE_ID_EXTENSION_PATH, "utf8").catch(() => "");
+      if (existing !== RPC_MESSAGE_ID_EXTENSION_SOURCE) {
+        await fs.writeFile(RPC_MESSAGE_ID_EXTENSION_PATH, RPC_MESSAGE_ID_EXTENSION_SOURCE, {
+          encoding: "utf8",
+          mode: 0o600,
+        });
+      }
+      return RPC_MESSAGE_ID_EXTENSION_PATH;
+    })();
+  }
+  return rpcMessageIdExtensionReady;
+}
+
 async function spawnRuntime(
   command: Record<string, unknown>,
   existingValidation?: ValidatedExistingPiSessionSpawn,
@@ -1208,8 +1393,10 @@ async function spawnRuntime(
   }
 
   try {
+    const extensionPath = await ensureRpcMessageIdExtension();
     const args = piRpcSpawnArgs({
       sessionsRoot: defaultPiSessionsRoot(),
+      extensionPath,
       ...(sessionFile ? { sessionFile } : {}),
     });
     const child = spawn(process.env.T3_PI_EXECUTABLE ?? "pi", args, {
@@ -1243,6 +1430,7 @@ async function spawnRuntime(
       nextRpcId: 0,
       pending: new Map(),
       bridgePending: new Map(),
+      pendingMessageCorrelations: [],
     };
     runtimes.set(runtimeId, runtime);
     attachRpc(runtime);
@@ -1311,6 +1499,7 @@ export function bridgeCommandFrame(command: Record<string, unknown>) {
     commandId: String(command.commandId),
     command: command.type,
     ...(typeof command.message === "string" ? { text: command.message } : {}),
+    ...(typeof command.messageId === "string" ? { messageId: command.messageId } : {}),
     ...(isRecord(command.lifecycle) ? { lifecycle: command.lifecycle } : {}),
   };
 }
@@ -1323,7 +1512,96 @@ export function existingWriterResumeAndSendCommand(
   return { ...command, type: streamingBehavior, runtimeId };
 }
 
-async function deliverRuntimeCommand(
+const enqueueMessageCorrelation = (
+  runtime: Runtime,
+  command: Record<string, unknown>,
+): PendingMessageCorrelation | undefined => {
+  if (
+    (command.type !== "send" &&
+      command.type !== "steer" &&
+      command.type !== "followUp" &&
+      command.type !== "resumeAndSend") ||
+    typeof command.messageId !== "string" ||
+    typeof command.message !== "string"
+  )
+    return;
+  const correlation: PendingMessageCorrelation = {
+    messageId: command.messageId,
+    text: command.message,
+    behavior:
+      command.type === "resumeAndSend"
+        ? command.streamingBehavior === "followUp" || command.streamingBehavior === "steer"
+          ? command.streamingBehavior
+          : "send"
+        : command.type,
+  };
+  runtime.pendingMessageCorrelations.push(correlation);
+  while (runtime.pendingMessageCorrelations.length > RING_SIZE) {
+    runtime.pendingMessageCorrelations.shift();
+  }
+  return correlation;
+};
+const dropMessageCorrelation = (
+  runtime: Runtime,
+  correlation: PendingMessageCorrelation | undefined,
+) => {
+  if (!correlation) return;
+  const index = runtime.pendingMessageCorrelations.indexOf(correlation);
+  if (index >= 0) runtime.pendingMessageCorrelations.splice(index, 1);
+};
+export const messageIdCorrelationPrompt = (
+  correlation: PendingMessageCorrelation,
+  operation: "enqueue" | "cancel" = "enqueue",
+  commandName = MESSAGE_ID_COMMAND,
+): string =>
+  `/${commandName} ${Buffer.from(JSON.stringify({ version: 1, messageId: correlation.messageId, behavior: correlation.behavior, operation }), "utf8").toString("base64url")}`;
+export const managedMessageIdCommandName = (
+  commands: readonly unknown[],
+  extensionPath: string,
+): string | undefined => {
+  const registered = commands.find((command) => {
+    if (!isRecord(command) || typeof command.name !== "string") return false;
+    const sourceInfo = isRecord(command.sourceInfo) ? command.sourceInfo : undefined;
+    return (
+      sourceInfo !== undefined &&
+      typeof sourceInfo.path === "string" &&
+      path.resolve(sourceInfo.path) === path.resolve(extensionPath)
+    );
+  });
+  return registered && isRecord(registered) && typeof registered.name === "string"
+    ? registered.name
+    : undefined;
+};
+const recordRpcMessageId = async (
+  runtime: Runtime,
+  correlation: PendingMessageCorrelation | undefined,
+) => {
+  if (!correlation) return;
+  if (runtime.messageIdCommandName === undefined) {
+    const response = await rpc(runtime, "get_commands").catch(() => undefined);
+    const data = response && isRecord(response.data) ? response.data : undefined;
+    const commands = data && Array.isArray(data.commands) ? data.commands : [];
+    runtime.messageIdCommandName =
+      managedMessageIdCommandName(commands, RPC_MESSAGE_ID_EXTENSION_PATH) ?? null;
+  }
+  if (runtime.messageIdCommandName === null) {
+    throw new Error("managed Pi message identity extension is unavailable");
+  }
+  await rpc(runtime, "prompt", {
+    message: messageIdCorrelationPrompt(correlation, "enqueue", runtime.messageIdCommandName),
+  });
+};
+const cancelRpcMessageId = async (
+  runtime: Runtime,
+  correlation: PendingMessageCorrelation | undefined,
+) => {
+  if (!correlation || !runtime.messageIdCommandName) return;
+  await rpc(runtime, "prompt", {
+    message: messageIdCorrelationPrompt(correlation, "cancel", runtime.messageIdCommandName),
+  }).catch(() => undefined);
+};
+
+async function deliverRuntimeCommandUnlocked(
   runtime: Runtime,
   command: Record<string, unknown>,
 ): Promise<SupervisorCommandReceipt> {
@@ -1332,6 +1610,7 @@ async function deliverRuntimeCommand(
   if (runtime.state.writerKind === "tuiBridge" && !runtime.bridge)
     throw new Error("bridge is reconnecting");
   if (runtime.bridge) {
+    const correlation = enqueueMessageCorrelation(runtime, command);
     const receipt = await new Promise<Record<string, unknown>>((resolve, reject) => {
       const timer = setTimeout(() => {
         runtime.bridgePending.delete(commandId);
@@ -1350,7 +1629,10 @@ async function deliverRuntimeCommand(
       );
     if (receipt.status === "indeterminate")
       throw new IndeterminateCommandError(String(receipt.error ?? "bridge disconnected"));
-    if (receipt.status === "error") throw new Error(String(receipt.error));
+    if (receipt.status === "error") {
+      dropMessageCorrelation(runtime, correlation);
+      throw new Error(String(receipt.error));
+    }
     return {
       commandId: commandId as never,
       status: "completed",
@@ -1376,6 +1658,13 @@ async function deliverRuntimeCommand(
         : command.type === "steer"
           ? "prompt"
           : "abort";
+  const correlation = enqueueMessageCorrelation(runtime, command);
+  try {
+    await recordRpcMessageId(runtime, correlation);
+  } catch (cause) {
+    dropMessageCorrelation(runtime, correlation);
+    throw cause;
+  }
   try {
     await rpc(
       runtime,
@@ -1389,7 +1678,11 @@ async function deliverRuntimeCommand(
         : {},
     );
   } catch (cause) {
-    if (cause instanceof RpcCommandRejectedError) throw cause;
+    if (cause instanceof RpcCommandRejectedError) {
+      await cancelRpcMessageId(runtime, correlation);
+      dropMessageCorrelation(runtime, correlation);
+      throw cause;
+    }
     throw new IndeterminateCommandError(
       cause instanceof Error ? cause.message : "pi command outcome is unknown",
     );
@@ -1403,20 +1696,32 @@ async function deliverRuntimeCommand(
     };
   const state = isRecord(stateResponse.data) ? stateResponse.data : {};
   const isStreaming = state.isStreaming === true;
+  const pendingMessageCount =
+    typeof state.pendingMessageCount === "number"
+      ? Math.max(0, Math.trunc(state.pendingMessageCount))
+      : 0;
   runtime.state = {
     ...runtime.state,
     status: isStreaming ? "streaming" : "idle",
     state,
     overlay: {
       isStreaming,
-      pendingMessageCount:
-        typeof state.pendingMessageCount === "number"
-          ? Math.max(0, Math.trunc(state.pendingMessageCount))
-          : 0,
+      pendingMessageCount,
       lastEventType: "get_state",
     },
   };
   return { commandId: commandId as never, status: "completed", runtimeId: runtime.state.runtimeId };
+}
+
+async function deliverRuntimeCommand(
+  runtime: Runtime,
+  command: Record<string, unknown>,
+): Promise<SupervisorCommandReceipt> {
+  return runKeyedSerialQueue({
+    entries: runtimeDeliveryQueues,
+    key: String(runtime.state.runtimeId),
+    run: () => deliverRuntimeCommandUnlocked(runtime, command),
+  });
 }
 
 export function runKeyedSerialQueue<T>(input: {
@@ -1500,22 +1805,16 @@ async function execute(
             existingWriterResumeAndSendCommand(command, acquisition.runtime.state.runtimeId),
           );
         }
-        try {
-          await rpc(acquisition.runtime, "prompt", {
-            message: String(command.message),
-            ...(Array.isArray(command.images) ? { images: command.images } : {}),
-          });
-        } catch (cause) {
-          if (cause instanceof RpcCommandRejectedError) throw cause;
-          throw new IndeterminateCommandError(
-            cause instanceof Error ? cause.message : "pi command outcome is unknown",
-          );
-        }
-        return {
-          commandId: commandId as never,
-          status: "completed",
-          runtimeId: acquisition.runtime.state.runtimeId,
-        };
+        return runKeyedSerialQueue({
+          entries: runtimeDeliveryQueues,
+          key: String(acquisition.runtime.state.runtimeId),
+          run: () =>
+            deliverRuntimeCommandUnlocked(acquisition.runtime, {
+              ...command,
+              type: "send",
+              runtimeId: acquisition.runtime.state.runtimeId,
+            }),
+        });
       },
     });
   }
@@ -1711,6 +2010,7 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
           nextRpcId: 0,
           pending: new Map(),
           bridgePending: new Map(),
+          pendingMessageCorrelations: [],
         } satisfies Runtime);
       if (socketGuard.isClosed()) return;
       if (runtime.bridgeExpiry) clearTimeout(runtime.bridgeExpiry);
@@ -1726,6 +2026,9 @@ async function registerBridge(socket: Socket, frame: Record<string, unknown>) {
       const followUp = Array.isArray(frame.followUp)
         ? frame.followUp.filter((value): value is string => typeof value === "string")
         : [];
+      if (bridgeRegistrationIsSettled(bridgeIsStreaming, steering, followUp)) {
+        runtime.pendingMessageCorrelations.length = 0;
+      }
       runtime.state = {
         ...runtime.state,
         status: bridgeIsStreaming ? "streaming" : "idle",
@@ -1991,14 +2294,22 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
   const bridged = [...runtimes.values()].find((candidate) => candidate.bridge === socket);
   if (value.type === "event") {
     if (bridged) {
-      if (value.event === "agent_start") clearOverlay(bridged);
+      const correlatedValue = correlateRuntimeUserMessage(
+        value,
+        bridged.pendingMessageCorrelations,
+      );
+      if (!isRecord(correlatedValue)) return;
+      if (correlatedValue.event === "agent_start") clearOverlay(bridged);
       const streaming =
-        value.event === "agent_start"
+        correlatedValue.event === "agent_start"
           ? true
-          : value.event === "agent_settled"
+          : correlatedValue.event === "agent_settled"
             ? false
             : (bridged.state.overlay?.isStreaming ?? false);
-      const queueData = value.event === "queue_update" && isRecord(value.data) ? value.data : {};
+      const queueData =
+        correlatedValue.event === "queue_update" && isRecord(correlatedValue.data)
+          ? correlatedValue.data
+          : {};
       const pendingMessageCount =
         (Array.isArray(queueData.steering) ? queueData.steering.length : 0) +
         (Array.isArray(queueData.followUp) ? queueData.followUp.length : 0);
@@ -2007,20 +2318,23 @@ async function handleFrame(socket: Socket, value: unknown): Promise<void> {
         overlay: {
           ...(bridged.state.overlay ?? { isStreaming: false, pendingMessageCount: 0 }),
           isStreaming: streaming,
-          ...(value.event === "queue_update" ? { pendingMessageCount } : {}),
-          ...(typeof value.event === "string" ? { lastEventType: value.event } : {}),
+          ...(correlatedValue.event === "queue_update" ? { pendingMessageCount } : {}),
+          ...(typeof correlatedValue.event === "string"
+            ? { lastEventType: correlatedValue.event }
+            : {}),
         },
         status:
-          value.event === "agent_start"
+          correlatedValue.event === "agent_start"
             ? "streaming"
-            : value.event === "agent_settled"
+            : correlatedValue.event === "agent_settled"
               ? "idle"
               : bridged.state.status,
       };
-      if (value.event === "agent_settled") {
+      if (correlatedValue.event === "agent_settled") {
+        bridged.pendingMessageCorrelations.length = 0;
         void publishSettledSnapshot(bridged, bridged.state.sequence);
       } else {
-        event(bridged, value);
+        event(bridged, correlatedValue);
       }
     }
     return;
