@@ -7,6 +7,7 @@ import * as NodeFS from "node:fs";
 import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
+import * as NodePerformance from "node:perf_hooks";
 import type {
   ManagedClaimRequest,
   ManagedClaimResponse,
@@ -35,7 +36,8 @@ const { createHash, randomUUID } = NodeCrypto;
 const { spawn } = NodeChildProcess;
 const fs = NodeFS.promises;
 const { createConnection, createServer } = NodeNet;
-const { homedir } = NodeOS;
+const { homedir, uptime } = NodeOS;
+const { performance } = NodePerformance;
 const path = NodePath;
 type ChildProcessWithoutNullStreams = NodeChildProcess.ChildProcessWithoutNullStreams;
 type Socket = NodeNet.Socket;
@@ -2151,11 +2153,137 @@ async function readAppendedEntries(sessionFile: string | undefined, offset: numb
     await handle?.close();
   }
 }
-export async function createSupervisorLockFile(lockPath: string, pid: number): Promise<boolean> {
-  const candidate = `${lockPath}.candidate-${pid}-${randomUUID()}`;
+interface SupervisorLockOwner {
+  readonly version: 1;
+  readonly pid: number;
+  readonly instanceId: string;
+  readonly witnessPort: number;
+}
+
+const encodeSupervisorLockOwner = (owner: SupervisorLockOwner) => JSON.stringify(owner);
+
+export function decodeSupervisorLockOwner(value: string): SupervisorLockOwner | undefined {
+  try {
+    const owner: unknown = JSON.parse(value);
+    if (
+      !isRecord(owner) ||
+      owner.version !== 1 ||
+      !Number.isSafeInteger(owner.pid) ||
+      Number(owner.pid) <= 0 ||
+      typeof owner.instanceId !== "string" ||
+      owner.instanceId.length === 0 ||
+      owner.instanceId.length > 128 ||
+      !Number.isSafeInteger(owner.witnessPort) ||
+      Number(owner.witnessPort) <= 0 ||
+      Number(owner.witnessPort) > 65_535
+    )
+      return;
+    return owner as unknown as SupervisorLockOwner;
+  } catch {
+    return;
+  }
+}
+
+async function openSupervisorWitness(instanceId: string): Promise<{
+  readonly server: NodeNet.Server;
+  readonly port: number;
+}> {
+  const server = createServer((socket) => {
+    socket.on("error", () => socket.destroy());
+    socket.end(instanceId);
+  });
+  try {
+    await new Promise<void>((resolve, reject) =>
+      server.listen(0, "127.0.0.1", resolve).once("error", reject),
+    );
+    const address = server.address();
+    if (!address || typeof address === "string")
+      throw new Error("pi supervisor witness did not bind a TCP port");
+    server.unref();
+    return { server, port: address.port };
+  } catch (cause) {
+    if (server.listening) server.close();
+    throw cause;
+  }
+}
+
+async function probeSupervisorWitness(owner: SupervisorLockOwner): Promise<boolean> {
+  return await new Promise<boolean>((resolve) => {
+    const socket = createConnection(owner.witnessPort, "127.0.0.1");
+    let response = "";
+    let settled = false;
+    const finish = (live: boolean) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(live);
+    };
+    socket.setEncoding("utf8");
+    socket.setTimeout(500, () => finish(false));
+    socket.on("data", (chunk: string) => {
+      response += chunk;
+      if (response.length > owner.instanceId.length) finish(false);
+    });
+    socket.once("end", () => finish(response === owner.instanceId));
+    socket.once("error", () => finish(false));
+  });
+}
+
+const probeSupervisorSocket = (socketPath: string) =>
+  new Promise<boolean>((resolve) => {
+    const probe = createConnection(socketPath);
+    probe.once("connect", () => {
+      probe.end();
+      resolve(true);
+    });
+    probe.once("error", () => resolve(false));
+  });
+
+/**
+ * new locks use a process-owned loopback witness because pid values can identify
+ * unrelated processes after their original owner exits. numeric locks from the
+ * current boot remain fail-closed while older detached supervisors age out.
+ */
+export async function supervisorLockOwnerIsLive(options: {
+  readonly ownerText: string;
+  readonly lockMtimeMs: number;
+  readonly socketPath: string;
+  readonly socketAttempts?: number;
+  readonly currentTimeMs?: number;
+  readonly systemUptimeMs?: number;
+}): Promise<boolean> {
+  const owner = decodeSupervisorLockOwner(options.ownerText);
+  if (owner && (await probeSupervisorWitness(owner))) return true;
+  if (!owner) {
+    const legacyPid = Number.parseInt(options.ownerText, 10);
+    const currentTimeMs = options.currentTimeMs ?? performance.timeOrigin + performance.now();
+    const systemUptimeMs = options.systemUptimeMs ?? uptime() * 1_000;
+    const bootTimeMs = currentTimeMs - systemUptimeMs;
+    if (Number.isSafeInteger(legacyPid) && legacyPid > 0 && options.lockMtimeMs >= bootTimeMs) {
+      try {
+        process.kill(legacyPid, 0);
+        return true;
+      } catch (cause) {
+        if (!(cause instanceof Error) || !("code" in cause) || cause.code !== "ESRCH") throw cause;
+      }
+    }
+  }
+  const attempts = options.socketAttempts ?? 40;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    if (await probeSupervisorSocket(options.socketPath)) return true;
+    if (attempt + 1 < attempts) await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return false;
+}
+
+export async function createSupervisorLockFile(
+  lockPath: string,
+  ownerText: string,
+): Promise<boolean> {
+  const candidate = `${lockPath}.candidate-${process.pid}-${randomUUID()}`;
   const handle = await fs.open(candidate, "wx", 0o600);
   try {
-    await handle.writeFile(String(pid));
+    await handle.writeFile(ownerText);
     await handle.sync();
   } finally {
     await handle.close();
@@ -2171,49 +2299,79 @@ export async function createSupervisorLockFile(lockPath: string, pid: number): P
   }
 }
 
-export async function runSupervisorDaemon(): Promise<never> {
-  await fs.mkdir(ROOT, { recursive: true, mode: 0o700 });
-  await fs.chmod(ROOT, 0o700);
-  const lockPath = path.join(ROOT, "supervisor.lock");
-  while (!(await createSupervisorLockFile(lockPath, process.pid))) {
-    const ownerText = await fs.readFile(lockPath, "utf8").catch(() => "");
-    const ownerPid = Number.parseInt(ownerText, 10);
-    if (Number.isSafeInteger(ownerPid) && ownerPid > 0) {
-      try {
-        process.kill(ownerPid, 0);
-        throw new Error("pi supervisor already running");
-      } catch (cause) {
-        if (!(cause instanceof Error) || !("code" in cause) || cause.code !== "ESRCH") throw cause;
-      }
-    }
-    let live = false;
-    for (let attempt = 0; attempt < 40 && !live; attempt++) {
-      live = await new Promise<boolean>((resolve) => {
-        const probe = createConnection(supervisorSocketPath);
-        probe.once("connect", () => {
-          probe.end();
-          resolve(true);
-        });
-        probe.once("error", () => resolve(false));
-      });
-      if (!live) await new Promise((resolve) => setTimeout(resolve, 50));
-    }
-    if (live) throw new Error("pi supervisor already running");
-    const staleClaim = `${lockPath}.stale-${process.pid}-${randomUUID()}`;
+export async function acquireSupervisorLockFile(options: {
+  readonly lockPath: string;
+  readonly ownerText: string;
+  readonly socketPath: string;
+  readonly socketAttempts?: number;
+}): Promise<void> {
+  while (!(await createSupervisorLockFile(options.lockPath, options.ownerText))) {
+    const existingOwner = await fs.readFile(options.lockPath, "utf8").catch(() => "");
+    const existingStat = await fs.stat(options.lockPath).catch((cause) => {
+      if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") return;
+      throw cause;
+    });
+    if (!existingStat) continue;
+    if (
+      await supervisorLockOwnerIsLive({
+        ownerText: existingOwner,
+        lockMtimeMs: existingStat.mtimeMs,
+        socketPath: options.socketPath,
+        ...(options.socketAttempts === undefined ? {} : { socketAttempts: options.socketAttempts }),
+      })
+    )
+      throw new Error("pi supervisor already running");
+    const staleClaim = `${options.lockPath}.stale-${process.pid}-${randomUUID()}`;
     try {
-      await fs.rename(lockPath, staleClaim);
+      await fs.rename(options.lockPath, staleClaim);
     } catch (cause) {
       if (cause instanceof Error && "code" in cause && cause.code === "ENOENT") continue;
       throw cause;
     }
     const claimedOwner = await fs.readFile(staleClaim, "utf8").catch(() => "");
-    if (claimedOwner !== ownerText) {
-      await fs.link(staleClaim, lockPath).catch(() => undefined);
+    if (claimedOwner !== existingOwner) {
+      await fs.link(staleClaim, options.lockPath).catch(() => undefined);
+      await fs.rm(staleClaim, { force: true });
+      throw new Error("pi supervisor already running");
+    }
+    const claimedStat = await fs.stat(staleClaim);
+    if (
+      await supervisorLockOwnerIsLive({
+        ownerText: claimedOwner,
+        lockMtimeMs: claimedStat.mtimeMs,
+        socketPath: options.socketPath,
+        socketAttempts: 1,
+      })
+    ) {
+      await fs.link(staleClaim, options.lockPath).catch(() => undefined);
       await fs.rm(staleClaim, { force: true });
       throw new Error("pi supervisor already running");
     }
     await fs.rm(staleClaim, { force: true });
   }
+}
+
+export async function runSupervisorDaemon(): Promise<never> {
+  await fs.mkdir(ROOT, { recursive: true, mode: 0o700 });
+  await fs.chmod(ROOT, 0o700);
+  const instanceId = randomUUID();
+  const witness = await openSupervisorWitness(instanceId);
+  const lockOwnerText = encodeSupervisorLockOwner({
+    version: 1,
+    pid: process.pid,
+    instanceId,
+    witnessPort: witness.port,
+  });
+  const lockPath = path.join(ROOT, "supervisor.lock");
+  await acquireSupervisorLockFile({
+    lockPath,
+    ownerText: lockOwnerText,
+    socketPath: supervisorSocketPath,
+  });
+  if ((await fs.readFile(lockPath, "utf8")) !== lockOwnerText)
+    throw new Error("pi supervisor lost its startup lock");
+  if (await probeSupervisorSocket(supervisorSocketPath))
+    throw new Error("pi supervisor already running");
   try {
     ledger = JSON.parse(await fs.readFile(LEDGER, "utf8")) as typeof ledger;
   } catch (cause) {
@@ -2236,6 +2394,10 @@ export async function runSupervisorDaemon(): Promise<never> {
   }
   if (recoveredIndeterminate) await atomicLedger();
   await managedAdmissions.recoverAfterRestart();
+  if ((await fs.readFile(lockPath, "utf8")) !== lockOwnerText)
+    throw new Error("pi supervisor lost its startup lock");
+  if (await probeSupervisorSocket(supervisorSocketPath))
+    throw new Error("pi supervisor already running");
   await fs.rm(supervisorSocketPath, { force: true });
   const server = createServer((socket) => {
     socket.setEncoding("utf8");
@@ -2269,10 +2431,24 @@ export async function runSupervisorDaemon(): Promise<never> {
       }
     });
   });
-  await new Promise<void>((resolve, reject) =>
-    server.listen(supervisorSocketPath, resolve).once("error", reject),
-  );
-  await fs.chmod(supervisorSocketPath, 0o600);
+  try {
+    await new Promise<void>((resolve, reject) =>
+      server.listen(supervisorSocketPath, resolve).once("error", reject),
+    );
+    await fs.chmod(supervisorSocketPath, 0o600);
+    if ((await fs.readFile(lockPath, "utf8")) !== lockOwnerText) {
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+      throw new Error("pi supervisor lost its startup lock");
+    }
+  } catch (cause) {
+    if (server.listening)
+      await new Promise<void>((resolve) => {
+        server.close(() => resolve());
+      });
+    throw cause;
+  }
   return await new Promise<never>(() => {});
 }
 

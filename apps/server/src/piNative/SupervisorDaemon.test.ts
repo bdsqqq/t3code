@@ -4,10 +4,12 @@ import { describe, expect, it } from "@effect/vitest";
 import * as NodeCrypto from "node:crypto";
 import * as NodeEvents from "node:events";
 import * as NodeFS from "node:fs";
+import * as NodeNet from "node:net";
 import * as NodeOS from "node:os";
 import * as NodePath from "node:path";
 
 import {
+  acquireSupervisorLockFile,
   projectOverlayPayload,
   acquireResumeAndSendRuntime,
   bridgeRegistrationIsSettled,
@@ -38,6 +40,7 @@ import {
   queuePayloadHasPending,
   shouldUseSnapshot,
   shouldRestartPersistedSession,
+  supervisorLockOwnerIsLive,
   validateExistingPiSessionSpawn,
 } from "./SupervisorDaemon.ts";
 import {
@@ -833,12 +836,94 @@ describe("native Pi replay projection", () => {
     const lockPath = NodePath.join(root, "supervisor.lock");
     try {
       const [first, second] = await Promise.all([
-        createSupervisorLockFile(lockPath, 1001),
-        createSupervisorLockFile(lockPath, 1002),
+        createSupervisorLockFile(lockPath, "owner-1"),
+        createSupervisorLockFile(lockPath, "owner-2"),
       ]);
       expect([first, second].filter(Boolean)).toHaveLength(1);
     } finally {
       await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("does not trust a reused pid from a numeric lock created before boot", async () => {
+    const currentTimeMs = 1_000_000;
+    const systemUptimeMs = 60_000;
+    expect(
+      await supervisorLockOwnerIsLive({
+        ownerText: String(process.pid),
+        lockMtimeMs: currentTimeMs - systemUptimeMs - 1,
+        socketPath: NodePath.join(NodeOS.tmpdir(), `missing-supervisor-${NodeCrypto.randomUUID()}`),
+        socketAttempts: 1,
+        currentTimeMs,
+        systemUptimeMs,
+      }),
+    ).toBe(false);
+    expect(
+      await supervisorLockOwnerIsLive({
+        ownerText: String(process.pid),
+        lockMtimeMs: currentTimeMs - systemUptimeMs,
+        socketPath: NodePath.join(NodeOS.tmpdir(), `missing-supervisor-${NodeCrypto.randomUUID()}`),
+        socketAttempts: 1,
+        currentTimeMs,
+        systemUptimeMs,
+      }),
+    ).toBe(true);
+  });
+
+  it("replaces an ownerless numeric lock even when its pid was reused", async () => {
+    const root = await NodeFS.promises.mkdtemp(
+      NodePath.join(NodeOS.tmpdir(), "t3-supervisor-stale-lock-"),
+    );
+    const lockPath = NodePath.join(root, "supervisor.lock");
+    const replacement = JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      instanceId: NodeCrypto.randomUUID(),
+      witnessPort: 65_535,
+    });
+    try {
+      await NodeFS.promises.writeFile(lockPath, String(process.pid), { mode: 0o600 });
+      await NodeFS.promises.utimes(lockPath, 0, 0);
+      await acquireSupervisorLockFile({
+        lockPath,
+        ownerText: replacement,
+        socketPath: NodePath.join(root, "missing-supervisor.sock"),
+        socketAttempts: 1,
+      });
+
+      expect(await NodeFS.promises.readFile(lockPath, "utf8")).toBe(replacement);
+    } finally {
+      await NodeFS.promises.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("recognizes the lock owner by its process-bound witness", async () => {
+    const instanceId = NodeCrypto.randomUUID();
+    const witness = NodeNet.createServer((socket) => socket.end(instanceId));
+    await new Promise<void>((resolve, reject) =>
+      witness.listen(0, "127.0.0.1", resolve).once("error", reject),
+    );
+    const address = witness.address();
+    if (!address || typeof address === "string") throw new Error("test witness did not bind");
+    try {
+      expect(
+        await supervisorLockOwnerIsLive({
+          ownerText: JSON.stringify({
+            version: 1,
+            pid: process.pid,
+            instanceId,
+            witnessPort: address.port,
+          }),
+          lockMtimeMs: 0,
+          socketPath: NodePath.join(
+            NodeOS.tmpdir(),
+            `missing-supervisor-${NodeCrypto.randomUUID()}`,
+          ),
+          socketAttempts: 1,
+        }),
+      ).toBe(true);
+    } finally {
+      await new Promise<void>((resolve) => witness.close(() => resolve()));
     }
   });
 });
