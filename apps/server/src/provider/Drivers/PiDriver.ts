@@ -91,7 +91,7 @@ export const PiDriver: ProviderDriver<PiSettings, PiDriverEnv> = {
       });
       const source = makeProviderSnapshotSettingsSource(effectiveConfig, serverSettings);
       const snapshot = yield* makeManagedServerProvider<ProviderSnapshotSettings<PiSettings>>({
-        maintenanceCapabilities,
+        resolveMaintenance: () => Effect.succeed(maintenanceCapabilities),
         getSettings: source.getSettings,
         streamSettings: source.streamSettings,
         haveSettingsChanged: haveProviderSnapshotSettingsChanged,

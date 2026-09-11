@@ -179,7 +179,7 @@ export const PiExternalCreateSessionResult = Schema.Struct({
 });
 export type PiExternalCreateSessionResult = typeof PiExternalCreateSessionResult.Type;
 
-export class PiNativeError extends Schema.TaggedErrorClass<PiNativeError>()("PiNativeError", {
+export class PiNativeError extends Schema.TaggedError<PiNativeError>()("PiNativeError", {
   code: Schema.String,
   message: Schema.String,
 }) {}

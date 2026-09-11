@@ -572,6 +572,7 @@ export function projectPiThread(input: {
     proposedPlans: [],
     activities: history.activities,
     checkpoints: [],
+    pullRequests: [],
     session,
     backing: projectPiBacking(input.record, input.runtime, input.catalogResumeSupported),
     historyTruncation: {
@@ -855,6 +856,7 @@ export function projectPiThreadShell(
     settledAt: thread.settledAt,
     snoozedUntil: thread.snoozedUntil,
     snoozedAt: thread.snoozedAt,
+    pullRequests: thread.pullRequests,
     session: thread.session,
     latestUserMessageAt:
       thread.messages.findLast((message) => message.role === "user")?.createdAt ?? null,

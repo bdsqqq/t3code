@@ -19,7 +19,7 @@ import type * as EffectAcpSchema from "effect-acp/schema";
 
 import { resolveAttachmentPath } from "../../attachmentStore.ts";
 import {
-  drainAntigravityStderr,
+  makeAntigravityStderrHandler,
   makeAntigravityStdoutTransform,
 } from "../antigravityAuthSupport.ts";
 import * as AcpSessionRuntime from "./AcpSessionRuntime.ts";
@@ -35,6 +35,8 @@ export interface AntigravityAcpRuntimeInput extends Omit<
   | "transformSessionUpdate"
   | "transformStdout"
 > {
+  /** Device CLI environment supplied for this provider session. */
+  readonly agentDeviceEnvironment?: Readonly<Record<string, string>>;
   readonly childProcessSpawner: ChildProcessSpawner.ChildProcessSpawner["Service"];
   readonly onAuthorizationUrl?: (url: string) => Effect.Effect<void, EffectAcpErrors.AcpError>;
   /**
@@ -73,7 +75,9 @@ export const makeAntigravityAcpRuntime = Effect.fn("makeAntigravityAcpRuntime")(
       transformStdout: makeAntigravityStdoutTransform(
         input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {},
       ),
-      onStderr: drainAntigravityStderr,
+      onStderr: makeAntigravityStderrHandler(
+        input.onAuthorizationUrl ? { onAuthorizationUrl: input.onAuthorizationUrl } : {},
+      ),
       transformSessionUpdate: normalizeAntigravitySessionUpdate,
     }).pipe(
       Layer.provide(
@@ -179,7 +183,7 @@ const AUDIO_MIME_TYPES = new Set([
   "audio/x-wav",
   "audio/webm",
 ]);
-export const ANTIGRAVITY_MAX_AUDIO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+const ANTIGRAVITY_MAX_AUDIO_ATTACHMENT_BYTES = 20 * 1024 * 1024;
 const TEXT_MIME_TYPES = new Set([
   "application/json",
   "application/ld+json",

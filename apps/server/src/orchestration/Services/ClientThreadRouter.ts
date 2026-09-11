@@ -11,15 +11,18 @@ import {
   OrchestrationDispatchCommandError,
   OrchestrationGetSnapshotError,
 } from "@t3tools/contracts";
+import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
+import * as Queue from "effect/Queue";
 import * as Stream from "effect/Stream";
 
 import {
   type PiExternalThreadSource,
   isPiExternalThreadId,
 } from "../../piNative/PiExternalThreadSource.ts";
-import { projectThreadDetailSnapshot } from "../ActivityPayloadProjection.ts";
+import { projectActivityEvent, projectThreadDetailSnapshot } from "../ActivityPayloadProjection.ts";
+import { makeLiveStreamBudget, type RetainedLiveItem } from "../LiveStreamBudget.ts";
 import type { ProjectionSnapshotQuery } from "./ProjectionSnapshotQuery.ts";
 
 type ExternalSource = Option.Option<PiExternalThreadSource["Service"]>;
@@ -74,6 +77,21 @@ export function getExternalThreadSubscription(
     onNone: () => Stream.fail(missingExternalSource()),
     onSome: (source) =>
       source.subscribeThread(input).pipe(
+        Stream.map((item) => {
+          if (item.kind === "snapshot") {
+            return {
+              ...item,
+              snapshot: projectThreadDetailSnapshot(item.snapshot),
+            };
+          }
+          if (item.kind === "event") {
+            return {
+              ...item,
+              event: projectActivityEvent(item.event),
+            };
+          }
+          return item;
+        }),
         Stream.mapError(
           (cause) =>
             new OrchestrationGetSnapshotError({
@@ -84,6 +102,38 @@ export function getExternalThreadSubscription(
       ),
   });
 }
+
+export const makeBoundedExternalThreadSubscription = Effect.fn(
+  "ClientThreadRouter.makeBoundedExternalThreadSubscription",
+)(function* (
+  source: Stream.Stream<OrchestrationThreadStreamItem, OrchestrationGetSnapshotError>,
+  limits?: {
+    readonly maxItems?: number;
+    readonly maxSerializedBytes?: number;
+  },
+) {
+  const budget = yield* makeLiveStreamBudget(limits);
+  const output = yield* Queue.unbounded<
+    RetainedLiveItem<OrchestrationThreadStreamItem>,
+    OrchestrationGetSnapshotError | Cause.Done<void>
+  >();
+  yield* Effect.addFinalizer(() => Queue.shutdown(output));
+  yield* source.pipe(
+    Stream.runForEach((item) =>
+      budget.retain(item).pipe(
+        Effect.flatMap((retained) => Queue.offer(output, retained)),
+        Effect.uninterruptible,
+      ),
+    ),
+    Effect.raceFirst(budget.failed),
+    Effect.matchCauseEffect({
+      onFailure: (cause) => Queue.failCause(output, cause),
+      onSuccess: () => Queue.end(output),
+    }),
+    Effect.forkScoped({ startImmediately: true }),
+  );
+  return budget.deliver(Stream.fromQueue(output));
+});
 
 export function getExternalThreadDispatch(
   command: ClientOrchestrationCommand,

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 
-import { buildDayColumns, niceScale } from "./UsageProviderChart";
+import { buildPeriodColumns, niceScale } from "./UsageProviderChart";
 import { providersWithUsage } from "./usageProviders";
 
 describe("niceScale", () => {
@@ -41,7 +41,7 @@ describe("niceScale", () => {
   });
 });
 
-describe("buildDayColumns", () => {
+describe("buildPeriodColumns", () => {
   const days = ["2026-08-01", "2026-08-02", "2026-08-03"];
   const byDay = new Map([
     [
@@ -73,11 +73,13 @@ describe("buildDayColumns", () => {
   ]);
 
   it("plots each day on its own", () => {
-    expect(buildDayColumns(days, byDay, "cost").map((column) => column.total)).toEqual([35, 0, 10]);
+    expect(buildPeriodColumns(days, byDay, "cost").map((column) => column.total)).toEqual([
+      35, 0, 10,
+    ]);
   });
 
   it("reads the requested metric", () => {
-    expect(buildDayColumns(days, byDay, "tokens").map((column) => column.total)).toEqual([
+    expect(buildPeriodColumns(days, byDay, "tokens").map((column) => column.total)).toEqual([
       350, 0, 100,
     ]);
   });
@@ -85,7 +87,7 @@ describe("buildDayColumns", () => {
   it("keeps band values absolute rather than cumulative", () => {
     // Regression: the bands were once stack offsets, which drew Claude Code
     // permanently above Codex regardless of which provider spent more.
-    const [first] = buildDayColumns(days, byDay, "cost");
+    const [first] = buildPeriodColumns(days, byDay, "cost");
 
     expect(first?.bands).toEqual([
       { provider: "codex", value: 10 },
@@ -96,7 +98,7 @@ describe("buildDayColumns", () => {
   });
 
   it("reports the total as the sum of its bands", () => {
-    for (const column of buildDayColumns(days, byDay, "cost")) {
+    for (const column of buildPeriodColumns(days, byDay, "cost")) {
       const sum = column.bands.reduce((running, band) => running + band.value, 0);
       expect(column.total).toBeCloseTo(sum, 9);
     }
@@ -131,7 +133,7 @@ describe("hourly chart columns", () => {
     ]);
 
     expect(
-      buildDayColumns(
+      buildPeriodColumns(
         ["2026-08-11T08:37:00.000Z", "2026-08-11T09:37:00.000Z", "2026-08-11T10:37:00.000Z"],
         byHour,
         "cost",

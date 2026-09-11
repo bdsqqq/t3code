@@ -21,22 +21,22 @@ import {
   type PiThinkingLevel,
 } from "./PiRpcSchema.ts";
 
-export class PiRpcProtocolError extends Schema.TaggedErrorClass<PiRpcProtocolError>()(
+export class PiRpcProtocolError extends Schema.TaggedError<PiRpcProtocolError>()(
   "PiRpcProtocolError",
   { detail: Schema.String, cause: Schema.optional(Schema.Defect()) },
 ) {}
 
-export class PiRpcRequestTimeoutError extends Schema.TaggedErrorClass<PiRpcRequestTimeoutError>()(
+export class PiRpcRequestTimeoutError extends Schema.TaggedError<PiRpcRequestTimeoutError>()(
   "PiRpcRequestTimeoutError",
   { command: Schema.String, requestId: Schema.String, timeoutMs: Schema.Number },
 ) {}
 
-export class PiRpcCommandError extends Schema.TaggedErrorClass<PiRpcCommandError>()(
+export class PiRpcCommandError extends Schema.TaggedError<PiRpcCommandError>()(
   "PiRpcCommandError",
   { command: Schema.String, requestId: Schema.String, detail: Schema.String },
 ) {}
 
-export class PiRpcProcessExitedError extends Schema.TaggedErrorClass<PiRpcProcessExitedError>()(
+export class PiRpcProcessExitedError extends Schema.TaggedError<PiRpcProcessExitedError>()(
   "PiRpcProcessExitedError",
   { detail: Schema.String, exitCode: Schema.optional(Schema.Number) },
 ) {}

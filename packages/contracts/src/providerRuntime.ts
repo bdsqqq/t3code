@@ -14,6 +14,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderInstanceId, ProviderDriverKind } from "./providerInstance.ts";
+import { ProviderUsageLimitsUpdate } from "./providerUsageLimits.ts";
 import { ProviderApprovalOption } from "./orchestration.ts";
 
 const TrimmedNonEmptyStringSchema = TrimmedNonEmptyString;
@@ -103,7 +104,7 @@ const RuntimeErrorClass = Schema.Literals([
 ]);
 export type RuntimeErrorClass = typeof RuntimeErrorClass.Type;
 
-export const TOOL_LIFECYCLE_ITEM_TYPES = [
+const TOOL_LIFECYCLE_ITEM_TYPES = [
   "command_execution",
   "file_change",
   "mcp_tool_call",
@@ -186,6 +187,7 @@ const ProviderRuntimeEventType = Schema.Literals([
   "hook.completed",
   "tool.progress",
   "tool.summary",
+  "tool.denied",
   "auth.status",
   "account.updated",
   "account.rate-limits.updated",
@@ -299,6 +301,8 @@ export type ThreadStartedPayload = typeof ThreadStartedPayload.Type;
 
 const ThreadStateChangedPayload = Schema.Struct({
   state: RuntimeThreadState,
+  beforeTokens: Schema.optional(NonNegativeInt),
+  afterTokens: Schema.optional(NonNegativeInt),
   detail: Schema.optional(Schema.Unknown),
 });
 export type ThreadStateChangedPayload = typeof ThreadStateChangedPayload.Type;
@@ -365,6 +369,35 @@ const TurnStartedPayload = Schema.Struct({
 });
 export type TurnStartedPayload = typeof TurnStartedPayload.Type;
 
+/**
+ * Normalized main-agent usage for one turn. Input includes cache reads and
+ * writes. Output includes reasoning, and reasoningTokens is an optional subset.
+ * Complete means the provider supplied full input and output totals. Partial
+ * means every included count is valid, but the full turn total is not known.
+ */
+const TurnTokenUsageCommonFields = {
+  usageScope: Schema.Literal("main_agent"),
+  cachedInputTokens: Schema.optional(NonNegativeInt),
+  cacheCreationTokens: Schema.optional(NonNegativeInt),
+  reasoningTokens: Schema.optional(NonNegativeInt),
+  hasSubagents: Schema.Boolean,
+};
+export const TurnTokenUsage = Schema.Union([
+  Schema.Struct({
+    ...TurnTokenUsageCommonFields,
+    usageStatus: Schema.Literal("complete"),
+    inputTokens: NonNegativeInt,
+    outputTokens: NonNegativeInt,
+  }),
+  Schema.Struct({
+    ...TurnTokenUsageCommonFields,
+    usageStatus: Schema.Literals(["partial", "unavailable"]),
+    inputTokens: Schema.optional(NonNegativeInt),
+    outputTokens: Schema.optional(NonNegativeInt),
+  }),
+]);
+export type TurnTokenUsage = typeof TurnTokenUsage.Type;
+
 const TurnCompletedPayload = Schema.Struct({
   state: RuntimeTurnState,
   stopReason: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
@@ -372,11 +405,13 @@ const TurnCompletedPayload = Schema.Struct({
   modelUsage: Schema.optional(UnknownRecordSchema),
   totalCostUsd: Schema.optional(Schema.Number),
   errorMessage: Schema.optional(TrimmedNonEmptyStringSchema),
+  tokenUsage: Schema.optional(TurnTokenUsage),
 });
 export type TurnCompletedPayload = typeof TurnCompletedPayload.Type;
 
 const TurnAbortedPayload = Schema.Struct({
   reason: TrimmedNonEmptyStringSchema,
+  tokenUsage: Schema.optional(TurnTokenUsage),
 });
 export type TurnAbortedPayload = typeof TurnAbortedPayload.Type;
 
@@ -492,7 +527,7 @@ export type RequestResolvedPayload = typeof RequestResolvedPayload.Type;
 
 const UserInputQuestionOption = Schema.Struct({
   label: TrimmedNonEmptyStringSchema,
-  description: TrimmedNonEmptyStringSchema,
+  description: Schema.String,
   value: Schema.optional(Schema.String),
 });
 export type UserInputQuestionOption = typeof UserInputQuestionOption.Type;
@@ -509,8 +544,9 @@ export const UserInputQuestion = Schema.Struct({
 });
 export type UserInputQuestion = typeof UserInputQuestion.Type;
 
-const UserInputRequestedPayload = Schema.Struct({
+export const UserInputRequestedPayload = Schema.Struct({
   questions: Schema.Array(UserInputQuestion),
+  responseMode: Schema.optional(Schema.Literal("message")),
 });
 export type UserInputRequestedPayload = typeof UserInputRequestedPayload.Type;
 
@@ -750,8 +786,12 @@ const AccountUpdatedPayload = Schema.Struct({
 });
 export type AccountUpdatedPayload = typeof AccountUpdatedPayload.Type;
 
+/**
+ * Adapters normalise their native rate-limit payload at the boundary so the
+ * consumer that folds it into the provider snapshot never sees driver shapes.
+ */
 const AccountRateLimitsUpdatedPayload = Schema.Struct({
-  rateLimits: Schema.Unknown,
+  limits: ProviderUsageLimitsUpdate,
 });
 export type AccountRateLimitsUpdatedPayload = typeof AccountRateLimitsUpdatedPayload.Type;
 

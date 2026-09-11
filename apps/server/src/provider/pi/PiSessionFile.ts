@@ -13,7 +13,7 @@ export const PiSessionCursor = Schema.Struct({
 });
 export type PiSessionCursor = typeof PiSessionCursor.Type;
 
-export class PiSessionFileError extends Schema.TaggedErrorClass<PiSessionFileError>()(
+export class PiSessionFileError extends Schema.TaggedError<PiSessionFileError>()(
   "PiSessionFileError",
   { operation: Schema.String, sessionFile: Schema.String, cause: Schema.Defect() },
 ) {}

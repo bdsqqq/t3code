@@ -59,10 +59,13 @@ import Migration0044 from "./Migrations/044_ClearAutomaticProjectModelDefaults.t
 import Migration0045 from "./Migrations/045_ProjectionProjectsAutoPull.ts";
 import Migration0046 from "./Migrations/046_RepairAutomaticSettlementTimestamps.ts";
 import Migration0047 from "./Migrations/047_ProjectionProjectIcon.ts";
-import Migration0048 from "./Migrations/048_PiExternalLifecycleOverrides.ts";
-import Migration0049 from "./Migrations/049_ProjectionPendingTurnIntent.ts";
-import Migration0050 from "./Migrations/050_ProjectionPendingTurnOperationId.ts";
-import Migration0051 from "./Migrations/051_ProjectionPendingTurnAdmissionProtocol.ts";
+import Migration0048 from "./Migrations/048_ProjectionThreadBranchPullRequest.ts";
+import Migration0049 from "./Migrations/049_ProjectionThreadsActiveOrderKey.ts";
+import Migration0050 from "./Migrations/050_ProjectionThreadPullRequests.ts";
+import Migration0052 from "./Migrations/052_PiExternalLifecycleOverrides.ts";
+import Migration0053 from "./Migrations/053_ProjectionPendingTurnIntent.ts";
+import Migration0054 from "./Migrations/054_ProjectionPendingTurnOperationId.ts";
+import Migration0055 from "./Migrations/055_ProjectionPendingTurnAdmissionProtocol.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -74,7 +77,7 @@ import Migration0051 from "./Migrations/051_ProjectionPendingTurnAdmissionProtoc
  * Uses Migrator.fromRecord which parses the key format and
  * returns migrations sorted by ID.
  */
-export const migrationEntries = [
+const migrationEntries = [
   [1, "OrchestrationEvents", Migration0001],
   [2, "OrchestrationCommandReceipts", Migration0002],
   [3, "CheckpointDiffBlobs", Migration0003],
@@ -122,15 +125,20 @@ export const migrationEntries = [
   [45, "ProjectionProjectsAutoPull", Migration0045],
   [46, "RepairAutomaticSettlementTimestamps", Migration0046],
   [47, "ProjectionProjectIcon", Migration0047],
-  [48, "PiExternalLifecycleOverrides", Migration0048],
-  [49, "ProjectionPendingTurnIntent", Migration0049],
-  [50, "ProjectionPendingTurnOperationId", Migration0050],
-  [51, "ProjectionPendingTurnAdmissionProtocol", Migration0051],
+  [48, "ProjectionThreadBranchPullRequest", Migration0048],
+  [49, "ProjectionThreadsActiveOrderKey", Migration0049],
+  [50, "ProjectionThreadPullRequests", Migration0050],
+  // Fork releases already used 48-51. The bridge at 52 replays upstream's
+  // idempotent 48-50 migrations for those existing databases.
+  [52, "PiExternalLifecycleOverrides", Migration0052],
+  [53, "ProjectionPendingTurnIntent", Migration0053],
+  [54, "ProjectionPendingTurnOperationId", Migration0054],
+  [55, "ProjectionPendingTurnAdmissionProtocol", Migration0055],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);
 
-export const makeMigrationLoader = (throughId?: number) =>
+const makeMigrationLoader = (throughId?: number) =>
   Migrator.fromRecord(
     Object.fromEntries(
       migrationEntries

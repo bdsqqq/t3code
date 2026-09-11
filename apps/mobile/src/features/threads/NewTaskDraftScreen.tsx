@@ -20,10 +20,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useUniwindTheme } from "../../lib/useUniwindTheme";
 import { useFontFamily } from "../../lib/useFontFamily";
 
-import {
-  isAtomCommandInterrupted,
-  squashAtomCommandFailure,
-} from "@t3tools/client-runtime/state/runtime";
+import { squashAtomCommandFailure } from "@t3tools/client-runtime/state/runtime";
 import {
   CommandId,
   MessageId,
@@ -36,7 +33,6 @@ import {
   ComposerActionButton,
   ComposerInlineControl,
   ComposerToolbarRow,
-  ComposerToolbarScroller,
 } from "../../components/ComposerToolbar";
 import { AndroidScreenHeader } from "../../components/AndroidScreenHeader";
 import { ComposerAttachmentButton } from "../../components/ComposerAttachmentButton";
@@ -44,6 +40,7 @@ import { ComposerAttachmentStrip } from "../../components/ComposerAttachmentStri
 import { EnvironmentMachineSymbol } from "../../components/EnvironmentMachineSymbol";
 import {
   composerAttachmentUploadBlockReason,
+  composerAttachmentsStillUploading,
   composerAttachmentUploadsAtom,
 } from "../../state/composer-attachment-uploads";
 import { FilePreviewModal, type FilePreviewSource } from "../../components/FilePreviewModal";
@@ -51,8 +48,8 @@ import { VideoPreviewModal, type VideoPreviewSource } from "../../components/Vid
 import { ProviderIcon } from "../../components/ProviderIcon";
 import { SymbolView } from "../../components/AppSymbol";
 import { AppText as Text } from "../../components/AppText";
+import { hasProviderUsageLimits, isUsageLimitsCommand } from "@t3tools/shared/usageLimits";
 import { COMPOSER_LAYOUT_TRANSITION, ComposerSurface } from "./ThreadComposer";
-import { ShimmeringWorkContent } from "./thread-work-log";
 import { ComposerCommandPopover } from "./ComposerCommandPopover";
 import { useComposerCommandMenu } from "./use-composer-command-menu";
 import {
@@ -78,30 +75,29 @@ import {
 import { useScaledTextRole } from "../settings/appearance/useScaledTextRole";
 import {
   clearComposerDraftContent,
-  flushComposerDrafts,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
   nativePiStartPayloadFingerprint,
   persistComposerDraftNativePiStartIdentity,
   reusableNativePiStartIdentity,
   restoreComposerDraftSnapshot,
+  updateComposerDraftSettings,
   scheduleUnusedComposerAttachmentCleanup,
   type ComposerDraft,
+  waitForComposerDraftsLoaded,
 } from "../../state/use-composer-drafts";
 import { useEnvironmentServerConfig, useProjects } from "../../state/entities";
 import {
   isModelSelectionUnavailable,
   resolveSelectableModelSelection,
 } from "../../lib/modelOptions";
-import { resolveProviderInteractionMode } from "./legacy-plan-mode";
 import { deriveThreadTitleFromPrompt } from "../../lib/projectThreadStartTurn";
 import { armAgentAwarenessLiveActivityForLocalWork } from "../agent-awareness/remoteRegistration";
 import { enqueueThreadOutboxMessage } from "../../state/thread-outbox";
-import { removeThreadOutboxMessage } from "../../state/thread-outbox-removal";
 import { useRemoteConnectionStatus } from "../../state/use-remote-environment-registry";
 import { useNewTaskFlow } from "./new-task-flow-provider";
 import { resolveProjectThreadCreationBranch } from "./projectThreadCreationValidation";
-import { useCreateProjectThread } from "./use-project-actions";
+import { resolveProviderInteractionMode } from "./legacy-plan-mode";
 import { resolveDraftProjectSelection } from "./new-task-project-selection";
 import {
   resolveNewTaskBranchLabel,
@@ -153,14 +149,17 @@ export function NewTaskDraftScreen(props: {
   readonly initialProjectRef?: {
     readonly environmentId?: string;
     readonly projectId?: string;
+    readonly branch?: string | null;
+    readonly worktreePath?: string | null;
   };
   /** Queued outbox message id when editing an existing pending task. */
   readonly pendingTaskId?: string;
+  /** Existing new-task draft key to resume (a Draft row in the thread list). */
+  readonly draftId?: string;
   /** Durable native share inbox item to merge into this project draft. */
   readonly incomingShareId?: string;
 }) {
   const projects = useProjects();
-  const createProjectThread = useCreateProjectThread();
   const createNativePiSession = useAtomCommand(piExternalEnvironment.createSession, {
     reportFailure: false,
   });
@@ -205,6 +204,18 @@ export function NewTaskDraftScreen(props: {
         states: uploadStates,
       })
     : null;
+  // A connected composer with uploads still in flight queues the task rather
+  // than making the user wait: the outbox drain finishes the upload and sends.
+  const attachmentsUploading =
+    environmentConnected &&
+    selectedProject !== null &&
+    composerAttachmentsStillUploading({
+      environmentId: selectedProject.environmentId,
+      attachments: flow.attachments,
+      serverConfig: selectedEnvironmentServerConfig,
+      states: uploadStates,
+    });
+  const queuesInsteadOfStarting = !environmentConnected || attachmentsUploading;
   const promptInputRef = useRef<ComposerEditorHandle>(null);
   const loadedBranchesProjectKeyRef = useRef<string | null>(null);
   const [isComposerFocused, setIsComposerFocused] = useState(false);
@@ -326,6 +337,14 @@ export function NewTaskDraftScreen(props: {
   const isComposerInteractionLocked = isIncomingShareTransferPending || flow.submitting;
   // Also guard while a submit is in flight: an Android back press or iOS
   // Cancel would otherwise abandon the screen while the task still starts.
+  // T3 owns /usage-limits only where Limits has data for the selected provider.
+  const offersUsageLimits =
+    flow.selectedProviderStatus !== null &&
+    hasProviderUsageLimits(
+      flow.selectedProviderStatus.driver,
+      selectedEnvironmentServerConfig?.providers ?? [],
+      selectedEnvironmentServerConfig?.usageLimitSources ?? [],
+    );
   const composerMenu = useComposerCommandMenu({
     draftMessage: flow.prompt,
     ownerKey: flow.draftKey,
@@ -336,6 +355,8 @@ export function NewTaskDraftScreen(props: {
         : (flow.selectedWorktreePath ?? selectedProject?.workspaceRoot)) || null,
     selectedProviderStatus: flow.selectedProviderStatus,
     hasThread: false,
+    hasCompactableConversation: false,
+    offersUsageLimits: offersUsageLimits,
     enabled: isComposerFocused && !isComposerInteractionLocked,
     onChangeDraftMessage: flow.setPrompt,
     onUpdateInteractionMode: flow.planModeEnabled ? flow.setInteractionMode : undefined,
@@ -426,7 +447,44 @@ export function NewTaskDraftScreen(props: {
     };
   }, []);
 
-  const { beginEditingPendingTask, cancelEditingPendingTask, editingPendingTask } = flow;
+  const { beginEditingPendingTask, cancelEditingPendingTask, editingPendingTask, openDraft } = flow;
+  // A Draft row opens its own draft; a fresh New Task never reuses one.
+  // Drafts hydrate from disk and projects arrive with the shell snapshot, so
+  // on a cold launch the draft or its project can be missing for a moment;
+  // wait for hydration and retry while projects load. Attempt each id once
+  // after that so a draft discarded mid-session does not keep bouncing to
+  // the picker.
+  const attemptedDraftIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!props.draftId || props.pendingTaskId) {
+      return;
+    }
+    const draftId = props.draftId;
+    if (attemptedDraftIdRef.current === draftId) {
+      return;
+    }
+    let cancelled = false;
+    void waitForComposerDraftsLoaded().then(() => {
+      if (cancelled || attemptedDraftIdRef.current === draftId) {
+        return;
+      }
+      if (openDraft(draftId)) {
+        attemptedDraftIdRef.current = draftId;
+        return;
+      }
+      if (getComposerDraftSnapshot(draftId).project !== undefined && projects.length === 0) {
+        // The draft exists; its project has not arrived yet. Retry on the
+        // next projects change instead of giving up.
+        return;
+      }
+      attemptedDraftIdRef.current = draftId;
+      navigation.dispatch(StackActions.replace("NewTask"));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [navigation, openDraft, projects, props.draftId, props.pendingTaskId]);
+
   const attemptedPendingTaskIdRef = useRef<string | null>(null);
   useEffect(() => {
     if (!props.pendingTaskId || editingPendingTask?.messageId === props.pendingTaskId) {
@@ -463,9 +521,10 @@ export function NewTaskDraftScreen(props: {
   const lastInitialProjectRefRef = useRef(props.initialProjectRef);
 
   useEffect(() => {
-    // Pending-task editing owns project selection (and must not fall through
-    // to the replace("NewTask") fallback while its hydration is in flight).
-    if (props.pendingTaskId) {
+    // Pending-task editing and draft resumption own project selection (and
+    // must not fall through to the replace("NewTask") fallback while their
+    // hydration is in flight).
+    if (props.pendingTaskId || props.draftId) {
       return;
     }
     if (lastInitialProjectRefRef.current !== props.initialProjectRef) {
@@ -487,6 +546,26 @@ export function NewTaskDraftScreen(props: {
         const directProjectKey = `${directProject.environmentId}:${directProject.id}`;
         if (appliedInitialProjectKeyRef.current === directProjectKey) {
           return;
+        }
+        if (props.initialProjectRef?.branch) {
+          if (
+            selectedProject?.environmentId !== directProject.environmentId ||
+            selectedProject.id !== directProject.id
+          ) {
+            setProject(directProject);
+            return;
+          }
+          if (!flow.draftKey) return;
+          // The route completes checkout before mounting this composer. Local
+          // mode reuses an existing worktree; worktree mode would create another.
+          updateComposerDraftSettings(flow.draftKey, {
+            workspaceSelection: {
+              mode: "local",
+              branch: props.initialProjectRef.branch,
+              worktreePath: props.initialProjectRef.worktreePath ?? null,
+              startFromOrigin: false,
+            },
+          });
         }
         appliedInitialProjectKeyRef.current = directProjectKey;
         if (
@@ -521,9 +600,11 @@ export function NewTaskDraftScreen(props: {
   }, [
     projectScopes,
     projects,
+    flow.draftKey,
     props.initialProjectRef,
     props.incomingShareId,
     props.pendingTaskId,
+    props.draftId,
     navigation,
     selectedProject,
     selectedProjectKey,
@@ -817,7 +898,7 @@ export function NewTaskDraftScreen(props: {
   }
 
   async function handlePickMedia(): Promise<void> {
-    if (isComposerInteractionLocked || voiceInput.isBusy) {
+    if (isComposerInteractionLocked || voiceInput.isBusy || runTarget === "pi") {
       return;
     }
     const capabilities = selectedEnvironmentServerConfig?.environment.capabilities;
@@ -842,7 +923,7 @@ export function NewTaskDraftScreen(props: {
   }
 
   async function handlePickFiles(): Promise<void> {
-    if (isComposerInteractionLocked || voiceInput.isBusy) {
+    if (isComposerInteractionLocked || voiceInput.isBusy || runTarget === "pi") {
       return;
     }
     const maxBytes =
@@ -871,6 +952,13 @@ export function NewTaskDraftScreen(props: {
 
   const handleNativePasteImages = useCallback(
     async (uris: ReadonlyArray<string>) => {
+      if (runTarget === "pi") {
+        Alert.alert(
+          "Attachments unavailable",
+          "Native Pi sessions do not support attachments yet.",
+        );
+        return;
+      }
       try {
         const images = await convertPastedImagesToAttachments({
           uris,
@@ -883,7 +971,7 @@ export function NewTaskDraftScreen(props: {
         console.error("[native paste] error converting images", error);
       }
     },
-    [flow],
+    [flow, runTarget],
   );
 
   async function handleStart(): Promise<void> {
@@ -903,16 +991,6 @@ export function NewTaskDraftScreen(props: {
       ) ?? flow.selectedModel;
     const workspaceMode = draft.workspaceSelection?.mode ?? flow.workspaceMode;
     const selectedBranchName = draft.workspaceSelection?.branch ?? flow.selectedBranchName;
-    const selectedWorktreePath =
-      draft.workspaceSelection?.worktreePath ?? flow.selectedWorktreePath;
-    const startFromOrigin = draft.workspaceSelection?.startFromOrigin ?? flow.startFromOrigin;
-    const runtimeMode = draft.runtimeMode ?? flow.runtimeMode;
-    const interactionMode = resolveProviderInteractionMode(
-      selectedEnvironmentServerConfig?.providers.find(
-        (provider) => provider.instanceId === modelSelection?.instanceId,
-      ),
-      flow.planModeEnabled ? (draft.interactionMode ?? flow.interactionMode) : "default",
-    );
     const initialMessageText = draft.text.trim();
 
     if (
@@ -932,7 +1010,22 @@ export function NewTaskDraftScreen(props: {
     ) {
       Alert.alert(
         "Antigravity model unavailable",
-        "Open model settings to finish setup or choose another model.",
+        "Set up Antigravity on web or desktop, or choose another model.",
+      );
+      return;
+    }
+    // T3's own limits command is answered by the thread composer; a new task would
+    // send it to the agent. A provider's same-named command, or a prompt carrying
+    // attachments, goes through as usual.
+    if (
+      runTarget === "t3" &&
+      offersUsageLimits &&
+      isUsageLimitsCommand(initialMessageText) &&
+      draft.attachments.length === 0
+    ) {
+      Alert.alert(
+        "Usage limits",
+        "Send /usage-limits inside a thread, or open Settings → Usage → Limits.",
       );
       return;
     }
@@ -962,6 +1055,13 @@ export function NewTaskDraftScreen(props: {
         Alert.alert("Remove attachments", "Native Pi sessions do not support attachments yet.");
         return;
       }
+      const runtimeMode = draft.runtimeMode ?? flow.runtimeMode;
+      const interactionMode = resolveProviderInteractionMode(
+        selectedEnvironmentServerConfig?.providers.find(
+          (provider) => provider.instanceId === modelSelection?.instanceId,
+        ),
+        flow.planModeEnabled ? (draft.interactionMode ?? flow.interactionMode) : "default",
+      );
       nativeStartInFlightRef.current = true;
       flow.setSubmitting(true);
       try {
@@ -1048,121 +1148,77 @@ export function NewTaskDraftScreen(props: {
       return;
     }
 
-    if (!environmentConnected) {
-      // Offline: park the task in the outbox; the drain sends it when the
-      // environment reconnects. Editing an existing pending task re-queues it
-      // under its original identifiers.
-      const metadata = editingPendingTask
-        ? {
-            threadId: editingPendingTask.threadId,
-            commandId: editingPendingTask.commandId,
-            messageId: editingPendingTask.messageId,
-            createdAt: editingPendingTask.createdAt,
-          }
-        : makeTurnCommandMetadata();
-      const message = flow.buildPendingTaskMessage(metadata);
-      if (!message) {
-        return;
-      }
-      flow.setSubmitting(true);
-      try {
-        await enqueueThreadOutboxMessage(message);
-      } catch (error) {
-        Alert.alert(
-          "Could not queue task",
-          error instanceof Error ? error.message : "The task could not be saved to the outbox.",
-        );
-        return;
-      } finally {
-        flow.setSubmitting(false);
-      }
-      if (editingPendingTask) {
-        flow.finishEditingPendingTask();
-      } else {
-        // Drop draft-local model/workspace selections with the content. The
-        // next task re-resolves project defaults before sticky app defaults.
-        clearComposerDraftContent(draftKey, {
-          clearModelSelection: true,
-          clearWorkspaceSelection: true,
-        });
-      }
-      setSubmitNavigationAction(CommonActions.goBack());
+    // Every submission goes through the outbox: the drain uploads the
+    // attachments and delivers the creation, retrying across reconnects.
+    // When it can send now the thread screen opens immediately with the
+    // queued prompt and reports setup progress there, like the web draft
+    // does. Offline, or with uploads still in flight, the task stays a
+    // pending task and the sheet closes. Editing an existing pending task
+    // re-queues it under its original identifiers.
+    const metadata = editingPendingTask
+      ? {
+          threadId: editingPendingTask.threadId,
+          commandId: editingPendingTask.commandId,
+          messageId: editingPendingTask.messageId,
+          createdAt: editingPendingTask.createdAt,
+        }
+      : makeTurnCommandMetadata();
+    const message = flow.buildPendingTaskMessage(metadata, {
+      // A task that waits in the outbox cannot know the checkout it will
+      // drain against; one that sends now runs against the live one.
+      currentCheckoutBranch: queuesInsteadOfStarting ? null : flow.currentCheckoutBranchName,
+    });
+    if (!message) {
       return;
     }
-
+    if (!queuesInsteadOfStarting) {
+      // Arm the lock-screen card before the async thread creation: backgrounding
+      // the app right after tapping submit would otherwise reject the foreground
+      // -only Activity start. If creation fails, the token registration's replay
+      // finds no work and ends the card within seconds.
+      armAgentAwarenessLiveActivityForLocalWork({
+        environmentId: selectedProject.environmentId,
+        threadTitle: deriveThreadTitleFromPrompt(initialMessageText),
+        projectTitle: selectedProject.title,
+      });
+    }
+    // Persist before clearing the draft or leaving its editor. This only waits
+    // for the local outbox write; server and worktree setup run on the thread.
     flow.setSubmitting(true);
-    // Arm the lock-screen card before the async thread creation: backgrounding
-    // the app right after tapping submit would otherwise reject the foreground
-    // -only Activity start. If creation fails, the token registration's replay
-    // finds no work and ends the card within seconds.
-    armAgentAwarenessLiveActivityForLocalWork({
-      environmentId: selectedProject.environmentId,
-      threadTitle: deriveThreadTitleFromPrompt(initialMessageText),
-      projectTitle: selectedProject.title,
-    });
-    const creationBranch = resolveProjectThreadCreationBranch({
-      workspaceMode,
-      selectedBranch: selectedBranchName,
-      currentCheckoutBranch: flow.currentCheckoutBranchName,
-    });
-    const result = await createProjectThread({
-      project: selectedProject,
-      modelSelection,
-      envMode: workspaceMode,
-      branch: creationBranch,
-      worktreePath: workspaceMode === "worktree" ? null : selectedWorktreePath,
-      startFromOrigin,
-      runtimeMode,
-      interactionMode,
-      initialMessageText,
-      initialAttachments: draft.attachments,
-      onAttachmentsUploaded: async (attachments) => {
-        flow.replaceAttachments(attachments);
-        await flushComposerDrafts();
-      },
-      ...(editingPendingTask
-        ? {
-            turnMetadata: {
-              threadId: editingPendingTask.threadId,
-              commandId: editingPendingTask.commandId,
-              messageId: editingPendingTask.messageId,
-              createdAt: editingPendingTask.createdAt,
-            },
-          }
-        : {}),
-    });
-    flow.setSubmitting(false);
-
-    if (result._tag === "Failure") {
-      if (!isAtomCommandInterrupted(result)) {
-        const error = squashAtomCommandFailure(result);
-        Alert.alert(
-          "Could not start task",
-          error instanceof Error ? error.message : "The task could not be started.",
-        );
-      }
+    try {
+      await enqueueThreadOutboxMessage(message);
+    } catch (error) {
+      Alert.alert(
+        "Could not queue task",
+        error instanceof Error ? error.message : "The task could not be saved to the outbox.",
+      );
       return;
+    } finally {
+      flow.setSubmitting(false);
     }
-
+    const draftSnapshot = getComposerDraftSnapshot(draftKey);
     if (editingPendingTask) {
-      try {
-        await removeThreadOutboxMessage(editingPendingTask);
-      } catch (error) {
-        console.warn("[new-task] failed to remove delivered pending task", error);
-      }
       flow.finishEditingPendingTask();
     } else {
+      // Drop draft-local model/workspace selections with the content. The
+      // next task re-resolves project defaults before sticky app defaults.
+      // The queued message owns the attachments now, so the sweep is deferred
+      // until the write confirms it.
       clearComposerDraftContent(draftKey, {
         clearModelSelection: true,
         clearWorkspaceSelection: true,
+        deferAttachmentCleanup: true,
       });
     }
     setSubmitNavigationAction(
-      StackActions.replace("Thread", {
-        environmentId: String(result.value.environmentId),
-        threadId: String(result.value.threadId),
-      }),
+      queuesInsteadOfStarting
+        ? CommonActions.goBack()
+        : StackActions.replace("Thread", {
+            environmentId: String(message.environmentId),
+            threadId: String(message.threadId),
+          }),
     );
+    scheduleUnusedComposerAttachmentCleanup(draftSnapshot.attachments);
   }
 
   if (!selectedProject) {
@@ -1316,50 +1372,46 @@ export function NewTaskDraftScreen(props: {
 
   const workspaceControls = (
     <View className="flex-row items-center gap-1 px-2">
-      {flow.submitting && environmentConnected && flow.workspaceMode === "worktree" ? (
-        <View
-          accessible
-          accessibilityLabel="Setting up worktree…"
-          className="h-11 w-full max-w-[260px] flex-row items-center px-2"
-        >
-          <ShimmeringWorkContent
-            icon="arrow.triangle.branch"
-            iconSubtleColor={theme["--color-icon-subtle"]}
-            label="Setting up worktree…"
-            showIcon
-          />
-        </View>
-      ) : (
-        <>
-          <ComposerInlineControl
-            accessibilityHint={`Switches to ${flow.workspaceMode === "local" ? "a new worktree" : "the current checkout"}`}
-            accessibilityLabel={workspaceLabel}
-            disabled={isComposerInteractionLocked || voiceInput.isBusy}
-            iconNode={
-              <NewTaskWorkspaceIcon
-                workspaceMode={flow.workspaceMode}
-                worktreePath={flow.selectedWorktreePath}
-              />
-            }
-            label={workspaceLabel}
-            maxWidth={flow.workspaceMode === "local" ? 220 : 148}
-            onPress={() =>
-              flow.setWorkspaceMode(flow.workspaceMode === "local" ? "worktree" : "local")
-            }
-            showChevron={false}
-          />
+      {nativePiSupported ? (
+        <ComposerInlineControl
+          accessibilityHint={`Switches to ${runTarget === "t3" ? "native Pi" : "T3 orchestration"}`}
+          accessibilityLabel={`Run target: ${runTarget === "t3" ? "T3" : "native Pi"}`}
+          disabled={isComposerInteractionLocked || voiceInput.isBusy}
+          emphasized
+          label={runTarget === "t3" ? "T3" : "Pi"}
+          maxWidth={72}
+          onPress={() =>
+            handleRunTargetMenuAction(runTarget === "t3" ? "run-target:pi" : "run-target:t3")
+          }
+          showChevron={false}
+        />
+      ) : null}
 
-          <ComposerInlineControl
-            accessibilityLabel={`${flow.workspaceMode === "worktree" ? "Base branch" : "Branch"}: ${selectedBranchLabel}`}
-            chevronDirection="right"
-            disabled={isComposerInteractionLocked}
-            icon="arrow.triangle.branch"
-            label={showBranchLoading ? "Loading branches…" : selectedBranchLabel}
-            maxWidth={190}
-            onPress={() => openContextPicker("NewTaskBranch")}
+      <ComposerInlineControl
+        accessibilityHint={`Switches to ${flow.workspaceMode === "local" ? "a new worktree" : "the current checkout"}`}
+        accessibilityLabel={workspaceLabel}
+        disabled={isComposerInteractionLocked || voiceInput.isBusy || runTarget === "pi"}
+        iconNode={
+          <NewTaskWorkspaceIcon
+            workspaceMode={flow.workspaceMode}
+            worktreePath={flow.selectedWorktreePath}
           />
-        </>
-      )}
+        }
+        label={workspaceLabel}
+        maxWidth={flow.workspaceMode === "local" ? 220 : 148}
+        onPress={() => flow.setWorkspaceMode(flow.workspaceMode === "local" ? "worktree" : "local")}
+        showChevron={false}
+      />
+
+      <ComposerInlineControl
+        accessibilityLabel={`${flow.workspaceMode === "worktree" ? "Base branch" : "Branch"}: ${selectedBranchLabel}`}
+        chevronDirection="right"
+        disabled={isComposerInteractionLocked || runTarget === "pi"}
+        icon="arrow.triangle.branch"
+        label={showBranchLoading ? "Loading branches…" : selectedBranchLabel}
+        maxWidth={190}
+        onPress={() => openContextPicker("NewTaskBranch")}
+      />
     </View>
   );
 
@@ -1377,7 +1429,7 @@ export function NewTaskDraftScreen(props: {
       ) : null}
       <View className="pb-1">{workspaceControls}</View>
 
-      {modelUnavailable ? (
+      {runTarget === "t3" && modelUnavailable ? (
         <Pressable
           accessibilityRole="button"
           className="px-3 py-2"
@@ -1445,28 +1497,30 @@ export function NewTaskDraftScreen(props: {
               ) : (
                 <>
                   <ComposerAttachmentButton
-                    disabled={isComposerInteractionLocked}
+                    disabled={isComposerInteractionLocked || runTarget === "pi"}
                     supportsFiles={Boolean(
                       selectedEnvironmentServerConfig?.environment.capabilities.fileAttachments,
                     )}
                     onPickMedia={handlePickMedia}
                     onPickFiles={handlePickFiles}
                   />
-                  <ComposerToolbarScroller align="end" contentPaddingRight={0} fadeSurface="sheet">
-                    <ComposerInlineControl
-                      accessibilityLabel="Model and reasoning settings"
-                      disabled={isComposerInteractionLocked}
-                      emphasized
-                      iconNode={
-                        <ProviderIcon
-                          provider={flow.selectedModelOption?.providerDriver}
-                          size={16}
-                        />
-                      }
-                      label={flow.selectedModelOption?.label ?? "Choose model"}
-                      maxWidth={152}
-                      onPress={settingsSheetPresentation.open}
-                    />
+                  <View className="min-w-0 flex-1 flex-row items-center justify-end gap-2">
+                    <View className="min-w-0 shrink">
+                      <ComposerInlineControl
+                        accessibilityLabel="Model and reasoning settings"
+                        disabled={isComposerInteractionLocked}
+                        emphasized
+                        iconNode={
+                          <ProviderIcon
+                            provider={flow.selectedModelOption?.providerDriver}
+                            size={16}
+                          />
+                        }
+                        label={flow.selectedModelOption?.label ?? "Choose model"}
+                        maxWidth="100%"
+                        onPress={settingsSheetPresentation.open}
+                      />
+                    </View>
                     {flow.planModeEnabled ? (
                       <ComposerInlineControl
                         accessibilityHint={`Switches to ${flow.interactionMode === "plan" ? "Build" : "Plan"} mode`}
@@ -1487,7 +1541,7 @@ export function NewTaskDraftScreen(props: {
                         showChevron={false}
                       />
                     ) : null}
-                  </ComposerToolbarScroller>
+                  </View>
                 </>
               )}
               <ComposerDictationPrimaryAction
@@ -1505,12 +1559,14 @@ export function NewTaskDraftScreen(props: {
                     attachmentBlockReason ??
                     (flow.submitting
                       ? "Starting task"
-                      : environmentConnected
-                        ? "Start task"
-                        : "Queue task")
+                      : attachmentsUploading
+                        ? "Queue task, sends when uploads finish"
+                        : environmentConnected
+                          ? "Start task"
+                          : "Queue task")
                   }
                   disabled={!canStart}
-                  icon={environmentConnected ? "arrow.up" : "tray.and.arrow.up"}
+                  icon={queuesInsteadOfStarting ? "tray.and.arrow.up" : "arrow.up"}
                   onPress={() => void handleStart()}
                   variant="primary"
                 />
