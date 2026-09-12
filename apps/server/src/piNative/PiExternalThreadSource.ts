@@ -160,6 +160,20 @@ export function catalogUpdateAfterRead<T>(
 ): T | undefined {
   return gate.allowsCatalogUpdate() ? snapshot : undefined;
 }
+export const subscribePiThreadInvalidations = Effect.fn("subscribePiThreadInvalidations")(
+  function* (catalog: PubSub.PubSub<void>, lifecycle: PubSub.PubSub<ThreadId>, threadId: ThreadId) {
+    const catalogSubscription = yield* PubSub.subscribe(catalog);
+    const lifecycleSubscription = yield* PubSub.subscribe(lifecycle);
+    return Stream.merge(
+      Stream.fromSubscription(catalogSubscription),
+      Stream.fromSubscription(lifecycleSubscription).pipe(
+        Stream.filter((id) => id === threadId),
+        Stream.map(() => undefined),
+      ),
+    );
+  },
+);
+
 export function runtimeSnapshotAtSequence(
   current: SupervisorRuntimeState | undefined,
   sequence: number,
@@ -482,6 +496,16 @@ async function* catalogTriggers(): AsyncGenerator<void> {
   }
 }
 
+class PiExternalCatalogTriggers extends Context.Reference<Stream.Stream<void, PiNativeError>>(
+  "t3/piNative/PiExternalCatalogTriggers",
+  {
+    defaultValue: () =>
+      Stream.fromAsyncIterable(catalogTriggers(), () =>
+        privateSourceError("catalog_watch", "Native Pi catalog watch failed."),
+      ),
+  },
+) {}
+
 function validateInlineImages(
   command: Extract<ClientOrchestrationCommand, { readonly type: "thread.turn.start" }>,
 ) {
@@ -531,6 +555,7 @@ export class PiExternalThreadSource extends Context.Service<
       const supervisor = yield* SupervisorClient;
       const snapshots = yield* ProjectionSnapshotQuery;
       const lifecycleOverrides = yield* PiExternalLifecycleOverrideRepository;
+      const catalogTriggerStream = yield* PiExternalCatalogTriggers;
       const settingsService = Option.getOrUndefined(
         yield* Effect.serviceOption(ServerSettingsService),
       );
@@ -1061,7 +1086,6 @@ export class PiExternalThreadSource extends Context.Service<
             }
             const snapshot = yield* buildCatalog(true);
             yield* publishCatalogSnapshot(snapshot, true);
-            yield* PubSub.publish(catalogInvalidations, undefined);
             yield* PubSub.publish(lifecycleInvalidations, command.threadId);
             return {
               sequence: snapshot.snapshotSequence,
@@ -1107,7 +1131,6 @@ export class PiExternalThreadSource extends Context.Service<
             }
             const snapshot = yield* buildCatalog(true);
             yield* publishCatalogSnapshot(snapshot, true);
-            yield* PubSub.publish(catalogInvalidations, undefined);
             yield* PubSub.publish(lifecycleInvalidations, command.threadId);
             return {
               sequence: snapshot.snapshotSequence,
@@ -1191,7 +1214,6 @@ export class PiExternalThreadSource extends Context.Service<
           // receipt before a disconnect prevented publication to subscribers.
           const snapshot = yield* buildCatalog(true);
           yield* publishCatalogSnapshot(snapshot, true);
-          yield* PubSub.publish(catalogInvalidations, undefined);
           yield* PubSub.publish(lifecycleInvalidations, command.threadId);
           return {
             sequence: snapshot.snapshotSequence,
@@ -1374,9 +1396,7 @@ export class PiExternalThreadSource extends Context.Service<
           Stream.flatMap((runtime) => runtimeStreamWithLifecycle(record, runtime)),
           Stream.repeat(Schedule.spaced("100 millis")),
         );
-      const filesystemUpdates = Stream.fromAsyncIterable(catalogTriggers(), () =>
-        privateSourceError("catalog_watch", "Native Pi catalog watch failed."),
-      ).pipe(
+      const filesystemUpdates = catalogTriggerStream.pipe(
         Stream.tap(() => PubSub.publish(catalogInvalidations, undefined)),
         Stream.mapEffect(() => buildCatalog(true)),
         Stream.map((snapshot) => ({ snapshot, detailInvalidated: true as const })),
@@ -1461,9 +1481,16 @@ export class PiExternalThreadSource extends Context.Service<
                   replacementRuntimeStreams(record),
                 );
               }
+              // Attach before reading so the scoped subscription buffers
+              // invalidations until the initial snapshot has been emitted.
+              const invalidations = yield* subscribePiThreadInvalidations(
+                catalogInvalidations,
+                lifecycleInvalidations,
+                record.threadId,
+              );
               const initial = yield* readProjected(input.threadId);
               const attachmentGate = new CatalogRuntimeAttachmentGate();
-              const catalogUpdates = Stream.fromPubSub(catalogInvalidations).pipe(
+              const catalogUpdates = invalidations.pipe(
                 Stream.takeWhile(() => attachmentGate.allowsCatalogUpdate()),
                 Stream.mapEffect(() => readProjected(input.threadId)),
                 Stream.map((snapshot) => catalogUpdateAfterRead(attachmentGate, snapshot)),
@@ -1552,5 +1579,9 @@ export class PiExternalThreadSource extends Context.Service<
         dispatch,
       });
     }),
+  );
+
+  static readonly layerTest = this.layer.pipe(
+    Layer.provide(Layer.succeed(PiExternalCatalogTriggers, Stream.empty)),
   );
 }

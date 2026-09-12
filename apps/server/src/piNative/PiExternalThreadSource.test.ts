@@ -11,14 +11,26 @@ import {
   type OrchestrationThreadShell,
 } from "@t3tools/contracts";
 import { it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
+import * as Layer from "effect/Layer";
+import * as Option from "effect/Option";
+import * as PubSub from "effect/PubSub";
+import * as Ref from "effect/Ref";
+import * as Stream from "effect/Stream";
+import * as TestClock from "effect/testing/TestClock";
 import { describe, expect } from "vite-plus/test";
 
+import { ProjectionSnapshotQuery } from "../orchestration/Services/ProjectionSnapshotQuery.ts";
+import type { PiExternalLifecycleOverride } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
+import { PiExternalLifecycleOverrideRepository } from "../persistence/Services/PiExternalLifecycleOverrides.ts";
 import {
   applyPiExternalAutoSettlement,
   boundExternalCatalog,
   catalogUpdateAfterRead,
   CatalogRuntimeAttachmentGate,
+  PiExternalThreadSource,
   PiThreadStreamSequenceGate,
   PiSubagentStreamTracker,
   runtimeSnapshotAtSequence,
@@ -28,9 +40,12 @@ import {
   planPiExternalTurnStart,
   receiptSessionFile,
   shutdownCreatedRuntime,
+  subscribePiThreadInvalidations,
   validExternalLifecycleOverride,
 } from "./PiExternalThreadSource.ts";
 import { projectPiThread } from "./PiSessionProjection.ts";
+import { SessionCatalog } from "./SessionCatalog.ts";
+import { SupervisorClient } from "./SupervisorClient.ts";
 import type { SupervisorRuntimeState, SupervisorStreamEvent } from "./SupervisorProtocol.ts";
 
 const takeoverRecord = {
@@ -219,6 +234,126 @@ describe("PiExternalThreadSource hardening", () => {
     expect(gate.allowsCatalogUpdate()).toBe(false);
     expect(catalogUpdateAfterRead(gate, { snapshotSequence: 1 })).toBeUndefined();
   });
+
+  it.effect("buffers lifecycle invalidation while a no-runtime thread snapshot loads", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const initialLifecycleReadStarted = yield* Deferred.make<void>();
+        const releaseInitialLifecycleRead = yield* Deferred.make<void>();
+        const lifecycle = yield* Ref.make<PiExternalLifecycleOverride | undefined>(undefined);
+        let blockNextLifecycleRead = true;
+
+        const dependencies = Layer.mergeAll(
+          Layer.mock(SessionCatalog)({
+            list: () => Effect.succeed([takeoverRecord]),
+            omittedCount: () => Effect.succeed(0),
+            read: () => Effect.succeed({ record: takeoverRecord, entries: [] }),
+            findLifecycleOperation: () => Effect.succeed(undefined),
+          }),
+          Layer.mock(SupervisorClient)({
+            list: () => Effect.succeed([]),
+            probeCapabilities: () => Effect.succeed({}),
+            subscribe: () => Stream.empty,
+          }),
+          Layer.mock(ProjectionSnapshotQuery)({
+            getShellSnapshot: () =>
+              Effect.succeed({
+                snapshotSequence: 0,
+                projects: [],
+                threads: [],
+                updatedAt: "2026-08-06T00:00:00.000Z",
+              }),
+          }),
+          Layer.mock(PiExternalLifecycleOverrideRepository)({
+            apply: (value) => Ref.set(lifecycle, value).pipe(Effect.as({ applied: true, value })),
+            recordReceipt: (value) => Ref.set(lifecycle, value).pipe(Effect.as(value)),
+            list: () =>
+              Ref.get(lifecycle).pipe(Effect.map((value) => (value === undefined ? [] : [value]))),
+            getBySourceKey: () =>
+              Effect.gen(function* () {
+                const captured = yield* Ref.get(lifecycle);
+                if (blockNextLifecycleRead) {
+                  blockNextLifecycleRead = false;
+                  yield* Deferred.succeed(initialLifecycleReadStarted, undefined);
+                  yield* Deferred.await(releaseInitialLifecycleRead);
+                }
+                return Option.fromNullishOr(captured);
+              }),
+            getByCommandId: () => Effect.succeed(Option.none()),
+          }),
+        );
+
+        yield* Effect.gen(function* () {
+          const source = yield* PiExternalThreadSource;
+          const subscription = yield* source
+            .subscribeThread({
+              threadId: takeoverRecord.threadId,
+              requestCompletionMarker: true,
+            })
+            .pipe(Stream.take(3), Stream.runCollect, Effect.forkChild);
+
+          yield* Deferred.await(initialLifecycleReadStarted);
+          yield* source.dispatch({
+            type: "thread.settle",
+            commandId: CommandId.make("settle-during-subscribe"),
+            threadId: takeoverRecord.threadId,
+          });
+          yield* Deferred.succeed(releaseInitialLifecycleRead, undefined);
+
+          const items = Array.from(
+            yield* Fiber.join(subscription).pipe(Effect.timeout("1 second"), TestClock.withLive),
+          );
+          expect(items.map((item) => item.kind)).toEqual(["snapshot", "synchronized", "snapshot"]);
+          expect(items[0]).toMatchObject({
+            kind: "snapshot",
+            snapshot: { thread: { settledOverride: null } },
+          });
+          expect(items[2]).toMatchObject({
+            kind: "snapshot",
+            snapshot: { thread: { settledOverride: "settled" } },
+          });
+        }).pipe(Effect.provide(PiExternalThreadSource.layerTest.pipe(Layer.provide(dependencies))));
+      }),
+    ),
+  );
+
+  it.effect("buffers both invalidation channels and releases them on cancellation", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const catalog = yield* PubSub.sliding<void>(1);
+        const lifecycle = yield* PubSub.sliding<ThreadId>(16);
+        yield* Effect.addFinalizer(() => PubSub.shutdown(catalog));
+        yield* Effect.addFinalizer(() => PubSub.shutdown(lifecycle));
+        const attached = yield* Deferred.make<void>();
+        const worker = yield* Effect.scoped(
+          Effect.gen(function* () {
+            const changes = yield* subscribePiThreadInvalidations(
+              catalog,
+              lifecycle,
+              takeoverRecord.threadId,
+            );
+            yield* PubSub.publish(lifecycle, ThreadId.make("unrelated"));
+            yield* PubSub.publish(lifecycle, takeoverRecord.threadId);
+            yield* PubSub.publish(catalog, undefined);
+            // Both publishes precede consumption: lazy subscriptions would lose them.
+            let received = 0;
+            yield* changes.pipe(
+              Stream.runForEach(() => {
+                received += 1;
+                return received === 2 ? Deferred.succeed(attached, undefined) : Effect.void;
+              }),
+            );
+          }),
+        ).pipe(Effect.forkChild);
+        yield* Deferred.await(attached).pipe(Effect.timeout("1 second"), TestClock.withLive);
+        yield* Fiber.interrupt(worker);
+        yield* PubSub.publish(catalog, undefined);
+        yield* PubSub.publish(lifecycle, takeoverRecord.threadId);
+        expect(yield* PubSub.size(catalog)).toBe(0);
+        expect(yield* PubSub.size(lifecycle)).toBe(0);
+      }),
+    ),
+  );
 
   it("refreshes state for bridge disconnect and reconnect lifecycle events", () => {
     expect(isRuntimeLifecycleEvent("bridge_disconnected")).toBe(true);
