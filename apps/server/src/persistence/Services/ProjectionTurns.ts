@@ -30,6 +30,7 @@ import type { ProjectionRepositoryError } from "../Errors.ts";
 
 export const ProjectionTurnState = Schema.Literals([
   "pending",
+  "queued",
   "running",
   "interrupted",
   "completed",
@@ -103,6 +104,13 @@ export const GetProjectionPendingTurnStartInput = Schema.Struct({
 });
 export type GetProjectionPendingTurnStartInput = typeof GetProjectionPendingTurnStartInput.Type;
 
+export const DeleteProjectionPendingTurnStartInput = Schema.Struct({
+  threadId: ThreadId,
+  messageId: MessageId,
+});
+export type DeleteProjectionPendingTurnStartInput =
+  typeof DeleteProjectionPendingTurnStartInput.Type;
+
 export const DeleteProjectionTurnsByThreadInput = Schema.Struct({
   threadId: ThreadId,
 });
@@ -130,9 +138,16 @@ export interface ProjectionTurnRepositoryShape {
     row: ProjectionPendingTurnStart,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
 
-  /**
-   * Returns the newest pending-start placeholder for a thread; this is expected to be at most one row after replacement writes.
-   */
+  /** Appends accepted work without replacing earlier pending starts. */
+  readonly enqueuePendingTurnStart: (
+    row: ProjectionPendingTurnStart,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  readonly hasQueuedTurnStarts: (
+    input: GetProjectionPendingTurnStartInput,
+  ) => Effect.Effect<boolean, ProjectionRepositoryError>;
+
+  /** Returns the oldest pending-start placeholder for a thread. */
   readonly getPendingTurnStartByThreadId: (
     input: GetProjectionPendingTurnStartInput,
   ) => Effect.Effect<Option.Option<ProjectionPendingTurnStart>, ProjectionRepositoryError>;
@@ -151,6 +166,11 @@ export interface ProjectionTurnRepositoryShape {
    */
   readonly deletePendingTurnStartByThreadId: (
     input: GetProjectionPendingTurnStartInput,
+  ) => Effect.Effect<void, ProjectionRepositoryError>;
+
+  /** Deletes one correlated pending start without consuming later queued starts. */
+  readonly deletePendingTurnStart: (
+    input: DeleteProjectionPendingTurnStartInput,
   ) => Effect.Effect<void, ProjectionRepositoryError>;
 
   /**

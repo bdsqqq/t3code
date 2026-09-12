@@ -25,6 +25,7 @@ import {
 } from "@t3tools/contracts";
 import { serializeAssistantCitation } from "@t3tools/shared/assistantCitations";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Deferred from "effect/Deferred";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -175,6 +176,7 @@ describe("ProviderCommandReactor", () => {
     readonly titleRegenerationBeforeStart?: "one" | "two";
     readonly pendingTurnBeforeStart?: boolean;
     readonly pendingTurnModelSelection?: ModelSelection;
+    readonly pendingCompactionQueueBeforeStart?: "compacting" | "completed" | "first-delivered";
     readonly serverActivation?: Effect.Effect<void>;
     readonly beforeReadySessionDispatch?: () => Effect.Effect<void>;
     readonly beforeTurnStartDispatch?: () => Effect.Effect<void>;
@@ -579,6 +581,106 @@ describe("ProviderCommandReactor", () => {
         }),
       );
     }
+    if (input?.pendingCompactionQueueBeforeStart !== undefined) {
+      const threadId = ThreadId.make("thread-1");
+      const dispatchTurn = (input: {
+        readonly commandId: string;
+        readonly messageId: string;
+        readonly text: string;
+        readonly createdAt: string;
+      }) =>
+        engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make(input.commandId),
+          threadId,
+          message: {
+            messageId: MessageId.make(input.messageId),
+            role: "user",
+            text: input.text,
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: input.createdAt,
+        });
+      for (const turn of [
+        {
+          commandId: "cmd-compact-before-restart",
+          messageId: "message-compact-before-restart",
+          text: "/compact",
+          createdAt: "2026-01-01T00:00:01.000Z",
+        },
+        {
+          commandId: "cmd-queued-first-before-restart",
+          messageId: "message-queued-first-before-restart",
+          text: "first queued after restart",
+          createdAt: "2026-01-01T00:00:02.000Z",
+        },
+        {
+          commandId: "cmd-queued-second-before-restart",
+          messageId: "message-queued-second-before-restart",
+          text: "second queued after restart",
+          createdAt: "2026-01-01T00:00:03.000Z",
+        },
+      ]) {
+        await Effect.runPromise(dispatchTurn(turn));
+      }
+      if (input.pendingCompactionQueueBeforeStart !== "compacting") {
+        await Effect.runPromise(
+          engine.dispatch({
+            type: "thread.activity.append",
+            commandId: CommandId.make("cmd-compact-completed-before-restart"),
+            threadId,
+            activity: {
+              id: EventId.make("activity-compact-completed-before-restart"),
+              tone: "info",
+              kind: "context-compaction",
+              summary: "Context compacted",
+              payload: { requestId: "message-compact-before-restart" },
+              turnId: null,
+              createdAt: "2026-01-01T00:00:04.000Z",
+            },
+            createdAt: "2026-01-01T00:00:04.000Z",
+          }),
+        );
+      }
+      if (input.pendingCompactionQueueBeforeStart === "first-delivered") {
+        await Effect.runPromise(
+          engine.dispatch({
+            type: "thread.turn.start",
+            commandId: CommandId.make("server:after-compaction:delivered-before-restart"),
+            threadId,
+            message: {
+              messageId: MessageId.make("message-queued-first-before-restart"),
+              role: "user",
+              text: "first queued after restart",
+              attachments: [],
+            },
+            interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+            runtimeMode: "approval-required",
+            createdAt: "2026-01-01T00:00:02.000Z",
+          }),
+        );
+        await Effect.runPromise(
+          engine.dispatch({
+            type: "thread.session.set",
+            commandId: CommandId.make("cmd-first-queued-delivered-before-restart"),
+            threadId,
+            session: {
+              threadId,
+              status: "running",
+              providerName: "codex",
+              providerInstanceId: ProviderInstanceId.make("codex"),
+              runtimeMode: "approval-required",
+              activeTurnId: TurnId.make("turn-first-queued-delivered-before-restart"),
+              lastError: null,
+              updatedAt: "2026-01-01T00:00:05.000Z",
+            },
+            createdAt: "2026-01-01T00:00:05.000Z",
+          }),
+        );
+      }
+    }
     if (input?.pendingTurnBeforeStart === true) {
       await Effect.runPromise(
         engine.dispatch({
@@ -640,7 +742,7 @@ describe("ProviderCommandReactor", () => {
             return yield* sql<{ readonly threadId: string }>`
               SELECT thread_id AS "threadId"
               FROM projection_turns
-              WHERE turn_id IS NULL AND state = 'pending'
+              WHERE turn_id IS NULL AND state IN ('pending', 'queued')
             `;
           }),
         ),
@@ -940,6 +1042,153 @@ describe("ProviderCommandReactor", () => {
     });
   });
 
+  effectIt.effect(
+    "recovers a compaction queue in accepted order with original operation identities",
+    () =>
+      Effect.gen(function* () {
+        const activation = yield* Deferred.make<void>();
+        const compactionStarted = yield* Deferred.make<void>();
+        const releaseCompaction = yield* Deferred.make<void>();
+        const secondQueuedTurnSent = yield* Deferred.make<void>();
+        const threadId = ThreadId.make("thread-1");
+        let queuedSendCount = 0;
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            pendingCompactionQueueBeforeStart: "compacting",
+            serverActivation: Deferred.await(activation),
+            compactThreadEffect: () =>
+              Deferred.succeed(compactionStarted, undefined).pipe(
+                Effect.andThen(Deferred.await(releaseCompaction)),
+              ),
+          }),
+        );
+        harness.sendTurn.mockImplementation(() => {
+          queuedSendCount += 1;
+          const turnId = TurnId.make(`turn-queued-after-restart-${queuedSendCount}`);
+          return (
+            queuedSendCount === 2 ? Deferred.succeed(secondQueuedTurnSent, undefined) : Effect.void
+          ).pipe(Effect.as({ threadId, turnId }));
+        });
+
+        yield* Deferred.succeed(activation, undefined);
+        yield* Deferred.await(compactionStarted);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).not.toHaveBeenCalled();
+
+        yield* Deferred.succeed(releaseCompaction, undefined);
+        yield* Deferred.await(secondQueuedTurnSent);
+        expect(harness.sendTurn.mock.calls.map(([request]) => request)).toEqual([
+          expect.objectContaining({
+            input: "first queued after restart",
+            operationId: CommandId.make("cmd-queued-first-before-restart"),
+          }),
+          expect.objectContaining({
+            input: "second queued after restart",
+            operationId: CommandId.make("cmd-queued-second-before-restart"),
+          }),
+        ]);
+      }),
+  );
+
+  effectIt.effect(
+    "orders recovery before live admissions and acknowledges same-turn steering",
+    () =>
+      Effect.gen(function* () {
+        const activation = yield* Deferred.make<void>();
+        const firstStarted = yield* Deferred.make<void>();
+        const releaseFirst = yield* Deferred.make<void>();
+        const harness = yield* Effect.promise(() =>
+          createHarness({
+            pendingCompactionQueueBeforeStart: "completed",
+            serverActivation: Deferred.await(activation),
+          }),
+        );
+        const events = yield* harness.engine.subscribeDomainEvents;
+        const accepted = yield* events.pipe(
+          Stream.filter(
+            (event) =>
+              event.type === "thread.activity-appended" &&
+              event.payload.activity.kind === "provider.turn.start.accepted",
+          ),
+          Stream.drop(2),
+          Stream.take(1),
+          Stream.runDrain,
+          Effect.forkChild,
+        );
+        let sends = 0;
+        harness.sendTurn.mockImplementation(() => {
+          sends += 1;
+          return (
+            sends === 1
+              ? Deferred.succeed(firstStarted, undefined).pipe(
+                  Effect.andThen(Deferred.await(releaseFirst)),
+                )
+              : Effect.void
+          ).pipe(
+            Effect.as({
+              threadId: ThreadId.make("thread-1"),
+              turnId: TurnId.make("same-steering-turn"),
+            }),
+          );
+        });
+        yield* harness.engine.dispatch({
+          type: "thread.turn.start",
+          commandId: CommandId.make("cmd-live-during-startup"),
+          threadId: ThreadId.make("thread-1"),
+          message: {
+            messageId: MessageId.make("message-live-during-startup"),
+            role: "user",
+            text: "live tail",
+            attachments: [],
+          },
+          interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
+          runtimeMode: "approval-required",
+          createdAt: "2026-01-01T00:00:06.000Z",
+        });
+        yield* Deferred.succeed(activation, undefined);
+        yield* Deferred.await(firstStarted);
+        yield* Effect.promise(() => harness.drain());
+        expect(harness.sendTurn).toHaveBeenCalledTimes(1);
+        yield* Deferred.succeed(releaseFirst, undefined);
+        yield* Fiber.join(accepted);
+        expect(harness.sendTurn.mock.calls.map(([request]) => request)).toEqual([
+          expect.objectContaining({ operationId: "cmd-queued-first-before-restart" }),
+          expect.objectContaining({ operationId: "cmd-queued-second-before-restart" }),
+          expect.objectContaining({ operationId: "cmd-live-during-startup" }),
+        ]);
+        expect(yield* Effect.promise(() => harness.readPendingTurnStarts())).toEqual([]);
+      }),
+  );
+
+  effectIt.effect("does not redeliver a queued turn already delivered before restart", () =>
+    Effect.gen(function* () {
+      const activation = yield* Deferred.make<void>();
+      const queuedTurnSent = yield* Deferred.make<void>();
+      const threadId = ThreadId.make("thread-1");
+      const harness = yield* Effect.promise(() =>
+        createHarness({
+          pendingCompactionQueueBeforeStart: "first-delivered",
+          serverActivation: Deferred.await(activation),
+        }),
+      );
+      harness.sendTurn.mockImplementation(() =>
+        Deferred.succeed(queuedTurnSent, undefined).pipe(
+          Effect.as({ threadId, turnId: TurnId.make("turn-second-queued-after-restart") }),
+        ),
+      );
+
+      yield* Deferred.succeed(activation, undefined);
+      yield* Deferred.await(queuedTurnSent);
+      expect(harness.compactThread).not.toHaveBeenCalled();
+      expect(harness.sendTurn.mock.calls.map(([request]) => request)).toEqual([
+        expect.objectContaining({
+          input: "second queued after restart",
+          operationId: CommandId.make("cmd-queued-second-before-restart"),
+        }),
+      ]);
+    }),
+  );
+
   it("replays fenced managed Pi admission without opening a replacement session", async () => {
     const piModelSelection = {
       instanceId: ProviderInstanceId.make("pi"),
@@ -1189,6 +1438,8 @@ describe("ProviderCommandReactor", () => {
           ),
         ).toEqual([]);
         expect(yield* Effect.promise(() => harness.readPendingTurnStarts())).toEqual([
+          { threadId: "thread-1" },
+          { threadId: "thread-1" },
           { threadId: "thread-1" },
         ]);
 

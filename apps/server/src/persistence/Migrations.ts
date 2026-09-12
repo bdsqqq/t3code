@@ -66,6 +66,7 @@ import Migration0052 from "./Migrations/052_PiExternalLifecycleOverrides.ts";
 import Migration0053 from "./Migrations/053_ProjectionPendingTurnIntent.ts";
 import Migration0054 from "./Migrations/054_ProjectionPendingTurnOperationId.ts";
 import Migration0055 from "./Migrations/055_ProjectionPendingTurnAdmissionProtocol.ts";
+import Migration0056 from "./Migrations/056_RecoverCompactionQueuedTurnStarts.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -134,6 +135,7 @@ const migrationEntries = [
   [53, "ProjectionPendingTurnIntent", Migration0053],
   [54, "ProjectionPendingTurnOperationId", Migration0054],
   [55, "ProjectionPendingTurnAdmissionProtocol", Migration0055],
+  [56, "RecoverCompactionQueuedTurnStarts", Migration0056],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

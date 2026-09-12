@@ -29,6 +29,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schedule from "effect/Schedule";
 import * as Schema from "effect/Schema";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { makeDrainableWorker } from "@t3tools/shared/DrainableWorker";
 
@@ -402,6 +403,7 @@ const make = Effect.gen(function* () {
   };
   // Turn starts received while a thread compacts, replayed in order once its session is restored.
   const turnsAfterCompaction = new Map<ThreadId, Array<QueuedTurnStart>>();
+  const turnAdmissionGates = new Map<ThreadId, { gate: Semaphore.Semaphore; pending: number }>();
   // Replay command id → the queued turn start it re-requests. `sent` settles once the replay's
   // provider send finishes, which is what lets the next queued turn follow it in order.
   const resumedTurnStarts = new Map<
@@ -1340,10 +1342,7 @@ const make = Effect.gen(function* () {
     const request: TurnStartRequest =
       "commandId" in input
         ? resumed !== undefined
-          ? {
-              ...resumed.request,
-              operationId: input.commandId,
-            }
+          ? resumed.request
           : {
               threadId: input.payload.threadId,
               messageId: input.payload.messageId,
@@ -1697,9 +1696,53 @@ const make = Effect.gen(function* () {
       return;
     }
 
-    const send = providerService
-      .sendTurn(sendTurnRequest.value)
-      .pipe(Effect.asVoid, Effect.catchCause(recoverTurnStartFailure));
+    let admission = turnAdmissionGates.get(request.threadId);
+    if (!admission) {
+      admission = { gate: yield* Semaphore.make(1), pending: 0 };
+      turnAdmissionGates.set(request.threadId, admission);
+    }
+    const admitted = admission;
+    admitted.pending += 1;
+    const durableQueuedAdmission = resumed !== undefined || request.recovered;
+    const send = admitted.gate
+      .withPermit(
+        Effect.gen(function* () {
+          if (durableQueuedAdmission) {
+            const pending = yield* projectionTurnRepository.getPendingTurnStartByThreadId({
+              threadId: request.threadId,
+            });
+            if (Option.isNone(pending) || pending.value.messageId !== request.messageId) return;
+          }
+          const result = yield* providerService.sendTurn(sendTurnRequest.value);
+          // Admission, not a new turn id, acknowledges steering on providers that
+          // accept multiple messages into the same running turn.
+          const createdAt = DateTime.formatIso(yield* DateTime.now);
+          yield* orchestrationEngine.dispatch({
+            type: "thread.activity.append",
+            commandId: yield* serverCommandId("turn-start-accepted"),
+            threadId: request.threadId,
+            activity: {
+              id: yield* serverEventId(),
+              kind: "provider.turn.start.accepted",
+              tone: "info",
+              summary: "Message sent",
+              payload: { requestId: request.messageId },
+              turnId: result.turnId,
+              createdAt,
+            },
+            createdAt,
+          });
+        }),
+      )
+      .pipe(
+        Effect.catchCause(recoverTurnStartFailure),
+        Effect.ensuring(
+          Effect.sync(() => {
+            admitted.pending -= 1;
+            if (admitted.pending === 0) turnAdmissionGates.delete(request.threadId);
+          }),
+        ),
+      );
     // The forked send settles `sent` from here on, so drop the entry the post-processing hook uses.
     if (resumed && receivedEvent?.commandId != null) {
       resumedTurnStarts.delete(receivedEvent.commandId);
@@ -2094,7 +2137,11 @@ const make = Effect.gen(function* () {
 
     // Subscribe before returning, even while event handling waits for server activation.
     const domainEvents = yield* orchestrationEngine.subscribeDomainEvents;
-    yield* forkParked(Stream.runForEach(domainEvents, processEvent));
+    yield* forkParked(
+      Deferred.await(startupRecoveryReady).pipe(
+        Effect.andThen(Stream.runForEach(domainEvents, processEvent)),
+      ),
+    );
 
     const pendingTurnStarts = yield* projectionTurnRepository
       .listPendingTurnStarts()

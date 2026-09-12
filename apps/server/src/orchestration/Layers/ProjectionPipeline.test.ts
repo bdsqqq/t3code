@@ -4064,6 +4064,210 @@ it.layer(makeProjectionPipelinePrefixedTestLayer("t3-pending-turn-terminal-test-
         assert.deepEqual(pendingRows, [{ messageId: "new-message" }]);
       }),
     );
+    it.effect("persists accepted turn starts queued behind compaction in accepted order", () =>
+      Effect.gen(function* () {
+        const projectionPipeline = yield* OrchestrationProjectionPipeline;
+        const eventStore = yield* OrchestrationEventStore;
+        const sql = yield* SqlClient.SqlClient;
+        const threadId = ThreadId.make("thread-compaction-queue");
+        const requests = [
+          { messageId: "compact-request", text: "/compact" },
+          { messageId: "queued-first", text: "first queued" },
+          { messageId: "queued-second", text: "second queued" },
+        ] as const;
+
+        for (const [index, request] of requests.entries()) {
+          const createdAt = `2026-02-26T16:00:0${index}.000Z`;
+          yield* eventStore.append({
+            type: "thread.message-sent",
+            eventId: EventId.make(`evt-compaction-queue-message-${index}`),
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: createdAt,
+            commandId: CommandId.make(`cmd-compaction-queue-${index}`),
+            causationEventId: null,
+            correlationId: CorrelationId.make(`cmd-compaction-queue-${index}`),
+            metadata: {},
+            payload: {
+              threadId,
+              messageId: MessageId.make(request.messageId),
+              role: "user",
+              text: request.text,
+              attachments: [],
+              turnId: null,
+              streaming: false,
+              createdAt,
+              updatedAt: createdAt,
+            },
+          });
+          yield* eventStore.append({
+            type: "thread.turn-start-requested",
+            eventId: EventId.make(`evt-compaction-queue-request-${index}`),
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: createdAt,
+            commandId: CommandId.make(`cmd-compaction-queue-${index}`),
+            causationEventId: null,
+            correlationId: CorrelationId.make(`cmd-compaction-queue-${index}`),
+            metadata: {},
+            payload: {
+              threadId,
+              messageId: MessageId.make(request.messageId),
+              runtimeMode: "full-access",
+              createdAt,
+            },
+          });
+          if (index === 0) {
+            yield* eventStore.append({
+              type: "thread.session-set",
+              eventId: EventId.make("evt-compaction-queue-starting"),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: "2026-02-26T16:00:00.100Z",
+              commandId: CommandId.make("cmd-compaction-queue-starting"),
+              causationEventId: null,
+              correlationId: CorrelationId.make("cmd-compaction-queue-starting"),
+              metadata: {},
+              payload: {
+                threadId,
+                session: {
+                  threadId,
+                  status: "starting",
+                  providerName: "codex",
+                  runtimeMode: "full-access",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-02-26T16:00:00.100Z",
+                },
+              },
+            });
+          } else if (index === 1) {
+            yield* eventStore.append({
+              type: "thread.activity-appended",
+              eventId: EventId.make("evt-compaction-queue-completed"),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: "2026-02-26T16:00:01.100Z",
+              commandId: CommandId.make("cmd-compaction-queue-completed"),
+              causationEventId: null,
+              correlationId: CorrelationId.make("cmd-compaction-queue-completed"),
+              metadata: {},
+              payload: {
+                threadId,
+                activity: {
+                  id: EventId.make("activity-compaction-queue-completed"),
+                  tone: "info",
+                  kind: "context-compaction",
+                  summary: "Context compacted",
+                  payload: { requestId: "compact-request" },
+                  turnId: null,
+                  createdAt: "2026-02-26T16:00:01.100Z",
+                },
+              },
+            });
+            yield* eventStore.append({
+              type: "thread.session-set",
+              eventId: EventId.make("evt-compaction-queue-ready"),
+              aggregateKind: "thread",
+              aggregateId: threadId,
+              occurredAt: "2026-02-26T16:00:01.200Z",
+              commandId: CommandId.make("server:provider-session-set:compaction-ready"),
+              causationEventId: null,
+              correlationId: null,
+              metadata: {},
+              payload: {
+                threadId,
+                session: {
+                  threadId,
+                  status: "ready",
+                  providerName: "codex",
+                  runtimeMode: "full-access",
+                  activeTurnId: null,
+                  lastError: null,
+                  updatedAt: "2026-02-26T16:00:01.200Z",
+                },
+              },
+            });
+          }
+        }
+
+        yield* projectionPipeline.bootstrap;
+
+        const pendingRows = yield* sql<{
+          readonly messageId: string;
+          readonly operationId: string | null;
+        }>`
+          SELECT
+            pending_message_id AS "messageId",
+            pending_operation_id AS "operationId"
+          FROM projection_turns
+          WHERE thread_id = ${threadId}
+            AND turn_id IS NULL
+            AND state IN ('pending', 'queued')
+          ORDER BY row_id ASC
+        `;
+        assert.deepEqual(pendingRows, [
+          { messageId: "queued-first", operationId: "cmd-compaction-queue-1" },
+          { messageId: "queued-second", operationId: "cmd-compaction-queue-2" },
+        ]);
+        for (const suffix of ["first", "duplicate"]) {
+          yield* eventStore.append({
+            type: "thread.session-set",
+            eventId: EventId.make(`evt-queued-running-${suffix}`),
+            aggregateKind: "thread",
+            aggregateId: threadId,
+            occurredAt: "2026-02-26T16:00:03.000Z",
+            commandId: CommandId.make(`cmd-queued-running-${suffix}`),
+            causationEventId: null,
+            correlationId: null,
+            metadata: {},
+            payload: {
+              threadId,
+              session: {
+                threadId,
+                status: "running",
+                providerName: "codex",
+                runtimeMode: "full-access",
+                activeTurnId: TurnId.make("turn-queued-first"),
+                lastError: null,
+                updatedAt: "2026-02-26T16:00:03.000Z",
+              },
+            },
+          });
+          yield* projectionPipeline.bootstrap;
+        }
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT pending_message_id AS "messageId"
+            FROM projection_turns WHERE thread_id = ${threadId}
+              AND turn_id IS NULL AND state IN ('pending', 'queued')
+            ORDER BY row_id
+          `,
+          [{ messageId: "queued-second" }],
+        );
+        yield* eventStore.append({
+          type: "thread.session-stop-requested",
+          eventId: EventId.make("evt-stop-durable-queue"),
+          aggregateKind: "thread",
+          aggregateId: threadId,
+          occurredAt: "2026-02-26T16:00:04.000Z",
+          commandId: CommandId.make("cmd-stop-durable-queue"),
+          causationEventId: null,
+          correlationId: null,
+          metadata: {},
+          payload: { threadId, createdAt: "2026-02-26T16:00:04.000Z" },
+        });
+        yield* projectionPipeline.bootstrap;
+        assert.deepStrictEqual(
+          yield* sql`
+            SELECT row_id FROM projection_turns
+            WHERE thread_id = ${threadId} AND turn_id IS NULL
+              AND state IN ('pending', 'queued')
+          `,
+          [],
+        );
+      }),
+    );
   },
 );
 
