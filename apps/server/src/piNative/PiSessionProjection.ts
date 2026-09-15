@@ -14,6 +14,7 @@ import type {
   RuntimeTaskId,
   TurnId,
 } from "@t3tools/contracts";
+import * as Schema from "effect/Schema";
 import {
   EventId as EventIdSchema,
   MessageId as MessageIdSchema,
@@ -32,6 +33,15 @@ import {
 
 type JsonRecord = Readonly<Record<string, unknown>>;
 const MESSAGE_ID_CUSTOM_TYPE = "t3.message-id.v1";
+const isSessionRecapData = Schema.is(
+  Schema.Struct({
+    version: Schema.Literal(1),
+    throughLeafId: Schema.NonEmptyString,
+    text: Schema.String.check(Schema.isPattern(/\S/)),
+    idleMs: Schema.Int.check(Schema.isGreaterThanOrEqualTo(1_000)),
+    title: Schema.optional(Schema.String),
+  }),
+);
 
 const isRecord = (value: unknown): value is JsonRecord =>
   typeof value === "object" && value !== null && !Array.isArray(value);
@@ -348,7 +358,29 @@ function projectHistory(record: PiSessionCatalogRecord, entries: ReadonlyArray<J
         typeof entry.provider === "string" ? `${entry.provider}/${entry.modelId}` : entry.modelId;
       continue;
     }
-    if (entry.type === "custom") continue;
+    if (entry.type === "custom") {
+      if (entry.customType === "@bds_pi/session-recap" && isSessionRecapData(entry.data)) {
+        const recap = entry.data;
+        const idle =
+          recap.idleMs < 60_000
+            ? `${Math.round(recap.idleMs / 1_000)}s`
+            : `${Math.round(recap.idleMs / 60_000)}m`;
+        // Pi owns generation and branch membership. This is display-only history,
+        // not an assistant message or work belonging inside a folded agent turn.
+        activities.push({
+          id: activityId(record, entryId),
+          tone: "info",
+          kind: "session.recap",
+          summary: ["Session recap", recap.title?.trim(), `${idle} idle`]
+            .filter(Boolean)
+            .join(" · "),
+          payload: { detail: recap.text, throughLeafId: recap.throughLeafId, idleMs: recap.idleMs },
+          turnId: null,
+          createdAt,
+        });
+      }
+      continue;
+    }
     if (entry.type !== "message" || !isRecord(entry.message)) {
       nextUserMessageId = undefined;
       continue;

@@ -91,6 +91,87 @@ const entries = [
 ] as const;
 
 describe("PiSessionProjection", () => {
+  const recap = {
+    type: "custom",
+    id: "recap-1",
+    parentId: "tool-result",
+    timestamp: "2026-07-30T00:02:05.000Z",
+    customType: "@bds_pi/session-recap",
+    data: {
+      version: 1,
+      throughLeafId: "assistant-2",
+      text: "read README.md; no changes.",
+      idleMs: 120_000,
+    },
+  };
+
+  it("projects Pi-owned recaps as standalone activities, never conversation messages", () => {
+    const before = projectPiThread({ record, entries, projectId: ProjectId.make("project-1") });
+    const after = projectPiThread({
+      record,
+      entries: [...entries, recap],
+      projectId: ProjectId.make("project-1"),
+    });
+    expect(after.thread.messages).toEqual(before.thread.messages);
+    expect(after.thread.latestTurn).toEqual(before.thread.latestTurn);
+    expect(after.thread.activities.at(-1)).toEqual({
+      id: "session-1:recap-1",
+      kind: "session.recap",
+      tone: "info",
+      summary: "Session recap · 2m idle",
+      payload: { detail: recap.data.text, throughLeafId: "assistant-2", idleMs: 120_000 },
+      turnId: null,
+      createdAt: recap.timestamp,
+    });
+  });
+
+  it("keeps earlier branch recaps as history but excludes abandoned-branch recaps", () => {
+    const next = { ...entries[2], id: "next-user", parentId: recap.id };
+    const project = (history: ReadonlyArray<Readonly<Record<string, unknown>>>) =>
+      projectPiThread({ record, entries: history, projectId: ProjectId.make("project-1") }).thread;
+    expect(
+      project([...entries, recap, next]).activities.filter((a) => a.kind === "session.recap"),
+    ).toHaveLength(1);
+    expect(project([...entries, recap, { ...next, parentId: "user-1" }]).activities).toEqual([]);
+    expect(project([{ ...recap, parentId: "truncated-parent" }]).activities).toHaveLength(1);
+  });
+
+  it.each([
+    undefined,
+    {},
+    { ...recap.data, version: 2 },
+    { ...recap.data, throughLeafId: undefined },
+    { ...recap.data, throughLeafId: "" },
+    { ...recap.data, text: " \n " },
+    { ...recap.data, text: 3 },
+    { ...recap.data, idleMs: 999 },
+    { ...recap.data, idleMs: 1000.5 },
+    { ...recap.data, title: 3 },
+  ])("ignores malformed or unsupported recap data: %j", (data) => {
+    const thread = projectPiThread({
+      record,
+      entries: [...entries, { ...recap, data }],
+      projectId: ProjectId.make("project-1"),
+    }).thread;
+    expect(thread.activities.some((a) => a.kind === "session.recap")).toBe(false);
+    expect(thread.messages).toHaveLength(3);
+  });
+
+  it("ignores other custom namespaces and does not reinterpret custom messages as recaps", () => {
+    for (const entry of [
+      { ...recap, customType: "other" },
+      { ...recap, type: "custom_message" },
+    ]) {
+      expect(
+        projectPiThread({
+          record,
+          entries: [...entries, entry],
+          projectId: ProjectId.make("project-1"),
+        }).thread.activities,
+      ).toHaveLength(1);
+    }
+  });
+
   it("follows only the active parent chain", () => {
     expect(projectPiActiveBranch(entries).entries.map((entry) => entry.id)).toEqual([
       "user-1",

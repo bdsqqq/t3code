@@ -35,6 +35,7 @@ import {
 import {
   createMessageAttachmentPreviewProjector,
   deriveTimelineEntries,
+  deriveWorkLogEntries,
   deriveTimelineEntriesWithState,
   type WorkLogEntry,
   type TimelineEntriesProjection,
@@ -1089,6 +1090,48 @@ describe("resolveAssistantMessageCopyState", () => {
 });
 
 describe("deriveMessagesTimelineRows", () => {
+  it.each([false, true])(
+    "keeps recap text visible outside work groups (working: %s)",
+    (isWorking) => {
+      const text = "preserve **literal text** and <exited with exit code 1>";
+      const work = deriveWorkLogEntries(
+        ["before", "recap", "after"].map((id, index) => ({
+          id: EventId.make(id),
+          kind: id === "recap" ? "session.recap" : "runtime.info",
+          tone: "info" as const,
+          summary: id === "recap" ? "Session recap · 2m idle" : id,
+          payload: { detail: id === "recap" ? text : "other activity" },
+          turnId: null,
+          createdAt: `2026-09-15T00:0${index}:00.000Z`,
+        })),
+      );
+      const rows = deriveMessagesTimelineRows({
+        timelineEntries: deriveTimelineEntries([], [], work),
+        isWorking,
+        activeTurnStartedAt: isWorking ? "2026-09-15T00:03:00.000Z" : null,
+        turnDiffSummaries: [],
+        supportsConversationRollback: false,
+      });
+      const recap = rows.find(
+        (row) => row.kind === "work" && row.groupedEntries.some((entry) => entry.id === "recap"),
+      );
+      expect(recap).toMatchObject({
+        kind: "work",
+        isExpandedToolGroup: false,
+        groupedEntries: [
+          {
+            id: "recap",
+            label: "Session recap · 2m idle",
+            detail: text,
+            sourceActivityKind: "session.recap",
+          },
+        ],
+      });
+      if (recap?.kind === "work") expect(recap.groupedEntries).toHaveLength(1);
+      expect(rows.some((row) => row.kind === "message")).toBe(false);
+    },
+  );
+
   it("keeps context compaction visible outside folded work", () => {
     const rows = deriveMessagesTimelineRows({
       timelineEntries: [

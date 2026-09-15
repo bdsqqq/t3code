@@ -527,14 +527,17 @@ function toDerivedWorkLogEntry(activity: OrchestrationThreadActivity): DerivedWo
       ? payload.detail
       : null;
   const taskLabel = taskSummary || taskDetailAsLabel;
-  const detail = isTaskActivity
-    ? !taskDetailAsLabel &&
-      payload &&
-      typeof payload.detail === "string" &&
-      payload.detail.length > 0
-      ? stripTrailingExitCode(payload.detail).output
-      : null
-    : extractToolDetail(payload, title ?? activity.summary);
+  const detail =
+    activity.kind === "session.recap" && typeof payload?.detail === "string"
+      ? payload.detail
+      : isTaskActivity
+        ? !taskDetailAsLabel &&
+          payload &&
+          typeof payload.detail === "string" &&
+          payload.detail.length > 0
+          ? stripTrailingExitCode(payload.detail).output
+          : null
+        : extractToolDetail(payload, title ?? activity.summary);
   const toolCallId = isTaskActivity ? null : extractToolCallId(payload);
   const entry: DerivedWorkLogEntry = {
     id: activity.id,

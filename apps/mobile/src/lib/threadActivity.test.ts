@@ -18,6 +18,7 @@ import {
   buildPendingUserInputAnswers,
   buildThreadFeed,
   deriveThreadFeedPresentation,
+  isSessionRecapActivityGroup,
   isPendingUserInputOptionSelected,
   setPendingUserInputCustomAnswer,
   togglePendingUserInputOptionSelection,
@@ -75,6 +76,46 @@ const nativeQuestion = {
   multiSelect: false,
   allowCustomAnswer: false,
 } as const;
+
+describe("session recaps", () => {
+  it.each([null, "2026-09-15T00:03:00.000Z"])(
+    "keeps recaps outside collapsed work with active start %s",
+    (activeStart) => {
+      const text = "preserve **literal text** and <exited with exit code 1>";
+      const feed = buildThreadFeed({
+        messages: [],
+        activities: ["before", "recap", "after"].map((id, index) => ({
+          id: EventId.make(id),
+          kind: id === "recap" ? "session.recap" : "runtime.info",
+          tone: "info" as const,
+          summary: id === "recap" ? "Session recap · 2m idle" : id,
+          payload: { detail: id === "recap" ? text : "other activity" },
+          turnId: null,
+          createdAt: `2026-09-15T00:0${index}:00.000Z`,
+        })),
+      });
+      const rows = deriveThreadFeedPresentation(feed, null, new Set(), new Set(), activeStart);
+      const recap = rows.find(
+        (row) => row.type === "activity-group" && isSessionRecapActivityGroup(row),
+      );
+      expect(recap).toMatchObject({
+        type: "activity-group",
+        activities: [
+          {
+            workEntry: {
+              id: "recap",
+              label: "Session recap · 2m idle",
+              detail: text,
+              sourceActivityKind: "session.recap",
+            },
+          },
+        ],
+      });
+      if (recap?.type === "activity-group") expect(recap.activities).toHaveLength(1);
+      expect(rows.some((row) => row.type === "message")).toBe(false);
+    },
+  );
+});
 
 describe("pending user input answers", () => {
   it("accepts free-text answers to async questions without options", () => {

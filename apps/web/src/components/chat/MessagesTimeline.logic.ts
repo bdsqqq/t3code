@@ -920,6 +920,7 @@ export function deriveMessagesTimelineRows(input: {
       entry.kind !== "work" ||
       entry.entry.agentSpawn !== undefined ||
       entry.entry.sourceActivityKind === "context-compaction" ||
+      entry.entry.sourceActivityKind === "session.recap" ||
       entry.entry.tone === "error"
     ) {
       break;
@@ -1043,7 +1044,11 @@ export function deriveMessagesTimelineRows(input: {
     }
 
     if (timelineEntry.kind === "work") {
-      if (timelineEntry.entry.agentSpawn !== undefined || timelineEntry.entry.tone === "error") {
+      if (
+        timelineEntry.entry.agentSpawn !== undefined ||
+        timelineEntry.entry.sourceActivityKind === "session.recap" ||
+        timelineEntry.entry.tone === "error"
+      ) {
         nextRows.push({
           kind: "work",
           id: timelineEntry.id,
@@ -1062,6 +1067,7 @@ export function deriveMessagesTimelineRows(input: {
           nextEntry.kind !== "work" ||
           nextEntry.entry.agentSpawn !== undefined ||
           nextEntry.entry.sourceActivityKind === "context-compaction" ||
+          nextEntry.entry.sourceActivityKind === "session.recap" ||
           nextEntry.entry.tone === "error" ||
           activeWorkEntryIds.has(nextEntry.id) ||
           collapsedEntryIds.has(nextEntry.id) ||

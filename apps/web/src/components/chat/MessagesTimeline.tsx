@@ -1282,7 +1282,17 @@ const TimelineRowContent = memo(function TimelineRowContent({ row }: { row: Time
       }
       data-message-role={row.kind === "message" ? row.message.role : undefined}
     >
-      {row.kind === "work" ? (
+      {row.kind === "work" && row.groupedEntries[0]?.sourceActivityKind === "session.recap" ? (
+        <aside
+          aria-label="Session recap"
+          className="mx-auto w-full max-w-3xl border-l-2 border-border pl-3 text-muted-foreground"
+        >
+          <p className="mb-1 text-xs">{row.groupedEntries[0].label}</p>
+          <p className="whitespace-pre-wrap wrap-anywhere text-sm">
+            {row.groupedEntries[0].detail}
+          </p>
+        </aside>
+      ) : row.kind === "work" ? (
         <WorkGroupSection
           anchorKey={row.id}
           groupedEntries={row.groupedEntries}

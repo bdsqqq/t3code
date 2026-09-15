@@ -140,6 +140,7 @@ import {
 import {
   deriveThreadFeedPresentation,
   isContextCompactionActivityGroup,
+  isSessionRecapActivityGroup,
   type ThreadFeedEntry,
   type ThreadFeedLatestTurn,
 } from "../../lib/threadActivity";
@@ -1426,6 +1427,18 @@ function renderFeedEntry(
     );
   }
 
+  if (entry.type === "activity-group" && isSessionRecapActivityGroup(entry)) {
+    const recap = entry.activities[0]!.workEntry;
+    return (
+      <View className="my-2 border-l-2 border-adaptive-neutral-200-a80-white-a8 pl-3">
+        <Text className="mb-1 text-xs text-foreground-muted">{recap.label}</Text>
+        <Text selectable className="text-sm text-foreground-muted">
+          {recap.detail}
+        </Text>
+      </View>
+    );
+  }
+
   if (entry.type === "activity-group" && isContextCompactionActivityGroup(entry)) {
     const label = entry.activities[0]!.summary;
     return (
@@ -2675,7 +2688,7 @@ export const ThreadFeed = memo(function ThreadFeed(props: ThreadFeedProps) {
         case "thinking":
           return WORK_GROUP_TOGGLE_HEIGHT;
         case "activity-group":
-          if (isContextCompactionActivityGroup(entry)) {
+          if (isContextCompactionActivityGroup(entry) || isSessionRecapActivityGroup(entry)) {
             return undefined;
           }
           // Expanded rows append a variable detail block — fall back to

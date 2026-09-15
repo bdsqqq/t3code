@@ -328,6 +328,37 @@ const deleted = (): OrchestrationThreadStreamItem => ({
 });
 
 describe("EnvironmentThreads", () => {
+  it.effect("applies idle custom-entry snapshots even when the runtime sequence is unchanged", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        yield* Queue.offer(h.inputs, snapshot(BASE_THREAD));
+        yield* awaitThreadState(h.observed, (state) => Option.isSome(state.data));
+        const activity = {
+          id: EventId.make("pi-session:recap-1"),
+          kind: "session.recap",
+          tone: "info" as const,
+          summary: "Session recap",
+          payload: {
+            detail: "isolated refresh proof",
+            throughLeafId: "assistant-1",
+            idleMs: 120_000,
+          },
+          turnId: null,
+          createdAt: "2026-09-15T00:02:00.000Z",
+        };
+        yield* Queue.offer(h.inputs, snapshot({ ...BASE_THREAD, activities: [activity] }));
+        const updated = yield* awaitThreadState(
+          h.observed,
+          (state) => Option.isSome(state.data) && state.data.value.activities.length === 1,
+        );
+        expect(Option.getOrThrow(updated.data).activities).toEqual([activity]);
+        expect(Option.getOrThrow(updated.data).messages).toEqual(BASE_THREAD.messages);
+        expect(yield* Ref.get(h.subscriptionCount)).toBe(1);
+      }),
+    ),
+  );
+
   for (const source of ["disk", "HTTP"] as const) {
     it.effect(`does not rewrite an unchanged ${source} snapshot on navigation or warm return`, () =>
       Effect.gen(function* () {
