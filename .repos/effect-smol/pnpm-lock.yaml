@@ -225,8 +225,8 @@ importers:
         specifier: workspace:*
         version: link:../packages/effect
       hono:
-        specifier: ^4.13.3
-        version: 4.13.3
+        specifier: ^4.13.5
+        version: 4.13.5
       nodemailer:
         specifier: ^9.0.5
         version: 9.0.5
@@ -4526,8 +4526,8 @@ packages:
   hermes-parser@0.35.0:
     resolution: {integrity: sha512-9JLjeHxBx8T4CAsydZR49PNZUaix+WpQJwu9p2010lu+7Kwl6D/7wYFFJxoz+aXkaaClp9Zfg6W6/zVlSJORaA==}
 
-  hono@4.13.3:
-    resolution: {integrity: sha512-r8AO2mYHoLxSHkgafNeC/BXyb2vWRxD3jem4Ts+ptav8oTG5FIRifAjuJEmZI4bSvvc2ns0GxmIYiZnHqN3mMw==}
+  hono@4.13.5:
+    resolution: {integrity: sha512-O6+/eCYRkzzzy0rPWwKLiGBR1nFuUPZynnwjxN1MBA62NNqbT0wQEzQyK2gSO5yDIDB336sXQleAhOHrzlYyKw==}
     engines: {node: '>=16.9.0'}
 
   html-encoding-sniffer@6.0.0:
@@ -10180,7 +10180,7 @@ snapshots:
     dependencies:
       hermes-estree: 0.35.0
 
-  hono@4.13.3: {}
+  hono@4.13.5: {}
 
   html-encoding-sniffer@6.0.0:
     dependencies:
