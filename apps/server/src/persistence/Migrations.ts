@@ -67,6 +67,8 @@ import Migration0053 from "./Migrations/053_ProjectionPendingTurnIntent.ts";
 import Migration0054 from "./Migrations/054_ProjectionPendingTurnOperationId.ts";
 import Migration0055 from "./Migrations/055_ProjectionPendingTurnAdmissionProtocol.ts";
 import Migration0056 from "./Migrations/056_RecoverCompactionQueuedTurnStarts.ts";
+import Migration0051 from "./Migrations/051_ProjectionThreadMessageContext.ts";
+import Migration0057 from "./Migrations/057_ReconcileUpstreamContextAndTitleState.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -129,6 +131,7 @@ const migrationEntries = [
   [48, "ProjectionThreadBranchPullRequest", Migration0048],
   [49, "ProjectionThreadsActiveOrderKey", Migration0049],
   [50, "ProjectionThreadPullRequests", Migration0050],
+  [51, "ProjectionThreadMessageContext", Migration0051],
   // Fork releases already used 48-51. The bridge at 52 replays upstream's
   // idempotent 48-50 migrations for those existing databases.
   [52, "PiExternalLifecycleOverrides", Migration0052],
@@ -136,6 +139,7 @@ const migrationEntries = [
   [54, "ProjectionPendingTurnOperationId", Migration0054],
   [55, "ProjectionPendingTurnAdmissionProtocol", Migration0055],
   [56, "RecoverCompactionQueuedTurnStarts", Migration0056],
+  [57, "ReconcileUpstreamContextAndTitleState", Migration0057],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

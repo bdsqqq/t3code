@@ -30,6 +30,7 @@ import {
   ProjectId as ProjectIdSchema,
   TurnId as TurnIdSchema,
 } from "@t3tools/contracts";
+import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -416,7 +417,10 @@ export function planPiExternalTurnStart(input: {
         sessionKey: input.record.sourceKey,
         sessionFile: input.record.canonicalFile,
         cwd: input.record.cwd,
-        message: input.command.message.text,
+        message: projectComposerContextForProvider({
+          text: input.command.message.text,
+          records: input.command.message.context?.records ?? [],
+        }),
         messageId: input.command.message.messageId,
         streamingBehavior: input.command.streamingBehavior ?? "steer",
       },
@@ -1280,7 +1284,10 @@ export class PiExternalThreadSource extends Context.Service<
               type,
               commandId: command.commandId,
               runtimeId: liveRuntime.runtimeId,
-              message: command.message.text,
+              message: projectComposerContextForProvider({
+                text: command.message.text,
+                records: command.message.context?.records ?? [],
+              }),
               messageId: command.message.messageId,
             });
           }

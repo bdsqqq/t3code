@@ -1,5 +1,6 @@
 import {
   CommandId,
+  ComposerContextId,
   MessageId,
   PiNativeRuntimeId,
   PiNativeSessionKey,
@@ -46,7 +47,11 @@ import {
 import { projectPiThread } from "./PiSessionProjection.ts";
 import { SessionCatalog } from "./SessionCatalog.ts";
 import { SupervisorClient } from "./SupervisorClient.ts";
-import type { SupervisorRuntimeState, SupervisorStreamEvent } from "./SupervisorProtocol.ts";
+import {
+  GUARDED_RESUME_CAPABILITY,
+  type SupervisorRuntimeState,
+  type SupervisorStreamEvent,
+} from "./SupervisorProtocol.ts";
 
 const takeoverRecord = {
   sourceKey: PiNativeSessionKey.make("source-key"),
@@ -81,6 +86,101 @@ const takeoverTurn = (externalResume?: "takeover", streamingBehavior?: "steer" |
   }) satisfies Extract<ClientOrchestrationCommand, { readonly type: "thread.turn.start" }>;
 
 describe("PiExternalThreadSource hardening", () => {
+  for (const mode of ["takeover", "send", "steer", "followUp"] as const) {
+    it.effect(
+      `projects structured context for native ${mode} without changing admission identity`,
+      () =>
+        Effect.gen(function* () {
+          const commands: unknown[] = [];
+          const runtime = {
+            runtimeId: PiNativeRuntimeId.make("runtime-1"),
+            sessionFile: takeoverRecord.canonicalFile,
+            writerKind: "rpc",
+            status: mode === "send" ? "idle" : "streaming",
+            sequence: 1,
+          } satisfies SupervisorRuntimeState;
+          const dependencies = Layer.mergeAll(
+            Layer.mock(SessionCatalog)({
+              list: () => Effect.succeed([takeoverRecord]),
+              omittedCount: () => Effect.succeed(0),
+              read: () => Effect.succeed({ record: takeoverRecord, entries: [] }),
+            }),
+            Layer.mock(SupervisorClient)({
+              list: () => Effect.succeed(mode === "takeover" ? [] : [runtime]),
+              probeCapabilities: () => Effect.succeed({ guardedResume: GUARDED_RESUME_CAPABILITY }),
+              subscribe: () => Stream.empty,
+              dispatch: (command) => {
+                commands.push(command);
+                return Effect.succeed({
+                  commandId: CommandId.make("takeover-command"),
+                  status: "completed",
+                });
+              },
+            }),
+            Layer.mock(ProjectionSnapshotQuery)({
+              getShellSnapshot: () =>
+                Effect.succeed({
+                  snapshotSequence: 0,
+                  projects: [],
+                  threads: [],
+                  updatedAt: takeoverRecord.updatedAt,
+                }),
+            }),
+            Layer.mock(PiExternalLifecycleOverrideRepository)({
+              list: () => Effect.succeed([]),
+            }),
+          );
+          const turn = takeoverTurn(
+            mode === "takeover" ? "takeover" : undefined,
+            mode === "steer" || mode === "followUp" ? mode : undefined,
+          );
+          const command = {
+            ...turn,
+            message: {
+              ...turn.message,
+              text: "Inspect [build](t3-context://v1/terminal/build)",
+              context: {
+                version: 1,
+                records: [
+                  {
+                    version: 1,
+                    kind: "terminal",
+                    contextId: ComposerContextId.make("build"),
+                    label: "build",
+                    terminalId: "terminal-1",
+                    terminalLabel: "Build",
+                    lineStart: 7,
+                    lineEnd: 7,
+                    text: "compiled successfully",
+                  },
+                ],
+              },
+            },
+          } satisfies ClientOrchestrationCommand;
+          yield* Effect.gen(function* () {
+            const source = yield* PiExternalThreadSource;
+            yield* source.dispatch(command);
+          }).pipe(
+            Effect.provide(PiExternalThreadSource.layerTest.pipe(Layer.provide(dependencies))),
+          );
+          expect(commands).toHaveLength(1);
+          expect(commands[0]).toMatchObject({
+            type: mode === "takeover" ? "resumeAndSend" : mode,
+            commandId: turn.commandId,
+            messageId: turn.message.messageId,
+            message: expect.stringContaining("[Terminal: build; ref=build]"),
+            ...(mode === "takeover"
+              ? { streamingBehavior: "steer" }
+              : { runtimeId: runtime.runtimeId }),
+          });
+          expect(commands[0]).toMatchObject({
+            message: expect.stringContaining("7 | compiled successfully"),
+          });
+          expect(command.message.text).toBe("Inspect [build](t3-context://v1/terminal/build)");
+        }).pipe(Effect.scoped),
+    );
+  }
+
   it("requires explicit takeover confirmation only when no runtime is present", () => {
     expect(
       planPiExternalTurnStart({

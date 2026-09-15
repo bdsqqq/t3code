@@ -67,6 +67,11 @@ export default Effect.gen(function* () {
     CREATE INDEX IF NOT EXISTS idx_projection_turns_thread_keyset
     ON projection_turns(thread_id, requested_at, turn_id)
   `;
+  yield* createPiLifecycleTables;
+});
+
+export const createPiLifecycleTables = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
   yield* sql`
     CREATE TABLE IF NOT EXISTS pi_external_lifecycle_overrides (
       source_key TEXT PRIMARY KEY,

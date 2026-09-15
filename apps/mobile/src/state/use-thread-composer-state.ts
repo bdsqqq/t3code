@@ -1,5 +1,6 @@
+import type { ComposerTextPaste } from "../native/T3ComposerEditor.types";
 import { useAtomValue } from "@effect/atom-react";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Alert } from "react-native";
 import * as Cause from "effect/Cause";
 
@@ -8,6 +9,7 @@ import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   MessageId,
   PROVIDER_SEND_TURN_MAX_ATTACHMENTS,
+  PROVIDER_SEND_TURN_MAX_INPUT_CHARS,
   type EnvironmentId,
   type ModelSelection,
   type ProviderInteractionMode,
@@ -16,6 +18,8 @@ import {
 } from "@t3tools/contracts";
 import { safeErrorLogAttributes } from "@t3tools/client-runtime/errors";
 import { isAtomCommandInterrupted } from "@t3tools/client-runtime/state/runtime";
+import { clampFileAttachmentUploadBytes } from "@t3tools/client-runtime/state/attachments";
+import { nextPastedTextFileName, pastedTextDisposition } from "@t3tools/client-runtime/text-paste";
 import {
   parseCodexFeedbackCommand,
   submitCodexFeedback,
@@ -23,16 +27,20 @@ import {
   type CodexFeedbackSubmission,
 } from "@t3tools/client-runtime/state/threads";
 import { deriveActiveWorkStartedAt } from "@t3tools/shared/orchestrationTiming";
+import { upgradeLegacyContextMessage } from "@t3tools/shared/composerContextLegacy";
+import { composerContextSendBlockReason, reidentifyComposerContext } from "../lib/composerContext";
+import { uuidv4 } from "../lib/uuid";
 
 import { makeQueuedMessageMetadata } from "../lib/commandMetadata";
-import { uuidv4 } from "../lib/uuid";
 import { isModelSelectionUnavailable } from "../lib/modelOptions";
 import { resolveProviderInteractionMode } from "../features/threads/legacy-plan-mode";
 import {
   convertPastedImagesToAttachments,
+  createPastedTextComposerAttachment,
   pasteComposerClipboard,
   pickComposerFiles,
   pickComposerMedia,
+  removePersistedComposerAttachmentFile,
 } from "../lib/composerImages";
 import type { DraftComposerImageAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
@@ -44,9 +52,13 @@ import { appAtomRegistry } from "../state/atom-registry";
 import { pendingThreadCreationMessage } from "./pending-thread-creation";
 import {
   appendComposerDraftAttachments,
-  appendComposerDraftText,
+  captureComposerDraftInsertion,
+  countComposerDraftAttachmentsAfterSelection,
+  insertComposerDraftText,
+  insertComposerDraftContext,
   clearComposerDraftContent,
   composerDraftsAtom,
+  composerContextImportsAtom,
   ensureComposerDraftsLoaded,
   getComposerDraftSnapshot,
   mergeComposerDraftContent,
@@ -97,9 +109,16 @@ export function appendReviewCommentToDraft(input: {
       threadId: input.threadId,
     }),
   );
-  const existing = appAtomRegistry.get(composerDraftsAtom)[threadKey]?.text ?? "";
-  const separator = existing.trim().length > 0 && !existing.endsWith("\n") ? "\n\n" : "";
-  setComposerDraftText(threadKey, `${existing}${separator}${input.text}`);
+  const upgraded = upgradeLegacyContextMessage(input.text);
+  if (
+    !insertComposerDraftContext(
+      threadKey,
+      reidentifyComposerContext(upgraded.text, upgraded.records, uuidv4),
+    )
+  ) {
+    Alert.alert("Too many context items", "Remove some context from the draft and try again.");
+    return;
+  }
   if (
     thread &&
     threadAllows(thread, "attachments") &&
@@ -108,7 +127,9 @@ export function appendReviewCommentToDraft(input: {
   ) {
     // Capped: a review comment is new content, not a send-failure restore, so
     // it must not push the draft over the send limit. Overflow is released.
-    const rejectedCount = appendComposerDraftAttachments(threadKey, input.attachments);
+    const rejectedCount = appendComposerDraftAttachments(threadKey, input.attachments, {
+      appendReference: true,
+    });
     if (rejectedCount > 0) {
       setPendingConnectionError(
         `${rejectedCount} comment attachment${rejectedCount === 1 ? " was" : "s were"} not added. Messages can contain at most ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} attachments.`,
@@ -150,6 +171,23 @@ export function useThreadComposerState() {
   const uploadThreadFeedback = useAtomCommand(threadEnvironment.uploadFeedback, {
     reportFailure: false,
   });
+  const pastedTextFileNamesRef = useRef<{ threadKey: string | null; names: Set<string> }>({
+    threadKey: null,
+    names: new Set(),
+  });
+  const reservePastedTextFileName = useCallback(
+    (threadKey: string, existingNames: ReadonlyArray<string>) => {
+      if (pastedTextFileNamesRef.current.threadKey !== threadKey) {
+        pastedTextFileNamesRef.current = { threadKey, names: new Set() };
+      }
+      const names = pastedTextFileNamesRef.current.names;
+      for (const name of existingNames) names.add(name);
+      const nextName = nextPastedTextFileName([...names]);
+      names.add(nextName);
+      return nextName;
+    },
+    [],
+  );
 
   useEffect(() => {
     ensureComposerDraftsLoaded();
@@ -343,6 +381,7 @@ export function useThreadComposerState() {
 
       const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
       const draft = getComposerDraftSnapshot(threadKey);
+      if (appAtomRegistry.get(composerContextImportsAtom)[threadKey]) return null;
       const thread = selectedThreadDetail ?? selectedThreadShell;
       const text = draft.text.trim();
       const attachments = draft.attachments;
@@ -374,6 +413,12 @@ export function useThreadComposerState() {
           "Too many attachments",
           `Remove attachments until there are at most ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS}.`,
         );
+        return null;
+      }
+
+      const contextBlockReason = composerContextSendBlockReason(draft.context);
+      if (contextBlockReason) {
+        Alert.alert("Too much context", contextBlockReason);
         return null;
       }
 
@@ -480,6 +525,7 @@ export function useThreadComposerState() {
         commandId: CommandId.make(metadata.commandId),
         text,
         attachments,
+        context: draft.context,
         modelSelection,
         runtimeMode: draft.runtimeMode ?? thread.runtimeMode,
         interactionMode: resolveProviderInteractionMode(
@@ -503,7 +549,11 @@ export function useThreadComposerState() {
           // append: the merge path slots existing attachments first and truncates
           // at the send limit, which would silently drop this message's images if
           // the user attached new ones while the write was in flight.
-          void mergeComposerDraftContent(threadKey, { text, attachments: [] });
+          void mergeComposerDraftContent(threadKey, {
+            text,
+            context: draft.context,
+            attachments: [],
+          });
           appendComposerDraftAttachments(threadKey, attachments, { allowOverflow: true });
           setPendingConnectionError(
             error instanceof Error ? error.message : "Failed to save the queued message.",
@@ -540,15 +590,19 @@ export function useThreadComposerState() {
     }
 
     const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+    const insertion = captureComposerDraftInsertion(threadKey);
     const capabilities = selectedEnvironmentRuntime?.serverConfig?.environment.capabilities;
     const result = await pickComposerMedia({
-      existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+      existingCount: countComposerDraftAttachmentsAfterSelection(threadKey, insertion),
       maxVideoBytes:
         capabilities?.attachmentUploads === true
           ? capabilities.fileAttachments?.maxUploadBytes
           : undefined,
     });
-    const rejectedCount = appendComposerDraftAttachments(threadKey, result.attachments);
+    const rejectedCount = appendComposerDraftAttachments(threadKey, result.attachments, {
+      appendReference: true,
+      insertion,
+    });
     const problems = [
       ...(result.error ? [result.error] : []),
       ...(rejectedCount > 0
@@ -578,12 +632,16 @@ export function useThreadComposerState() {
     }
 
     const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+    const insertion = captureComposerDraftInsertion(threadKey);
     // pickComposerFiles clamps the advertised limit to the contract maximum.
     const result = await pickComposerFiles({
-      existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+      existingCount: countComposerDraftAttachmentsAfterSelection(threadKey, insertion),
       maxBytes,
     });
-    const rejectedCount = appendComposerDraftAttachments(threadKey, result.files);
+    const rejectedCount = appendComposerDraftAttachments(threadKey, result.files, {
+      appendReference: true,
+      insertion,
+    });
     // The picker error and the live-cap rejection can both happen in one
     // pick; report both in a single alert.
     const problems = [
@@ -608,14 +666,84 @@ export function useThreadComposerState() {
     }
 
     const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+    const insertion = captureComposerDraftInsertion(threadKey);
     const result = await pasteComposerClipboard({
-      existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+      existingCount: countComposerDraftAttachmentsAfterSelection(threadKey, insertion),
     });
     const rejectedPasteCount = allowsAttachments
-      ? appendComposerDraftAttachments(threadKey, result.images)
+      ? appendComposerDraftAttachments(threadKey, result.images, {
+          appendReference: true,
+          insertion,
+        })
       : 0;
     if (result.text) {
-      appendComposerDraftText(threadKey, result.text);
+      const currentDraft = getComposerDraftSnapshot(threadKey);
+      const currentAttachments = currentDraft.attachments;
+      const capabilities = selectedEnvironmentRuntime?.serverConfig?.environment.capabilities;
+      const advertisedMax =
+        capabilities?.attachmentUploads === true
+          ? capabilities.fileAttachments?.maxUploadBytes
+          : undefined;
+      const maxBytes =
+        advertisedMax === undefined ? null : clampFileAttachmentUploadBytes(advertisedMax);
+      const wouldExceedInputLimit =
+        currentDraft.text.length -
+          (currentDraft.text === insertion.text
+            ? Math.max(0, insertion.end - insertion.start)
+            : 0) +
+          result.text.length >
+        PROVIDER_SEND_TURN_MAX_INPUT_CHARS;
+      const shouldFold =
+        pastedTextDisposition({
+          text: result.text,
+          wouldExceedInputLimit,
+          canAttach: true,
+        }) === "attachment";
+      const canAttach =
+        allowsAttachments &&
+        maxBytes !== null &&
+        countComposerDraftAttachmentsAfterSelection(threadKey, insertion) <
+          PROVIDER_SEND_TURN_MAX_ATTACHMENTS &&
+        new TextEncoder().encode(result.text).byteLength <= maxBytes;
+      if (shouldFold && canAttach && maxBytes !== null) {
+        try {
+          const attachment = await createPastedTextComposerAttachment({
+            text: result.text,
+            name: reservePastedTextFileName(
+              threadKey,
+              currentAttachments.map((item) => item.name),
+            ),
+            maxBytes,
+          });
+          // Same reference the pasted images above get: a folded paste is only visible
+          // as its chip until the message is sent.
+          if (
+            appendComposerDraftAttachments(threadKey, [attachment], {
+              appendReference: true,
+              insertion,
+            }) > 0
+          ) {
+            await removePersistedComposerAttachmentFile(attachment.fileUri);
+            setPendingConnectionError(
+              `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
+            );
+          }
+        } catch (error) {
+          setPendingConnectionError(
+            error instanceof Error ? error.message : "Could not attach pasted text.",
+          );
+        }
+      } else if (shouldFold && !wouldExceedInputLimit) {
+        insertComposerDraftText(threadKey, result.text, insertion);
+      } else if (shouldFold) {
+        setPendingConnectionError(
+          wouldExceedInputLimit
+            ? "Pasted text is too large for this message. Remove some text or an attachment, then paste again."
+            : "Could not attach pasted text. Remove an attachment or use a smaller paste, then try again.",
+        );
+      } else {
+        insertComposerDraftText(threadKey, result.text, insertion);
+      }
     }
     if (result.error) {
       setPendingConnectionError(result.error);
@@ -624,7 +752,13 @@ export function useThreadComposerState() {
         `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
       );
     }
-  }, [allowsAttachments, composerDrafts, selectedThreadShell]);
+  }, [
+    allowsAttachments,
+    composerDrafts,
+    reservePastedTextFileName,
+    selectedEnvironmentRuntime?.serverConfig,
+    selectedThreadShell,
+  ]);
 
   const onNativePasteImages = useCallback(
     async (uris: ReadonlyArray<string>) => {
@@ -633,13 +767,14 @@ export function useThreadComposerState() {
       }
 
       const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+      const insertion = captureComposerDraftInsertion(threadKey);
       try {
         const images = await convertPastedImagesToAttachments({
           uris,
-          existingCount: composerDrafts[threadKey]?.attachments.length ?? 0,
+          existingCount: countComposerDraftAttachmentsAfterSelection(threadKey, insertion),
         });
         if (images.length > 0) {
-          appendComposerDraftAttachments(threadKey, images);
+          appendComposerDraftAttachments(threadKey, images, { appendReference: true, insertion });
         }
       } catch (error) {
         console.error("[native paste] error converting images", {
@@ -651,6 +786,56 @@ export function useThreadComposerState() {
       }
     },
     [allowsAttachments, composerDrafts, selectedThreadShell],
+  );
+
+  const onNativePasteText = useCallback(
+    async (paste: ComposerTextPaste) => {
+      if (!selectedThreadShell || !allowsAttachments) return;
+      const capabilities = selectedEnvironmentRuntime?.serverConfig?.environment.capabilities;
+      const advertisedMax =
+        capabilities?.attachmentUploads === true
+          ? capabilities.fileAttachments?.maxUploadBytes
+          : undefined;
+      if (advertisedMax === undefined) return;
+
+      const threadKey = scopedThreadKey(selectedThreadShell.environmentId, selectedThreadShell.id);
+      const insertion = { text: paste.value, ...paste.selection };
+      const currentAttachments = getComposerDraftSnapshot(threadKey).attachments;
+      try {
+        const attachment = await createPastedTextComposerAttachment({
+          text: paste.text,
+          name: reservePastedTextFileName(
+            threadKey,
+            currentAttachments.map((item) => item.name),
+          ),
+          maxBytes: clampFileAttachmentUploadBytes(advertisedMax),
+        });
+        // The chip is how a folded paste stays visible: without it the attachment is in the
+        // draft but nothing in the composer says so until the message is sent. Web folds
+        // through its ordinary attach path, which always writes a reference; match that.
+        const rejectedCount = appendComposerDraftAttachments(threadKey, [attachment], {
+          appendReference: true,
+          insertion,
+        });
+        if (rejectedCount > 0) {
+          await removePersistedComposerAttachmentFile(attachment.fileUri);
+          setPendingConnectionError(
+            `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} files per message.`,
+          );
+        }
+      } catch (error) {
+        setPendingConnectionError(
+          error instanceof Error ? error.message : "Could not attach pasted text.",
+        );
+      }
+    },
+    [
+      allowsAttachments,
+      composerDrafts,
+      reservePastedTextFileName,
+      selectedEnvironmentRuntime?.serverConfig,
+      selectedThreadShell,
+    ],
   );
 
   const onRemoveDraftImage = useCallback(
@@ -767,6 +952,7 @@ export function useThreadComposerState() {
     onPickDraftFiles,
     onPasteIntoDraft,
     onNativePasteImages,
+    onNativePasteText,
     onRemoveDraftImage,
     onDiscardIndeterminateMessages,
     onReviewQueuedExternalResumeMessages,
