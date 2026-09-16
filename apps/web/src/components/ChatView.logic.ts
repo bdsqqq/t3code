@@ -959,9 +959,9 @@ export async function resolveExternalResumeForSend(
 
   const confirmed = await confirm(
     [
-      "Take over this Pi thread?",
-      "T3 will start a new Pi writer for this thread.",
-      "Continue only if this session is not open in another terminal. T3 cannot detect unbridged writers.",
+      "Resume on this host?",
+      "T3 will start a new Pi writer on this environment's host using this transcript copy.",
+      "This session may still be running on another host or in another terminal. T3 cannot detect those writers. Continue only after checking that it is safe to resume here.",
     ].join("\n\n"),
     { variant: "destructive" },
   );

@@ -647,9 +647,22 @@ export const ExternalThreadBacking = Schema.Struct({
   source: Schema.Literal("pi"),
   sourceKey: TrimmedNonEmptyString,
   control: Schema.Literals(["live", "resumable", "readOnly"]),
+  runtimePresence: Schema.optional(Schema.Literals(["connected", "unknown"])),
   capabilities: ExternalThreadCapabilities,
 });
 export type ExternalThreadBacking = typeof ExternalThreadBacking.Type;
+
+/** A catalog location is not evidence of where a session originated or still runs. */
+export function threadEnvironmentAttribution(
+  backing: ExternalThreadBacking | undefined,
+  environmentLabel: string | null,
+): string | null {
+  if (backing === undefined) return environmentLabel;
+  const host = environmentLabel ?? "this host";
+  return backing.runtimePresence === "connected"
+    ? `live on ${host}`
+    : `copy on ${host} · runtime unknown`;
+}
 
 export const ExternalThreadHistoryTruncation = Schema.Struct({
   truncated: Schema.Boolean,

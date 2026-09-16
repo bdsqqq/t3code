@@ -10,6 +10,7 @@ import type {
 } from "@t3tools/client-runtime/state/shell";
 import type { EnvironmentThreadSearchMatch } from "@t3tools/client-runtime/state/thread-search";
 import type { EnvironmentMachineKind } from "@t3tools/contracts";
+import { threadEnvironmentAttribution } from "@t3tools/contracts";
 import { canSnooze, resolveSnoozePresets } from "@t3tools/client-runtime/state/thread-settled";
 import { resolveSettledThreadTimestamp } from "@t3tools/client-runtime/state/thread-sort";
 import type { MenuAction } from "@react-native-menu/menu";
@@ -818,7 +819,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
           >
             {thread.session.lastError}
           </Text>
-        ) : thread.branch || props.environmentLabel ? (
+        ) : thread.branch || props.environmentLabel || thread.backing ? (
           /* "branch · machine" share one truncating line. The machine sits
              last so a tight fit cuts the repetitive label, not the branch —
              and machine-only fills the row for non-git projects. The glyph
@@ -852,8 +853,8 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                   {thread.branch}
                 </Text>
               ) : null}
-              {thread.branch && props.environmentLabel ? "  ·  " : null}
-              {props.environmentLabel ? (
+              {thread.branch && (props.environmentLabel || thread.backing) ? "  ·  " : null}
+              {props.environmentLabel || thread.backing ? (
                 <Text
                   className={cn(
                     "text-xs",
@@ -864,7 +865,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
                       : "text-foreground-tertiary",
                   )}
                 >
-                  {props.environmentLabel}
+                  {threadEnvironmentAttribution(thread.backing, props.environmentLabel)}
                 </Text>
               ) : null}
             </Text>
@@ -1053,6 +1054,21 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             >
               {thread.title}
             </Text>
+            {thread.backing ? (
+              <Text
+                className={cn(
+                  "text-xs",
+                  selected
+                    ? materialYouStyleLayoutActive
+                      ? "text-thread-selected-foreground-muted"
+                      : "text-user-bubble-foreground-muted"
+                    : "text-foreground-tertiary",
+                )}
+                numberOfLines={2}
+              >
+                {threadEnvironmentAttribution(thread.backing, props.environmentLabel)}
+              </Text>
+            ) : null}
             {props.searchMatch ? (
               <ThreadSearchMatchExcerpt
                 match={props.searchMatch}

@@ -85,11 +85,11 @@ import {
 function confirmExternalPiTakeover(): Promise<boolean> {
   return new Promise((resolve) => {
     Alert.alert(
-      "Continue this Pi session?",
-      "T3 starts a new Pi writer for this session. Continue only if this session is not open in another terminal because unbridged writers cannot be detected.",
+      "Resume on this host?",
+      "T3 starts a new Pi writer on this environment's host using this transcript copy. This session may still be running on another host or in another terminal. T3 cannot detect those writers. Continue only after checking that it is safe to resume here.",
       [
         { text: "Cancel", style: "cancel", onPress: () => resolve(false) },
-        { text: "Start new writer", onPress: () => resolve(true) },
+        { text: "Resume on this host", onPress: () => resolve(true) },
       ],
       { cancelable: true, onDismiss: () => resolve(false) },
     );

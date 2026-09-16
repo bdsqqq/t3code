@@ -154,6 +154,7 @@ function backingFor(
     kind: "external",
     source: "pi",
     sourceKey: runtime?.sessionKey ?? "catalog",
+    runtimePresence: controlled ? "connected" : "unknown",
     control:
       runtime === undefined
         ? catalogResumeSupported

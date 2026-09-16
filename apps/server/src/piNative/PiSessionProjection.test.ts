@@ -1,4 +1,10 @@
-import { PiNativeRuntimeId, PiNativeSessionKey, ProjectId, ThreadId } from "@t3tools/contracts";
+import {
+  PiNativeRuntimeId,
+  PiNativeSessionKey,
+  ProjectId,
+  ThreadId,
+  threadEnvironmentAttribution,
+} from "@t3tools/contracts";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
@@ -91,6 +97,30 @@ const entries = [
 ] as const;
 
 describe("PiSessionProjection", () => {
+  it("attributes only connected runtimes as live, never inferring origin from a copy", () => {
+    for (const status of [undefined, "starting", "exited", "idle", "streaming"] as const) {
+      const runtime =
+        status === undefined
+          ? undefined
+          : {
+              runtimeId: PiNativeRuntimeId.make("runtime-attribution"),
+              writerKind: "tuiBridge" as const,
+              status,
+              sequence: 1,
+            };
+      const backing = projectPiBacking(record, runtime, true);
+      const connected = status === "idle" || status === "streaming";
+      expect(backing.runtimePresence).toBe(connected ? "connected" : "unknown");
+      expect(threadEnvironmentAttribution(backing, "mbp")).toBe(
+        connected ? "live on mbp" : "copy on mbp · runtime unknown",
+      );
+    }
+    const { runtimePresence: _, ...legacyBacking } = projectPiBacking(record, undefined, true);
+    expect(threadEnvironmentAttribution(legacyBacking, "mbp")).toBe(
+      "copy on mbp · runtime unknown",
+    );
+    expect(threadEnvironmentAttribution(undefined, "mbp")).toBe("mbp");
+  });
   const recap = {
     type: "custom",
     id: "recap-1",

@@ -1,4 +1,5 @@
 import { requestCustomSnooze } from "./CustomSnoozeDialog";
+import { threadEnvironmentAttribution } from "@t3tools/contracts";
 import { useSupportsMultiplePullRequests } from "~/hooks/useSupportsMultiplePullRequests";
 import { resolveThreadCurrentPullRequestLink } from "@t3tools/shared/threadPullRequests";
 import { useAtomValue } from "@effect/atom-react";
@@ -341,6 +342,7 @@ function SidebarThreadTooltip({
   terminalStatus: TerminalStatusIndicator | null;
   terminalProcessCount: number;
 }) {
+  const attribution = threadEnvironmentAttribution(thread.backing, environmentLabel);
   const driverKind = providerEntry?.driverKind ?? null;
   const supportsMultiplePullRequests = useSupportsMultiplePullRequests(thread.environmentId);
   return (
@@ -362,13 +364,13 @@ function SidebarThreadTooltip({
               <div className="min-w-0 truncate text-foreground/75">{projectDisplayName}</div>
             </div>
           ) : null}
-          {environmentLabel ? (
+          {attribution ? (
             <div className="flex min-w-0 items-center gap-2">
               <EnvironmentMachineIcon
                 kind={environmentMachine}
                 className="size-3 shrink-0 stroke-muted-foreground"
               />
-              <div className="min-w-0 truncate text-foreground/75">{environmentLabel}</div>
+              <div className="min-w-0 truncate text-foreground/75">{attribution}</div>
             </div>
           ) : null}
           {thread.branch ? (

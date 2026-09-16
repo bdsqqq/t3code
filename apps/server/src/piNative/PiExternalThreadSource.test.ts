@@ -86,7 +86,7 @@ const takeoverTurn = (externalResume?: "takeover", streamingBehavior?: "steer" |
   }) satisfies Extract<ClientOrchestrationCommand, { readonly type: "thread.turn.start" }>;
 
 describe("PiExternalThreadSource hardening", () => {
-  for (const mode of ["takeover", "send", "steer", "followUp"] as const) {
+  for (const mode of ["unconfirmed", "takeover", "send", "steer", "followUp"] as const) {
     it.effect(
       `projects structured context for native ${mode} without changing admission identity`,
       () =>
@@ -106,7 +106,8 @@ describe("PiExternalThreadSource hardening", () => {
               read: () => Effect.succeed({ record: takeoverRecord, entries: [] }),
             }),
             Layer.mock(SupervisorClient)({
-              list: () => Effect.succeed(mode === "takeover" ? [] : [runtime]),
+              list: () =>
+                Effect.succeed(mode === "takeover" || mode === "unconfirmed" ? [] : [runtime]),
               probeCapabilities: () => Effect.succeed({ guardedResume: GUARDED_RESUME_CAPABILITY }),
               subscribe: () => Stream.empty,
               dispatch: (command) => {
@@ -159,10 +160,21 @@ describe("PiExternalThreadSource hardening", () => {
           } satisfies ClientOrchestrationCommand;
           yield* Effect.gen(function* () {
             const source = yield* PiExternalThreadSource;
+            if (mode === "unconfirmed") {
+              expect(yield* source.dispatch(command).pipe(Effect.flip)).toMatchObject({
+                code: "read_only",
+                message: expect.stringContaining("another host"),
+              });
+              return;
+            }
             yield* source.dispatch(command);
           }).pipe(
             Effect.provide(PiExternalThreadSource.layerTest.pipe(Layer.provide(dependencies))),
           );
+          if (mode === "unconfirmed") {
+            expect(commands).toEqual([]);
+            return;
+          }
           expect(commands).toHaveLength(1);
           expect(commands[0]).toMatchObject({
             type: mode === "takeover" ? "resumeAndSend" : mode,

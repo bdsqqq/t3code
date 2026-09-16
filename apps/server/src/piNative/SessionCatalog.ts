@@ -96,6 +96,12 @@ function textFrom(value: unknown): string | undefined {
     }
 }
 
+const isSyncArtifact = (name: string) =>
+  name === ".stversions" || name === ".stfolder" || name.includes(".sync-conflict-");
+
+const isSyncArtifactPath = (root: string, file: string) =>
+  NodePath.relative(root, file).split(NodePath.sep).some(isSyncArtifact);
+
 async function walk(root: string): Promise<{
   readonly files: ReadonlyArray<string>;
   readonly omittedCount: number;
@@ -144,6 +150,7 @@ async function walk(root: string): Promise<{
     }
     entries.sort((left, right) => left.name.localeCompare(right.name));
     for (const entry of entries) {
+      if (isSyncArtifact(entry.name)) continue;
       const candidate = NodePath.join(directory, entry.name);
       if (entry.isSymbolicLink()) continue;
       if (entry.isDirectory()) await visit(candidate);
@@ -525,6 +532,7 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
       const accepted = await (async () => {
         const canonical = await NodeFS.promises.realpath(priorityFile);
         if (!canonical.startsWith(`${root}${NodePath.sep}`)) return undefined;
+        if (isSyncArtifactPath(root, canonical)) return undefined;
         const stat = await NodeFS.promises.stat(canonical);
         return stat.isFile() ? canonical : undefined;
       })().catch(() => undefined);
@@ -546,6 +554,7 @@ export function makeSessionCatalog(options: SessionCatalogOptions = {}): Session
           (async () => {
             const canonical = await NodeFS.promises.realpath(candidate);
             if (!canonical.startsWith(`${root}${NodePath.sep}`)) return undefined;
+            if (isSyncArtifactPath(root, canonical)) return undefined;
             const stat = await NodeFS.promises.stat(canonical);
             return stat.isFile() ? { canonical, stat } : undefined;
           })().catch(() => undefined),

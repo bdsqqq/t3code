@@ -1,6 +1,7 @@
 import { useLoadBalancedEnvironment } from "../hooks/useLoadBalancedEnvironment";
 import { visibleThreadPullRequests } from "@t3tools/shared/threadPullRequests";
 import type { UsageLimitSourceSnapshots } from "@t3tools/contracts";
+import { threadEnvironmentAttribution } from "@t3tools/contracts";
 import {
   collectProviderUsageLimits,
   hasProviderUsageLimits,
@@ -9576,6 +9577,17 @@ export default function ChatView(props: ChatViewProps) {
             onDeleteProjectScript={deleteProjectScript}
           />
         </WorkspacePageHeader>
+
+        {activeThreadMetadata?.backing ? (
+          <div className="border-b px-4 py-1 text-xs text-muted-foreground">
+            {threadEnvironmentAttribution(
+              activeThreadMetadata.backing,
+              environmentById.get(activeThread.environmentId)?.label ??
+                serverConfig?.environment.label ??
+                null,
+            )}
+          </div>
+        ) : null}
 
         {/* Main content area with optional plan sidebar */}
         <div className="flex min-h-0 min-w-0 flex-1">

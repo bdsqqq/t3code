@@ -11,6 +11,7 @@ import {
   DEFAULT_SERVER_SETTINGS,
   EnvironmentId,
   ThreadId,
+  threadEnvironmentAttribution,
   type ProjectScript,
 } from "@t3tools/contracts";
 import {
@@ -358,7 +359,10 @@ function ThreadRouteContent(
   const usesNativeHeaderGlass = NATIVE_LIQUID_GLASS_SUPPORTED;
   const headerSubtitle = [
     selectedThreadProject?.title ?? null,
-    selectedEnvironmentConnection?.environmentLabel ?? null,
+    threadEnvironmentAttribution(
+      selectedThread?.backing,
+      selectedEnvironmentConnection?.environmentLabel ?? null,
+    ),
   ]
     .filter(Boolean)
     .join(" · ");

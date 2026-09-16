@@ -1263,7 +1263,7 @@ export class PiExternalThreadSource extends Context.Service<
           if (plan.type === "takeoverConfirmationRequired") {
             return yield* sourceError(
               "read_only",
-              "Resuming this native Pi session requires takeover confirmation.",
+              "Resume on this host requires explicit confirmation: this transcript may still be running on another host or in another terminal.",
             );
           }
           if (plan.type === "takeover") {

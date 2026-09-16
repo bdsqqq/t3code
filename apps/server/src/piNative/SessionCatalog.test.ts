@@ -16,6 +16,54 @@ const digest = async (file: string) =>
     .update(await NodeFS.promises.readFile(file))
     .digest("hex");
 describe("SessionCatalog", () => {
+  it.effect(
+    "excludes sync artifacts recursively and from priority files without touching copies",
+    () =>
+      Effect.acquireUseRelease(
+        Effect.tryPromise(() =>
+          NodeFS.promises.mkdtemp(NodePath.join(NodeOS.tmpdir(), "t3-pi-sync-")),
+        ),
+        (root) =>
+          Effect.gen(function* () {
+            const accepted = ["nested/session.jsonl", "backups/session.jsonl"];
+            const excluded = [
+              ".stversions/session.jsonl",
+              "nested/.stversions/session.jsonl",
+              "nested/.stfolder/session.jsonl",
+              "nested/session.sync-conflict-20260915-host.jsonl",
+              "nested/dir.sync-conflict-20260915-host/session.jsonl",
+            ];
+            const files = [...accepted, ...excluded].map((file) => NodePath.join(root, file));
+            const content =
+              JSON.stringify({ type: "session", id: "same-session", cwd: root }) + "\n";
+            yield* Effect.tryPromise(async () => {
+              for (const file of files) {
+                await NodeFS.promises.mkdir(NodePath.dirname(file), { recursive: true });
+                await NodeFS.promises.writeFile(file, content);
+              }
+            });
+            const catalog = makeSessionCatalog({ root });
+            const initial = yield* catalog.list();
+            const prioritized = yield* catalog.list(files);
+            expect(initial).toHaveLength(2);
+            expect(new Set(initial.map((row) => row.threadId)).size).toBe(2);
+            expect(prioritized.map((row) => row.threadId)).toEqual(
+              initial.map((row) => row.threadId),
+            );
+            expect(
+              initial
+                .map((row) => NodePath.relative(NodeFS.realpathSync(root), row.canonicalFile))
+                .sort(),
+            ).toEqual(accepted.toSorted());
+            expect(yield* catalog.omittedCount()).toBe(0);
+            yield* Effect.tryPromise(async () => {
+              for (const file of files)
+                expect(await NodeFS.promises.readFile(file, "utf8")).toBe(content);
+            });
+          }),
+        (root) => Effect.promise(() => NodeFS.promises.rm(root, { recursive: true, force: true })),
+      ),
+  );
   it("mirrors Pi's session directory precedence", () => {
     const base = {
       homeDir: "/home/test",
