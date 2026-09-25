@@ -668,6 +668,8 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
         iconSize: 120,
         iconTextSize: 12,
       });
+      // A Linux AppImage build also emits the .deb from the same run.
+      assert.deepStrictEqual((linux.linux as Record<string, unknown>).target, ["AppImage", "deb"]);
       // Linux must register the renderer schemes so the generated .desktop
       // entry advertises MimeType=x-scheme-handler/t3code; for OAuth deep links.
       assert.deepStrictEqual((linux.linux as Record<string, unknown>).protocols, [
@@ -733,7 +735,6 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
           "@ff-labs/fff-node": "0.9.4",
           "@opencode-ai/sdk": "^1.3.15",
           "@pierre/diffs": "1.3.0",
-          "msgpackr-extract": "3.0.4",
           "node-pty": "1.1.0",
         },
         desktopDependencies: {
@@ -745,7 +746,6 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
       }),
       {
         "@ff-labs/fff-node": "0.9.4",
-        "msgpackr-extract": "3.0.4",
         "node-pty": "1.1.0",
         "@napi-rs/keyring": "1.3.0",
         "playwright-core": "1.60.0",

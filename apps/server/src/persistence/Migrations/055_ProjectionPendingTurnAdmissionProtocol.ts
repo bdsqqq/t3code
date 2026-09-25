@@ -1,12 +1,24 @@
 import * as Effect from "effect/Effect";
 import * as SqlClient from "effect/unstable/sql/SqlClient";
 
+import PendingTurnIntent from "./053_ProjectionPendingTurnIntent.ts";
+import PendingTurnOperationId from "./054_ProjectionPendingTurnOperationId.ts";
+
 // Follows the fork/upstream migration-id compatibility bridge in migration 52.
 export default Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const columns = yield* sql<{ readonly name: string }>`
     PRAGMA table_info(projection_turns)
   `;
+
+  // Upstream databases at ids 53–54 have different schemas. Repair the skipped
+  // fork prerequisites before migration 56 reads them; applied fork ids stay intact.
+  if (!columns.some((column) => column.name === "pending_model_selection_json")) {
+    yield* PendingTurnIntent;
+  }
+  if (!columns.some((column) => column.name === "pending_operation_id")) {
+    yield* PendingTurnOperationId;
+  }
 
   if (!columns.some((column) => column.name === "pending_admission_protocol")) {
     yield* sql`

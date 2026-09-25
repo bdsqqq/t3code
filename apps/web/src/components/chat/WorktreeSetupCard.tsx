@@ -19,6 +19,7 @@ import { useEffect, useState, type ReactNode } from "react";
 
 import { Button } from "~/components/ui/button";
 import { Spinner } from "~/components/ui/spinner";
+import { MiddleTruncate } from "../ui/middle-truncate";
 import { observeVisibleAnimation } from "~/lib/visibleAnimation";
 import { cn } from "~/lib/utils";
 
@@ -55,12 +56,12 @@ function useNowWhile(active: boolean): number {
 }
 
 function StageIcon({ status }: { status: WorktreeSetupStage["status"] }) {
-  const className = "size-4 shrink-0 stroke-[1.8]";
+  const className = "size-4 shrink-0 stroke-2";
   switch (status) {
     case "done":
       return <CheckIcon aria-hidden className={className} />;
     case "running":
-      return <Spinner className={className} />;
+      return <Spinner size="md" className="shrink-0" />;
     case "failed":
       return <XIcon aria-hidden className={className} />;
     case "warning":
@@ -222,18 +223,34 @@ function StageRow({
   );
 }
 
+/** The server keeps this many trailing lines; the box is sized for exactly that. */
+const OUTPUT_TAIL_LINES = 4;
+const OUTPUT_TAIL_SLOTS = Array.from({ length: OUTPUT_TAIL_LINES }, (_, slot) => slot);
+
+/**
+ * Fixed-height window onto the script's last lines. Rows never wrap and the
+ * box never grows or shrinks, so streaming output cannot push the timeline
+ * around while the script runs.
+ */
 function OutputTail({ lines, failed }: { lines: ReadonlyArray<string>; failed: boolean }) {
-  if (lines.length === 0) return null;
+  const rows = OUTPUT_TAIL_SLOTS.map((slot) => ({
+    slot,
+    line: lines[lines.length - OUTPUT_TAIL_LINES + slot] ?? "",
+  }));
   return (
     <pre
       className={cn(
-        "mb-1 ml-8 rounded-md border px-2.5 py-1.5 font-mono text-[11px] leading-relaxed whitespace-pre-wrap break-all select-text",
+        "mb-1 ml-8 overflow-hidden rounded-md border px-2.5 py-1.5 font-mono text-2xs leading-relaxed select-text",
         failed
           ? "border-destructive/20 bg-error-surface text-destructive-foreground"
           : "border-border bg-code text-muted-foreground",
       )}
     >
-      {lines.join("\n")}
+      {rows.map(({ slot, line }) => (
+        <div key={slot} className="truncate whitespace-pre">
+          {line.length === 0 ? "\u00a0" : line}
+        </div>
+      ))}
     </pre>
   );
 }
@@ -244,19 +261,25 @@ function SetupDetails({ snapshot }: { snapshot: WorktreeSetupSnapshot }) {
       {snapshot.branch ? (
         <>
           <dt className="text-foreground/80">Branch</dt>
-          <dd className="truncate font-mono">{snapshot.branch}</dd>
+          <dd className="min-w-0 font-mono">
+            <MiddleTruncate value={snapshot.branch} className="flex" />
+          </dd>
         </>
       ) : null}
       {snapshot.baseRef ? (
         <>
           <dt className="text-foreground/80">Base</dt>
-          <dd className="truncate font-mono">{snapshot.baseRef}</dd>
+          <dd className="min-w-0 font-mono">
+            <MiddleTruncate value={snapshot.baseRef} className="flex" />
+          </dd>
         </>
       ) : null}
       {snapshot.worktreePath ? (
         <>
           <dt className="text-foreground/80">Path</dt>
-          <dd className="truncate font-mono">{snapshot.worktreePath}</dd>
+          <dd className="min-w-0 font-mono">
+            <MiddleTruncate value={snapshot.worktreePath} className="flex" />
+          </dd>
         </>
       ) : null}
       {snapshot.setupScript ? (
@@ -269,6 +292,47 @@ function SetupDetails({ snapshot }: { snapshot: WorktreeSetupSnapshot }) {
   );
 }
 
+/**
+ * One-line summary of a settled setup under a live turn. A clean finish is
+ * removed from the timeline altogether, so this only renders the outcomes
+ * worth keeping: a failed script, a failed setup, or a cancelled one.
+ */
+function CollapsedSummaryRow({
+  snapshot,
+  totalElapsed,
+}: {
+  snapshot: WorktreeSetupSnapshot;
+  totalElapsed: number | null;
+}) {
+  const status: WorktreeSetupStage["status"] =
+    snapshot.phase === "failed" || snapshot.phase === "cancelled"
+      ? "failed"
+      : snapshot.stages.some((stage) => stage.id === "setup-script" && stage.status === "failed")
+        ? "failed"
+        : "done";
+  const label = headerLabel(snapshot);
+  return (
+    <div
+      className={cn(
+        "flex min-h-6 min-w-0 items-center gap-1.5 rounded-md px-0.5 py-0.5 text-sm leading-relaxed",
+        stageRowClassName(status),
+      )}
+      data-worktree-setup-stage="summary"
+      data-worktree-setup-status={status}
+    >
+      <span className="flex size-6 shrink-0 items-center justify-center text-icon-muted">
+        <StageIcon status={status} />
+      </span>
+      <span className="min-w-0 flex-1 truncate">{label}</span>
+      {totalElapsed !== null ? (
+        <span className="shrink-0 text-xs text-muted-foreground tabular-nums">
+          {formatDuration(totalElapsed)}
+        </span>
+      ) : null}
+    </div>
+  );
+}
+
 export function WorktreeSetupCard({
   snapshot,
   onCancel,
@@ -277,8 +341,9 @@ export function WorktreeSetupCard({
   embedded = false,
 }: WorktreeSetupCardProps & {
   /**
-   * The agent already started (async setup script), so the turn owns the
-   * "Working for" header and only the script's row sits among the worklog.
+   * The agent's turn is live and owns the "Working for" header. The stage
+   * list stays exactly where it was so the handoff never moves anything; a
+   * failed script that outlives the handoff collapses to a single row.
    */
   embedded?: boolean;
 }) {
@@ -292,24 +357,40 @@ export function WorktreeSetupCard({
   })();
   const setupStage = snapshot.stages.find((stage) => stage.id === "setup-script");
   const showTerminal = onOpenTerminal && setupStage && setupStage.status !== "pending";
-  const stages = embedded
-    ? snapshot.stages.filter((stage) => stage.id === "setup-script")
-    : snapshot.stages;
+  const collapsed = embedded && !running;
+  // While running, the timeline's working row above the card carries the
+  // "Setting up worktree…" label (and keeps that slot when the agent takes
+  // over). The card only brings its own header for a settled outcome that
+  // has no working row to sit under.
+  const showHeader = !embedded && !running;
+  // The tail box is part of the script row's footprint while the script runs
+  // (and after it failed, so the last lines explain the failure). It mounts
+  // as soon as the script is running, empty lines and all, so the card takes
+  // its final height once instead of growing with each output line.
+  const showTail =
+    setupStage !== undefined && (setupStage.status === "running" || setupStage.status === "failed");
 
   return (
     <section aria-label="Worktree setup" data-worktree-setup-phase={snapshot.phase}>
-      {embedded ? null : <SetupHeaderRow snapshot={snapshot} totalElapsed={totalElapsed} />}
-      <div className={embedded ? undefined : "pt-1.5"}>
-        {stages.map((stage) => (
-          <div key={stage.id}>
-            <StageRow stage={stage} nowMs={nowMs} scriptName={snapshot.setupScript?.name ?? null} />
-            {stage.id === "setup-script" &&
-            (stage.status === "running" || stage.status === "failed") ? (
-              <OutputTail lines={stage.tail} failed={stage.status === "failed"} />
-            ) : null}
-          </div>
-        ))}
-      </div>
+      {showHeader ? <SetupHeaderRow snapshot={snapshot} totalElapsed={totalElapsed} /> : null}
+      {collapsed ? (
+        <CollapsedSummaryRow snapshot={snapshot} totalElapsed={totalElapsed} />
+      ) : (
+        <div className={showHeader ? "pt-1.5" : undefined}>
+          {snapshot.stages.map((stage) => (
+            <div key={stage.id}>
+              <StageRow
+                stage={stage}
+                nowMs={nowMs}
+                scriptName={snapshot.setupScript?.name ?? null}
+              />
+              {stage.id === "setup-script" && showTail ? (
+                <OutputTail lines={stage.tail} failed={stage.status === "failed"} />
+              ) : null}
+            </div>
+          ))}
+        </div>
+      )}
 
       {snapshot.phase === "failed" && snapshot.error ? (
         <p className="mt-1 ml-8 text-xs text-muted-foreground">{snapshot.error}</p>

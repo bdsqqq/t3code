@@ -96,6 +96,7 @@ export const orchestrationHttpApiLayer = HttpApiBuilder.group(
                     ? { beforeCursor: args.payload.beforeCursor }
                     : {}),
                 },
+            args.payload.reasoningMessages === "true",
           ).pipe(
             Effect.catch((cause) =>
               failEnvironmentInternal("orchestration_thread_snapshot_failed", cause),

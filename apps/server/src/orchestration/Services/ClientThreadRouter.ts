@@ -37,13 +37,14 @@ export function getClientThreadDetailSnapshot(
   external: ExternalSource,
   internal: ProjectionSnapshotQuery["Service"],
   window?: OrchestrationThreadDetailWindow,
+  reasoningMessages = false,
 ): Effect.Effect<Option.Option<OrchestrationThreadDetailSnapshot>, OrchestrationGetSnapshotError> {
   if (isPiExternalThreadId(threadId)) {
     return Option.match(external, {
       onNone: () => Effect.fail(missingExternalSource()),
       onSome: (source) =>
         source.threadSnapshot(threadId).pipe(
-          Effect.map(projectThreadDetailSnapshot),
+          Effect.map((snapshot) => projectThreadDetailSnapshot(snapshot, reasoningMessages)),
           Effect.map(Option.some),
           Effect.mapError(
             (cause) =>
@@ -57,7 +58,7 @@ export function getClientThreadDetailSnapshot(
     });
   }
   return internal.getThreadDetailSnapshot(threadId, window).pipe(
-    Effect.map(Option.map(projectThreadDetailSnapshot)),
+    Effect.map(Option.map((snapshot) => projectThreadDetailSnapshot(snapshot, reasoningMessages))),
     Effect.mapError(
       (cause) =>
         new OrchestrationGetSnapshotError({
@@ -81,13 +82,16 @@ export function getExternalThreadSubscription(
           if (item.kind === "snapshot") {
             return {
               ...item,
-              snapshot: projectThreadDetailSnapshot(item.snapshot),
+              snapshot: projectThreadDetailSnapshot(
+                item.snapshot,
+                input.reasoningMessages === true,
+              ),
             };
           }
           if (item.kind === "event") {
             return {
               ...item,
-              event: projectActivityEvent(item.event),
+              event: projectActivityEvent(item.event, input.reasoningMessages === true),
             };
           }
           return item;

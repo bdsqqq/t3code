@@ -31,6 +31,7 @@ const snapshot = {
     id: externalThreadId,
     projectId: ProjectId.make("project-1"),
     activities: [],
+    messages: [{ id: "reasoning-1", role: "reasoning", text: "thinking" }],
   },
 } as unknown as OrchestrationThreadDetailSnapshot;
 
@@ -136,6 +137,54 @@ describe("ClientThreadRouter", () => {
       ]);
     }),
   );
+
+  for (const reasoningMessages of [false, true]) {
+    it.effect(`negotiates external reasoning messages (${reasoningMessages})`, () =>
+      Effect.gen(function* () {
+        const internal = {} as ProjectionSnapshotQuery["Service"];
+        const detail = yield* getClientThreadDetailSnapshot(
+          externalThreadId,
+          Option.some(externalSource),
+          internal,
+          undefined,
+          reasoningMessages,
+        );
+        const expectedRole = reasoningMessages ? "reasoning" : "system";
+        expect(Option.getOrThrow(detail).thread.messages[0]).toMatchObject({
+          id: "reasoning-1",
+          role: expectedRole,
+        });
+        const event = {
+          sequence: 5,
+          type: "thread.message-sent",
+          payload: { threadId: externalThreadId, messageId: "reasoning-1", role: "reasoning" },
+        } as unknown as OrchestrationEvent;
+        const source = {
+          ...externalSource,
+          subscribeThread: () =>
+            Stream.make({ kind: "snapshot" as const, snapshot }, { kind: "event" as const, event }),
+        } as PiExternalThreadSource["Service"];
+        const subscription = getExternalThreadSubscription(
+          { threadId: externalThreadId, reasoningMessages },
+          Option.some(source),
+        );
+        expect(yield* Stream.runCollect(subscription!)).toMatchObject([
+          {
+            kind: "snapshot",
+            snapshot: {
+              snapshotSequence: 4,
+              thread: { messages: [{ id: "reasoning-1", role: expectedRole }] },
+            },
+          },
+          {
+            kind: "event",
+            event: { sequence: 5, payload: { messageId: "reasoning-1", role: expectedRole } },
+          },
+        ]);
+        expect(snapshot.thread.messages[0]?.role).toBe("reasoning");
+      }),
+    );
+  }
 
   it.effect("starts draining an external source before the client pulls", () =>
     Effect.scoped(

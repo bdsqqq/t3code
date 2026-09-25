@@ -29,7 +29,7 @@ import * as Schema from "effect/Schema";
 import { DraftComposerAttachmentSchema } from "../lib/composer-image-schema";
 import type { DraftComposerAttachment } from "../lib/composerImages";
 import { scopedThreadKey } from "../lib/scopedEntities";
-import { resolveProviderInteractionMode } from "../features/threads/legacy-plan-mode";
+import { resolveProviderInteractionMode } from "./legacy-plan-mode";
 
 const THREAD_OUTBOX_SCHEMA_VERSION = 8;
 const THREAD_OUTBOX_MAX_RETRY_DELAY_MS = 16_000;

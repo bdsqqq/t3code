@@ -6,6 +6,7 @@
  *
  * @module TerminalManager
  */
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   DEFAULT_TERMINAL_ID,
   TerminalCwdError,
@@ -1933,16 +1934,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     terminalId: string,
   ): Effect.fn.Return<TerminalSessionState, TerminalSessionLookupError> {
     return yield* Effect.flatMap(getSession(threadId, terminalId), (session) =>
-      Option.match(session, {
-        onNone: () =>
-          Effect.fail(
-            new TerminalSessionLookupError({
-              threadId,
-              terminalId,
-            }),
-          ),
-        onSome: Effect.succeed,
-      }),
+      Effect.fromOption(session, () => new TerminalSessionLookupError({ threadId, terminalId })),
     );
   });
 
@@ -2366,7 +2358,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }
 
     const inspectorOption = yield* acquireSubprocessInspector.pipe(
-      Effect.map(Option.some),
+      Effect.asSome,
       Effect.catch((reason) =>
         Effect.logWarning("failed to snapshot processes for terminal subprocess polling", {
           reason,
@@ -2392,7 +2384,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     ) {
       const terminalPid = session.pid;
       const inspectResult = yield* subprocessInspector(terminalPid).pipe(
-        Effect.map(Option.some),
+        Effect.asSome,
         Effect.catch((reason) =>
           Effect.logWarning("failed to check terminal subprocess activity", {
             threadId: session.threadId,
@@ -2516,7 +2508,9 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     }).pipe(Effect.ignoreCause({ log: true })),
   );
 
-  const openLocked = Effect.fn("terminal.openLocked")(function* (input: TerminalOpenInput) {
+  const openWithWorkspaceLease = Effect.fn("terminal.openLocked")(function* (
+    input: TerminalOpenInput,
+  ) {
     const terminalId = input.terminalId;
     yield* assertValidCwd(input.cwd);
 
@@ -2638,6 +2632,12 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
 
     return snapshot(liveSession);
   });
+
+  const openLocked = (input: TerminalOpenInput) =>
+    withWorkspaceLease(
+      path.resolve(input.worktreePath ?? input.cwd),
+      openWithWorkspaceLease(input),
+    );
 
   const open: TerminalManager["Service"]["open"] = (input) =>
     withThreadLock(
@@ -3010,7 +3010,14 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
   const restart: TerminalManager["Service"]["restart"] = (input) =>
     withThreadLock(
       input.threadId,
-      resolveLaunchInputEnvironment(input).pipe(Effect.flatMap(restartResolved)),
+      resolveLaunchInputEnvironment(input).pipe(
+        Effect.flatMap((resolved) =>
+          withWorkspaceLease(
+            path.resolve(resolved.worktreePath ?? resolved.cwd),
+            restartResolved(resolved),
+          ),
+        ),
+      ),
     );
 
   const close: TerminalManager["Service"]["close"] = (input) =>

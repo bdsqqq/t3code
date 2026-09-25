@@ -8,11 +8,13 @@ This document covers the unified release workflow for stable and nightly desktop
 
 - Workflow: `.github/workflows/release.yml`
 - Triggers:
-  - manual `workflow_dispatch` with `channel=stable`, the normal way to ship stable
+  - manual `workflow_dispatch` with `channel=stable`, the normal way to ship stable. Stable
+    and nightly dispatches must select `main`; preview may select any branch. The channel defaults
+    to preview so an omitted selection cannot publish a stable release.
   - push tag matching `v*.*.*` for a stable release of an explicit commit
   - scheduled nightly check every 30 minutes
   - manual `workflow_dispatch` with `channel=nightly`
-  - manual `workflow_dispatch` with `channel=preview`, the maintainers' test train. It exercises the whole release flow (build, sign, notarize, smoke, publish) for a commit that end users must never receive, which is how an unmerged branch or a risky change gets a real release run before it lands. It builds the triggering commit with nightly's versioning under the `preview` prerelease identifier (`0.0.41-preview.<date>.<run>`) and publishes a GitHub prerelease plus the npm packages under the `preview` dist-tag. Nothing ever selects preview on its own: it is not on the schedule, no default npm dist-tag points at it, its desktop builds carry no update feed, and no updater manifest (`latest*.yml`, `nightly*.yml`, blockmaps) is attached, so a stable or nightly install cannot be offered one. The only ways onto it are downloading the release by hand, `npx t3@preview`, `T3CODE_CHANNEL=preview` for the install scripts, or `t3 update --channel preview` from a terminal; each prints a warning, and the CLI asks for confirmation when the running build is not itself a preview. The release itself is named as a maintainer test build and its body is a warning rather than generated notes: a changelog of unmerged branch history is not a changelog, and nightly and stable notes are unaffected because each series resolves its previous tag within its own channel. The hosted web app, AUR, and Discord announcements are skipped. Keep it; it costs nothing when idle.
+  - manual `workflow_dispatch` with `channel=preview`, the maintainers' test train. It exercises the whole release flow (build, sign, notarize, smoke, publish) for a commit that end users must never receive, which is how an unmerged branch or a risky change gets a real release run before it lands. It builds the triggering commit with nightly's versioning under the `preview` prerelease identifier (`0.0.41-preview.<date>.<run>`) and publishes a GitHub prerelease plus the npm packages under the `preview` dist-tag. Preview is not on the schedule, no default npm dist-tag points at it, its desktop builds carry no update feed, and no updater manifest (`latest*.yml`, `nightly*.yml`, blockmaps) is attached, so a stable or nightly install cannot be offered one. The only ways onto it are downloading the release by hand, `npx t3@preview`, `T3CODE_CHANNEL=preview` for the install scripts, or `t3 update --channel preview` from a terminal; each prints a warning, and the CLI asks for confirmation when the running build is not itself a preview. The release itself is named as a maintainer test build and its body is a warning rather than generated notes: a changelog of unmerged branch history is not a changelog, and nightly and stable notes are unaffected because each series resolves its previous tag within its own channel. The hosted web app, AUR, and Discord announcements are skipped. Keep it; it costs nothing when idle.
 - A manual stable release builds the commit of the latest published nightly, not `main` HEAD.
   Nightly is the release candidate: verify the nightly, then promote it. Merges to `main` keep
   landing while you verify and never leak into the stable build.
@@ -27,7 +29,7 @@ This document covers the unified release workflow for stable and nightly desktop
 - Builds six desktop artifacts in parallel for both channels, each as its own job (`desktop_<platform>_<arch>`, one call of `release-desktop.yml`) on hardware of its own architecture, gated only on the bundle (the Windows jobs also wait for the same-arch Linux job, whose CLI archive they embed as the WSL runtime):
   - macOS `arm64` DMG
   - macOS `x64` DMG
-  - Linux `x64` and `arm64` AppImage
+  - Linux `x64` and `arm64` AppImage and `.deb`, from one electron-builder run. The `.deb` updates in the app through electron-updater, which installs it with `dpkg`.
   - Windows `x64` and `arm64` NSIS installer
 - Publishes one GitHub Release with all produced files.
   - Stable tags with a suffix after `X.Y.Z` (for example `1.2.3-alpha.1`) are published as GitHub prereleases.
@@ -130,11 +132,18 @@ Required `production` environment variables:
 Optional `production` environment variables:
 
 - `RELAY_DOMAIN` when overriding the derived `relay.<RELAY_API_ZONE_NAME>` domain
+- `RELAY_TUNNEL_CLEANUP_MODE` with `off`, `dry-run`, or `enabled`. Missing and blank values use
+  `off`.
 
 Required `production` environment secrets:
 
 - `CLERK_SECRET_KEY`
 - `APNS_PRIVATE_KEY`
+
+The relay Worker reads these variables and secrets when it is deployed. Alchemy does not redeploy the
+Worker when only one of these values changes ([alchemy-run/alchemy#1831](https://github.com/alchemy-run/alchemy/issues/1831)),
+so a push to `main` without relay code changes leaves the old value in place. After changing one, run
+the **Deploy T3 Connect relay** workflow manually from `main` with **force** checked.
 
 The account-scoped repository credentials are consumed by Alchemy while provisioning relay stages; they
 are not bound into the relay Worker. The production deployment uses an Axiom personal access token,
@@ -148,6 +157,57 @@ Developers deploy personal stages locally rather than through pull-request autom
 ```sh
 vp run --filter t3code-relay deploy -- --stage "$USER" --env-file .env.local
 ```
+
+### Managed tunnel cleanup rollout
+
+Keep `RELAY_TUNNEL_CLEANUP_MODE=off` for the first production deploy. That deploy applies the
+nullable allocation migration and adds the recovery endpoints. Web and mobile clients need no
+coordinated release. CLI and desktop server builds must reach users before cleanup is enabled,
+because those builds register recovery and replace a deleted tunnel after wake.
+
+1. Deploy the relay and migration with cleanup `off`.
+2. Release the server build and confirm current hosts register recovery. Older hosts stay marked
+   legacy and are never candidates.
+3. Set `dry-run`, run a forced relay deploy, and read the sweep counters (`scanned`, `wouldDelete`,
+   `skippedLegacy`, `skippedOrphan`, `failed`, `truncated`) across several sweeps. Each sweep records
+   them, and the active `mode`, as `relay.managed_endpoint_reaper.*` attributes on its
+   `relay.managed_endpoint_reaper.sweep` span in Axiom.
+4. Run the disposable-host canary below.
+5. Set `enabled` only after the canary recovers without a server restart.
+
+The job runs every five minutes with a five-minute grace period for tunnels that lost their
+connector, so a candidate is usually removed five to ten minutes after it goes down. Tunnels that
+never connected wait an hour. One sweep attempts at most 100 deletions, so a backlog takes longer.
+Changing `RELAY_TUNNEL_CLEANUP_MODE`, including turning cleanup off during an incident, needs a forced
+relay deploy. Confirm the new `mode` on the next sweep span.
+
+To roll back, set cleanup to `off` and run a forced relay deploy before downgrading any host. Keep the
+recovery endpoints deployed while current server builds are in use. The nullable columns can stay.
+
+### Disposable-host canary
+
+This test has not been run against a real Cloudflare account. Run it against a disposable relay
+stage, test Cloudflare account, disposable host, and disposable T3 home. Keep production cleanup at
+`off` or `dry-run` until it passes. Do not stop a daily-use T3 server.
+
+1. Deploy the disposable stage with cleanup `dry-run`. Link a first disposable environment through
+   web or mobile settings and confirm its tunnel is healthy and recovery is registered.
+2. Stop that host and restart the same T3 home on a different local port. Confirm the public
+   hostname reaches the new port and sends nothing to the old one.
+3. Link a second disposable environment with a server build that predates recovery registration.
+   Capture its managed `cloudflared` child PID, confirm it belongs to that host, and pause only that
+   child with `kill -STOP <legacy-pid>`. Wait until Cloudflare reports it down for over five minutes.
+4. Capture the first environment's `cloudflared` child PID from its server logs, confirm ownership,
+   and pause it with `kill -STOP <first-pid>`. Wait until Cloudflare reports it down for over five
+   minutes.
+5. Confirm dry-run counts the first tunnel in `wouldDelete` and the second in `skippedLegacy`.
+6. Set cleanup `enabled` on the disposable stage and deploy it with `--force`. Confirm in the test
+   Cloudflare account that the first tunnel is deleted and the legacy tunnel still exists.
+7. Resume the first child with `kill -CONT <first-pid>`. Confirm the running server detects the
+   repeated rejection, requests recovery, and becomes reachable at the same hostname without a
+   restart.
+8. Resume the legacy child with `kill -CONT <legacy-pid>` and confirm its tunnel reconnects.
+9. Repeat with a physical sleep and wake cycle on a disposable laptop before broad rollout.
 
 ## Marketing site deployment
 
@@ -269,7 +329,7 @@ available.
   - `T3CODE_DESKTOP_UPDATE_REPOSITORY` (format `owner/repo`), if set.
   - otherwise `GITHUB_REPOSITORY` from GitHub Actions.
 - Required release assets for updater:
-  - platform installers (`.exe`, `.dmg`, `.AppImage`, plus macOS `.zip` for Squirrel.Mac update payloads)
+  - platform installers (`.exe`, `.dmg`, `.AppImage`, `.deb`, plus macOS `.zip` for Squirrel.Mac update payloads)
   - channel metadata: `latest*.yml` for stable releases, `nightly*.yml` for nightly releases
   - `*.blockmap` files (used for differential downloads)
 - macOS metadata note:

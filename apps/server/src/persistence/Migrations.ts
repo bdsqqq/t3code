@@ -69,6 +69,7 @@ import Migration0055 from "./Migrations/055_ProjectionPendingTurnAdmissionProtoc
 import Migration0056 from "./Migrations/056_RecoverCompactionQueuedTurnStarts.ts";
 import Migration0051 from "./Migrations/051_ProjectionThreadMessageContext.ts";
 import Migration0057 from "./Migrations/057_ReconcileUpstreamContextAndTitleState.ts";
+import Migration0058 from "./Migrations/058_ReconcileUpstreamPullRequestAndAutoSettle.ts";
 
 /**
  * Migration loader with all migrations defined inline.
@@ -140,6 +141,8 @@ const migrationEntries = [
   [55, "ProjectionPendingTurnAdmissionProtocol", Migration0055],
   [56, "RecoverCompactionQueuedTurnStarts", Migration0056],
   [57, "ReconcileUpstreamContextAndTitleState", Migration0057],
+  // Preserve published fork ids; upstream 53–54 are replayed idempotently here.
+  [58, "ReconcileUpstreamPullRequestAndAutoSettle", Migration0058],
 ] as const;
 
 export const migrationManifest = migrationEntries.map(([id, name]) => [id, name] as const);

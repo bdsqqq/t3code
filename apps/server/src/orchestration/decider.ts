@@ -48,6 +48,8 @@ import {
 import { projectEvent } from "./projector.ts";
 import { threadHasQueuedTurnStart } from "./ThreadSettlementPolicy.ts";
 
+const monogramSegmenter = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
 const isScriptRunCommand = Schema.is(SCRIPT_RUN_COMMAND_PATTERN);
 
 const nowIso = Effect.map(DateTime.now, DateTime.formatIso);
@@ -265,6 +267,15 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         projectId: command.projectId,
       });
+      if (
+        command.projectIcon?.kind === "monogram" &&
+        Array.from(monogramSegmenter.segment(command.projectIcon.text)).length > 2
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: "Project monograms must contain at most two characters.",
+        });
+      }
       if (command.scripts !== undefined) {
         // Persisted IDs predate shortcut validation. Let users edit or remove them
         // without allowing another invalid ID to enter the project.
@@ -474,13 +485,14 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         command,
         threadId: command.threadId,
       });
-      if (command.type === "thread.auto-settle" && thread.settledOverride !== null) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} changed before automatic settlement`,
-          }),
-        );
+      if (
+        command.type === "thread.auto-settle" &&
+        (thread.settledOverride !== null || thread.autoSettleDisabledAt != null)
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} changed before automatic settlement`,
+        });
       }
       // The server owns settle eligibility. A stale command must not settle
       // a thread whose session is coming alive or working.
@@ -632,36 +644,30 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       // structurally just a string): NaN fails every comparison, and an
       // unparseable snoozedUntil must never persist.
       if (!(Date.parse(command.snoozedUntil) > Date.parse(occurredAt))) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} snooze wake time ${command.snoozedUntil} is not in the future`,
-          }),
-        );
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} snooze wake time ${command.snoozedUntil} is not in the future`,
+        });
       }
       // Blocked-on-you work must not be snoozed away: a pending approval or
       // user-input request is the agent waiting on the user, and hiding it
       // defeats the request. (A running session IS snoozable — snooze only
       // affects visibility, never the agent.)
       if (openRequests(thread).size > 0) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} has a pending approval or user-input request and cannot be snoozed`,
-          }),
-        );
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} has a pending approval or user-input request and cannot be snoozed`,
+        });
       }
       // A queued turn start — a user message no turn has adopted yet — is
       // invisible pending work: no session, no pending flags. Snoozing in
       // that window would hide a just-requested turn exactly the way settle
       // would.
       if (hasQueuedTurnStartForThread(thread, occurredAt)) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} has a queued turn start and cannot be snoozed`,
-          }),
-        );
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} has a queued turn start and cannot be snoozed`,
+        });
       }
       // Re-snoozing an already-snoozed thread to the SAME wake time is a
       // duplicate (double-click, raced clients): re-emit with the original
@@ -823,12 +829,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       // (rather than silently pinning) keeps a raced reorder-after-unpin
       // from resurrecting a pin the user just cleared.
       if (thread.pinnedAt == null) {
-        return yield* Effect.fail(
-          new OrchestrationCommandInvariantError({
-            commandType: command.type,
-            detail: `thread ${command.threadId} is not pinned and cannot be reordered`,
-          }),
-        );
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `thread ${command.threadId} is not pinned and cannot be reordered`,
+        });
       }
       // Idempotent by re-emission (see thread.settle): a duplicate drop on
       // the same slot keeps the existing updatedAt so it projects as a no-op.
@@ -846,6 +850,37 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           threadId: command.threadId,
           orderKey: command.orderKey,
           updatedAt: keyUnchanged ? thread.updatedAt : occurredAt,
+        },
+      };
+    }
+
+    case "thread.auto-settle.set": {
+      const thread = yield* requireThreadNotArchived({
+        readModel,
+        command,
+        threadId: command.threadId,
+      });
+      // Idempotent by re-emission (see thread.unpin): setting the current
+      // state again keeps the existing timestamps so duplicates do not churn
+      // ordering. The flag is independent of the settled lifecycle: it only
+      // gates the automatic paths, so it never blocks a manual settle.
+      const currentlyDisabledAt = thread.autoSettleDisabledAt ?? null;
+      const unchanged = command.enabled
+        ? currentlyDisabledAt === null
+        : currentlyDisabledAt !== null;
+      const occurredAt = yield* nowIso;
+      return {
+        ...(yield* withEventBase({
+          aggregateKind: "thread",
+          aggregateId: command.threadId,
+          occurredAt,
+          commandId: command.commandId,
+        })),
+        type: "thread.auto-settle-set",
+        payload: {
+          threadId: command.threadId,
+          autoSettleDisabledAt: command.enabled ? null : (currentlyDisabledAt ?? occurredAt),
+          updatedAt: unchanged ? thread.updatedAt : occurredAt,
         },
       };
     }
@@ -909,12 +944,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       if (command.linkedPullRequest != null) {
         const { linkedPullRequest: linked, ...metadata } = command;
         const project = readModel.projects.find((project) => project.id === thread.projectId);
-        let host = project?.repositoryIdentity?.canonicalKey.split("/")[0] ?? "unknown";
-        try {
-          host = new URL(linked.url).hostname;
-        } catch {
-          // Historical clients can send links without a parseable URL.
-        }
+        // Historical clients can send links without a parseable URL.
+        const host = URL.canParse(linked.url)
+          ? new URL(linked.url).hostname
+          : (project?.repositoryIdentity?.canonicalKey.split("/")[0] ?? "unknown");
         const hasMetadata = Object.entries(metadata).some(
           ([key, value]) => !["type", "commandId", "threadId"].includes(key) && value !== undefined,
         );
@@ -1829,12 +1862,10 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
           sessionComingAlive ||
           hasQueuedTurnStartForThread(thread, command.createdAt)
         ) {
-          return yield* Effect.fail(
-            new OrchestrationCommandInvariantError({
-              commandType: command.type,
-              detail: `thread ${command.threadId} was re-engaged after settle; skipping session stop`,
-            }),
-          );
+          return yield* new OrchestrationCommandInvariantError({
+            commandType: command.type,
+            detail: `thread ${command.threadId} was re-engaged after settle; skipping session stop`,
+          });
         }
       }
       return {
@@ -1903,7 +1934,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       return [unsettledEvent, sessionSetEvent];
     }
 
-    case "thread.message.assistant.delta": {
+    case "thread.message.assistant.delta":
+    case "thread.message.reasoning.delta": {
       if (isImportedAgentSessionMessageId(command.messageId)) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,
@@ -1926,7 +1958,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           messageId: command.messageId,
-          role: "assistant",
+          role: command.type === "thread.message.reasoning.delta" ? "reasoning" : "assistant",
           text: command.delta,
           turnId: command.turnId ?? null,
           streaming: true,
@@ -1936,7 +1968,8 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
       };
     }
 
-    case "thread.message.assistant.complete": {
+    case "thread.message.assistant.complete":
+    case "thread.message.reasoning.complete": {
       if (isImportedAgentSessionMessageId(command.messageId)) {
         return yield* new OrchestrationCommandInvariantError({
           commandType: command.type,
@@ -1959,7 +1992,7 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
         payload: {
           threadId: command.threadId,
           messageId: command.messageId,
-          role: "assistant",
+          role: command.type === "thread.message.reasoning.complete" ? "reasoning" : "assistant",
           text: "",
           turnId: command.turnId ?? null,
           streaming: false,
@@ -2064,11 +2097,29 @@ export const decideOrchestrationCommand = Effect.fn("decideOrchestrationCommand"
     }
 
     case "thread.turn.diff.complete": {
-      yield* requireThread({
+      const thread = yield* requireThread({
         readModel,
         command,
         threadId: command.threadId,
       });
+      // A placeholder (status "missing") must never replace a checkpoint that
+      // was already captured with a real git ref. Provider diff ingestion
+      // checks this before dispatching, but CheckpointReactor can commit the
+      // real capture in between; the decider runs under the engine's command
+      // lock, so rejecting here closes that window.
+      const existingCheckpoint = thread.checkpoints.find(
+        (checkpoint) => checkpoint.turnId === command.turnId,
+      );
+      if (
+        command.status === "missing" &&
+        existingCheckpoint !== undefined &&
+        existingCheckpoint.status !== "missing"
+      ) {
+        return yield* new OrchestrationCommandInvariantError({
+          commandType: command.type,
+          detail: `turn ${command.turnId} already has a captured checkpoint`,
+        });
+      }
       return {
         ...(yield* withEventBase({
           aggregateKind: "thread",
