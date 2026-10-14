@@ -1,5 +1,7 @@
 // @effect-diagnostics globalDate:off -- UI snooze presets use local calendar boundaries and Intl labels.
 import * as DateTime from "effect/DateTime";
+import { ThreadId, type ThreadSnoozeCondition } from "@t3tools/contracts";
+import { parseChangeRequestUrl } from "@t3tools/shared/changeRequestUrl";
 
 import type { PendingSubagentRequest } from "./models.ts";
 
@@ -85,11 +87,13 @@ export function hasQueuedTurnStart(
  * The snooze lifecycle fields plus everything needed to detect a raised
  * hand. Snooze is an overlay on the active state: a snoozed thread stays
  * "active" in the data model and is only suppressed from the inbox until
- * its wake time passes or the thread demands attention.
+ * its wake time passes, its dependency is fulfilled, or the thread demands attention.
  */
 export interface ThreadSnoozeShell extends QueuedThreadShell {
   readonly snoozedUntil?: string | null;
   readonly snoozedAt?: string | null;
+  readonly snoozeCondition?: ThreadSnoozeCondition | null;
+  readonly lastSnoozeWakeAt?: string | null;
   readonly hasPendingApprovals: boolean;
   readonly hasPendingUserInput: boolean;
   readonly pendingSubagentRequest?: PendingSubagentRequest | null;
@@ -159,16 +163,18 @@ export function canSnooze(
 }
 
 /**
- * Snoozed resolution: hidden from the inbox while the wake time is in the
- * future and the thread has not raised its hand. Timer wakes are derived —
+ * Dependency wakes are server-authoritative; clients must not infer settlement
+ * from a finished run or treat a missing target shell as a fulfilled condition.
+ * Timer wakes are derived —
  * no server event fires when snoozedUntil passes; the stale fields simply
  * stop classifying as snoozed (and feed the woke indicator until the user
- * visits or re-engages).
+ * visits or re-engages). Both kinds retain raised-hand early wakes.
  */
 export function effectiveSnoozed(
   shell: ThreadSnoozeShell,
   options: { readonly now: string },
 ): boolean {
+  if (shell.snoozeCondition != null) return !threadRaisedHandWhileSnoozed(shell);
   if (shell.snoozedUntil == null) return false;
   const wakeAtMs = Date.parse(shell.snoozedUntil);
   // Malformed data never hides a thread.
@@ -192,9 +198,11 @@ export function threadWokeAt(
   shell: ThreadSnoozeShell,
   options: { readonly now: string },
 ): string | null {
-  if (shell.snoozedUntil == null) return null;
-  const wakeAtMs = Date.parse(shell.snoozedUntil);
-  if (Number.isNaN(wakeAtMs)) return null;
+  if (shell.snoozedUntil == null && shell.snoozeCondition == null) {
+    return shell.lastSnoozeWakeAt ?? null;
+  }
+  const wakeAtMs = Date.parse(shell.snoozedUntil ?? "");
+  if (shell.snoozeCondition == null && Number.isNaN(wakeAtMs)) return null;
   // An early hand-raise wake stays authoritative even after the scheduled
   // wake time passes: reporting snoozedUntil then would resurface a Woke
   // indicator the user already cleared by visiting (snoozedUntil is newer
@@ -213,7 +221,40 @@ export function threadWokeAt(
     return runtime?.updatedAt ?? shell.snoozedAt ?? null;
   }
   // No raised hand: woke iff the timer elapsed (still-snoozed → null).
-  return wakeAtMs <= Date.parse(options.now) ? shell.snoozedUntil : null;
+  return wakeAtMs <= Date.parse(options.now) ? (shell.snoozedUntil ?? null) : null;
+}
+
+export type SnoozeChoice =
+  | { readonly snoozedUntil: string; readonly condition?: never }
+  | { readonly condition: ThreadSnoozeCondition; readonly snoozedUntil?: never };
+
+export function resolveConditionalSnooze(
+  input:
+    | { readonly mode: "thread"; readonly threadId: string }
+    | { readonly mode: "pull-request"; readonly url: string },
+): ThreadSnoozeCondition | null {
+  if (input.mode === "thread") {
+    const threadId = input.threadId.trim();
+    return threadId ? { type: "thread-settled", threadId: ThreadId.make(threadId) } : null;
+  }
+  const reference = parseChangeRequestUrl(input.url.trim());
+  return reference
+    ? {
+        type: "pull-request-merged",
+        host: reference.host,
+        repository: reference.repository,
+        number: reference.number,
+      }
+    : null;
+}
+
+export function snoozeConditionLabel(
+  condition: ThreadSnoozeCondition,
+  threadTitle?: string | null,
+): string {
+  return condition.type === "thread-settled"
+    ? `Until ${threadTitle || "thread"} settles`
+    : `Until ${condition.repository}#${condition.number} merges`;
 }
 
 const HOUR_MS = 60 * 60 * 1_000;

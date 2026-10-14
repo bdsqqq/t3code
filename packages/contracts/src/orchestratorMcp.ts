@@ -30,6 +30,7 @@ import {
   OrchestrationV2CreationSource,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
+  ThreadSnoozeCondition,
 } from "./orchestrationV2.ts";
 import {
   ProviderOptionDescriptor,
@@ -334,6 +335,7 @@ export const OrchestratorMcpThreadListItem = Schema.Struct({
   snoozed: Schema.Boolean,
   /** When a snoozed thread wakes; null when it is not snoozed. */
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  snoozeCondition: Schema.optional(Schema.NullOr(ThreadSnoozeCondition)),
   parentThreadId: Schema.NullOr(ThreadId),
   relationshipToParent: Schema.NullOr(Schema.Literals(["fork", "subagent"])),
   itemCount: NonNegativeInt,
@@ -392,6 +394,7 @@ export const OrchestratorMcpThreadDetail = Schema.Struct({
   snoozed: Schema.Boolean,
   /** When a snoozed thread wakes; null when it is not snoozed. */
   snoozedUntil: Schema.NullOr(IsoDateTime),
+  snoozeCondition: Schema.optional(Schema.NullOr(ThreadSnoozeCondition)),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });

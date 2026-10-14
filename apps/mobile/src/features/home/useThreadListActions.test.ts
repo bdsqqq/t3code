@@ -14,6 +14,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const state = vi.hoisted(() => ({
   pendingOrder: null as object | null,
   dropBusy: false,
+  conditionalSnoozeSupported: true,
   scopes: new Map<string, Set<string>>(),
   shells: [] as EnvironmentThreadShell[],
   requests: [] as {
@@ -76,6 +77,7 @@ vi.mock("../../state/atom-registry", () => ({
                       capabilities: {
                         threadSettlement: true,
                         threadSnooze: true,
+                        threadConditionalSnooze: state.conditionalSnoozeSupported,
                         threadPinning: true,
                         threadPinReorder: true,
                         threadTitleRegeneration: true,
@@ -171,6 +173,7 @@ const mutationCases = [
 beforeEach(() => {
   state.pendingOrder = null;
   state.dropBusy = false;
+  state.conditionalSnoozeSupported = true;
   state.scopes = new Map([
     [primaryEnvironmentId, new Set([AuthOrchestrationOperateScope])],
     [otherEnvironmentId, new Set<string>()],
@@ -185,23 +188,49 @@ beforeEach(() => {
 afterEach(() => vi.unstubAllEnvs());
 
 describe("thread list operation permissions", () => {
+  it("dispatches a conditional snooze without a time", async () => {
+    const condition = { type: "thread-settled" as const, threadId: ThreadId.make("dependency") };
+    expect(await useThreadListActions().snoozeThread(makeThread(), { condition })).toBe(true);
+    expect(state.requests).toEqual([
+      {
+        action: "snooze",
+        environmentId: primaryEnvironmentId,
+        input: { threadId: ThreadId.make("thread"), condition },
+      },
+    ]);
+  });
+
+  it("rejects conditional choices on older servers while preserving time snoozes", async () => {
+    state.conditionalSnoozeSupported = false;
+    const actions = useThreadListActions();
+    expect(
+      await actions.snoozeThread(makeThread(), {
+        condition: { type: "thread-settled", threadId: ThreadId.make("dependency") },
+      }),
+    ).toBe(false);
+    expect(state.requests).toEqual([]);
+    expect(
+      await actions.snoozeThread(makeThread(), { snoozedUntil: "2099-01-01T00:00:00.000Z" }),
+    ).toBe(true);
+    expect(state.requests).toHaveLength(1);
+  });
+
   it.each(mutationCases)(
     "%s rejects a retained callback after its environment loses permission",
     async (handler) => {
       const actions = useThreadListActions();
       state.scopes.get(primaryEnvironmentId)!.clear();
 
-      await actions[handler](makeThread(), "2099-01-01T00:00:00.000Z");
+      await actions[handler](makeThread(), { snoozedUntil: "2099-01-01T00:00:00.000Z" });
 
       expect(state.requests).toEqual([]);
     },
   );
 
   it.each(mutationCases)("%s requires the target environment's permission", async (handler) => {
-    await useThreadListActions()[handler](
-      makeThread({ environmentId: otherEnvironmentId }),
-      "2099-01-01T00:00:00.000Z",
-    );
+    await useThreadListActions()[handler](makeThread({ environmentId: otherEnvironmentId }), {
+      snoozedUntil: "2099-01-01T00:00:00.000Z",
+    });
 
     expect(state.requests).toEqual([]);
   });
@@ -213,10 +242,9 @@ describe("thread list operation permissions", () => {
       const actions = useThreadListActions();
       state.scopes.get(otherEnvironmentId)!.add(AuthOrchestrationOperateScope);
 
-      await actions[handler](
-        makeThread({ environmentId: otherEnvironmentId }),
-        "2099-01-01T00:00:00.000Z",
-      );
+      await actions[handler](makeThread({ environmentId: otherEnvironmentId }), {
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
 
       expect(state.requests).toEqual([
         expect.objectContaining({ action, environmentId: otherEnvironmentId }),

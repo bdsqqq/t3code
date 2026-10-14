@@ -3,6 +3,7 @@ import { useAndroidControlSizing } from "../../components/useAndroidControlSizin
 import type { ThreadMoveDestination } from "../threads/threadOrder";
 import { computeThreadMoveAvailability } from "../threads/threadOrder";
 import { LegendList, type LegendListRef } from "@legendapp/list/react-native";
+import type { SnoozeChoice } from "@t3tools/client-runtime/state/thread-settled";
 import {
   type EnvironmentProject,
   type EnvironmentThreadShell,
@@ -110,7 +111,7 @@ interface HomeScreenProps {
   readonly onSettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly onSnoozeThread: (
     thread: EnvironmentThreadShell,
-    snoozedUntil: string,
+    choice: SnoozeChoice,
   ) => Promise<boolean>;
   readonly onUnsnoozeThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
@@ -457,8 +458,8 @@ export function HomeScreen(props: HomeScreenProps) {
   // optimistic holds.
   const handleSettleThread = props.onSettleThread;
   const handleSnoozeThread = useCallback(
-    (thread: EnvironmentThreadShell, snoozedUntil: string) => {
-      void props.onSnoozeThread(thread, snoozedUntil);
+    (thread: EnvironmentThreadShell, choice: SnoozeChoice) => {
+      void props.onSnoozeThread(thread, choice);
     },
     [props.onSnoozeThread],
   );
@@ -551,6 +552,7 @@ export function HomeScreen(props: HomeScreenProps) {
     machineByEnvironmentId,
     settlementEnvironmentIds,
     snoozeEnvironmentIds,
+    conditionalSnoozeEnvironmentIds,
     pinningEnvironmentIds,
     autoSettleOptOutEnvironmentIds,
     pinReorderEnvironmentIds,
@@ -673,6 +675,13 @@ export function HomeScreen(props: HomeScreenProps) {
       ),
     [props.pendingTasks, props.selectedEnvironmentId, v2ScopedProjectKeys, v2SearchQuery],
   );
+  const threadTitlesByKey = useMemo(
+    () =>
+      new Map(
+        props.threads.map((thread) => [`${thread.environmentId}:${thread.id}`, thread.title]),
+      ),
+    [props.threads],
+  );
   const threadListV2Items = useMemo(
     () =>
       buildThreadListV2ListItems({
@@ -688,6 +697,7 @@ export function HomeScreen(props: HomeScreenProps) {
         settledShelfExpanded,
         settledShelfHeaderIndex: threadListV2Layout.settledShelfHeaderIndex,
         snoozeLabelNow: `${nowMinute}:00.000Z`,
+        threadTitlesByKey,
         snoozeEnvironmentIds,
         queuedThreadKeys,
         moveAvailability: threadMoveAvailability,
@@ -702,6 +712,7 @@ export function HomeScreen(props: HomeScreenProps) {
       snoozedShelfExpanded,
       snoozeEnvironmentIds,
       threadListV2Layout,
+      threadTitlesByKey,
       v2PendingTasks,
       workingShelfExpanded,
     ],
@@ -814,6 +825,7 @@ export function HomeScreen(props: HomeScreenProps) {
           settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
           onSettleThread={handleSettleThread}
           snoozeSupported={snoozeEnvironmentIds.has(thread.environmentId)}
+          conditionalSnoozeSupported={conditionalSnoozeEnvironmentIds.has(thread.environmentId)}
           pinningSupported={pinningEnvironmentIds.has(thread.environmentId)}
           autoSettleOptOutSupported={autoSettleOptOutEnvironmentIds.has(thread.environmentId)}
           reorderSupported={
@@ -873,6 +885,7 @@ export function HomeScreen(props: HomeScreenProps) {
       settlementEnvironmentIds,
       snoozeEnvironmentIds,
       threadSearchMatchByKey,
+      conditionalSnoozeEnvironmentIds,
       titleRegenerationEnvironmentIds,
       toggleSettledShelf,
       toggleSnoozedShelf,

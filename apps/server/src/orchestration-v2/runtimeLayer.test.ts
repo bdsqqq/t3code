@@ -18,6 +18,7 @@ import {
   TurnItemId,
   type ModelSelection,
   type OrchestrationV2Run,
+  OrchestrationV2ThreadShellJson,
   ProjectId,
   type PullRequestDetail,
   type PullRequestComment,
@@ -38,6 +39,7 @@ import * as Logger from "effect/Logger";
 import * as Path from "effect/Path";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 import * as SqlClient from "effect/sql/SqlClient";
@@ -76,6 +78,9 @@ import { CodexProviderCapabilitiesV2 } from "./Adapters/CodexAdapterV2.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+
+const encodeThreadShellJson = Schema.encodeSync(OrchestrationV2ThreadShellJson);
+const decodeThreadShellJson = Schema.decodeSync(OrchestrationV2ThreadShellJson);
 
 const layerPlatformTest = Layer.merge(
   NodeServices.layer,
@@ -4673,6 +4678,253 @@ it.layer(layerTest)("snooze queued runs", (it) => {
 });
 
 it.layer(layerSharedApplicationDataPlaneTest)("snooze projection", (it) => {
+  it.effect("delayed conditional cleanup preserves an already-visited early wake time", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const eventSink = yield* EventSink.EventSinkV2;
+      const threadId = ThreadId.make("conditional-early-wake");
+      const snoozeId = CommandId.make("conditional-early-snooze");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("conditional-early-create"),
+        createdBy: "user",
+        creationSource: "web",
+        threadId,
+        projectId: ProjectId.make("conditional-early-project"),
+        title: "Early wake",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: snoozeId,
+        threadId,
+        condition: {
+          type: "pull-request-merged",
+          host: "github.com",
+          repository: "org/repo",
+          number: 1,
+        },
+      });
+      yield* TestClock.adjust("1 minute");
+      const raisedAt = yield* DateTime.now;
+      yield* eventSink.write({
+        commandId: CommandId.make("conditional-early-request"),
+        events: [
+          {
+            id: EventId.make("conditional-early-request-event"),
+            type: "runtime-request.updated",
+            threadId,
+            nodeId: NodeId.make("conditional-early-node"),
+            occurredAt: raisedAt,
+            payload: {
+              id: RuntimeRequestId.make("conditional-early-request"),
+              nodeId: NodeId.make("conditional-early-node"),
+              providerTurnId: null,
+              nativeRequestRef: null,
+              kind: "user_input",
+              status: "pending",
+              responseCapability: { type: "message" },
+              createdAt: raisedAt,
+              resolvedAt: null,
+            },
+          },
+        ],
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.visit",
+        commandId: CommandId.make("conditional-early-visit"),
+        threadId,
+        visitedAt: DateTime.formatIso(raisedAt),
+      });
+      yield* TestClock.adjust("1 minute");
+      yield* orchestrator.dispatch({
+        type: "thread.snooze.wake",
+        commandId: CommandId.make("conditional-early-cleanup"),
+        threadId,
+        expectedSnoozeCommandId: snoozeId,
+      });
+      const projections = yield* ProjectionStore.ProjectionStoreV2.pipe(
+        Effect.provide(ProjectionStore.layer),
+      );
+      const shell = yield* projections.getThreadShell(threadId);
+      assert.deepEqual(shell?.lastSnoozeWakeAt, raisedAt);
+      assert.deepEqual(shell?.lastVisitedAt, raisedAt);
+      assert.isNull(shell?.snoozeCondition);
+      assert.isNotNull(shell);
+      const wire = encodeThreadShellJson(shell!);
+      assert.equal(wire.lastSnoozeWakeAt, DateTime.formatIso(raisedAt));
+      assert.deepEqual(decodeThreadShellJson(wire).lastSnoozeWakeAt, raisedAt);
+    }),
+  );
+  it.effect("guards conditional replacements and rejects concurrent dependency cycles", () =>
+    Effect.gen(function* () {
+      const projects = yield* ProjectService.ProjectService;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projectId = ProjectId.make("conditional-project");
+      const a = ThreadId.make("conditional-a");
+      const b = ThreadId.make("conditional-b");
+      yield* projects.create({
+        commandId: CommandId.make("conditional-project-create"),
+        projectId,
+        title: "Conditional snooze",
+        workspaceRoot: "/tmp/conditional-snooze",
+      });
+      for (const threadId of [a, b]) {
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${threadId}`),
+          threadId,
+          projectId,
+          title: threadId,
+          createdBy: "user",
+          creationSource: "web",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+        });
+      }
+      for (const target of [a, ThreadId.make("missing-thread")]) {
+        const rejected = yield* orchestrator
+          .dispatch({
+            type: "thread.snooze",
+            commandId: CommandId.make(`bad-target:${target}`),
+            threadId: a,
+            condition: { type: "thread-settled", threadId: target },
+          })
+          .pipe(Effect.flip);
+        assert.equal(rejected._tag, "OrchestratorDispatchError");
+      }
+      const results = yield* Effect.all(
+        [
+          orchestrator
+            .dispatch({
+              type: "thread.snooze",
+              commandId: CommandId.make("edge:a"),
+              threadId: a,
+              condition: { type: "thread-settled", threadId: b },
+            })
+            .pipe(Effect.result),
+          orchestrator
+            .dispatch({
+              type: "thread.snooze",
+              commandId: CommandId.make("edge:b"),
+              threadId: b,
+              condition: { type: "thread-settled", threadId: a },
+            })
+            .pipe(Effect.result),
+        ],
+        { concurrency: 2 },
+      );
+      assert.equal(results.filter((result) => result._tag === "Success").length, 1);
+      const original = CommandId.make("conditional-original");
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: original,
+        threadId: a,
+        condition: {
+          type: "pull-request-merged",
+          host: "github.com",
+          repository: "any/repo",
+          number: 1,
+        },
+      });
+      const replacement = CommandId.make("conditional-replacement");
+      const condition = {
+        type: "pull-request-merged" as const,
+        host: "gitlab.com",
+        repository: "other/repo",
+        number: 2,
+      };
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: replacement,
+        threadId: a,
+        condition,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze.wake",
+        commandId: CommandId.make("stale-wake"),
+        threadId: a,
+        expectedSnoozeCommandId: original,
+      });
+      const projections = yield* ProjectionStore.ProjectionStoreV2.pipe(
+        Effect.provide(ProjectionStore.layer),
+      );
+      const shell = yield* projections.getThreadShell(a);
+      assert.deepEqual(shell?.snoozeCondition, condition);
+      assert.equal(shell?.snoozeCommandId, replacement);
+      assert.isNull(shell?.snoozedUntil);
+      yield* orchestrator.dispatch({
+        type: "thread.snooze.wake",
+        commandId: CommandId.make("current-wake"),
+        threadId: a,
+        expectedSnoozeCommandId: replacement,
+      });
+      assert.isNull((yield* projections.getThreadShell(a))?.snoozeCondition);
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("conditional-before-pin"),
+        threadId: a,
+        condition,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.pin",
+        commandId: CommandId.make("conditional-pin"),
+        threadId: a,
+      });
+      assert.isNull((yield* projections.getThreadShell(a))?.snoozeCondition);
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("conditional-pinned"),
+        threadId: a,
+        condition,
+      });
+      assert.isTrue(
+        (yield* projections.getConditionalSnoozeCandidates(a)).some((thread) => thread.id === a),
+      );
+      yield* orchestrator.dispatch({
+        type: "thread.snooze",
+        commandId: CommandId.make("timer-replacement"),
+        threadId: a,
+        snoozedUntil: "2099-01-01T00:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.snooze.wake",
+        commandId: CommandId.make("stale-conditional-timer-wake"),
+        threadId: a,
+        expectedSnoozeCommandId: CommandId.make("conditional-pinned"),
+      });
+      assert.isNotNull((yield* projections.getThreadShell(a))?.snoozedUntil);
+      for (const type of ["thread.archive", "thread.settle"] as const) {
+        yield* orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`snooze-before:${type}`),
+          threadId: a,
+          condition,
+        });
+        yield* orchestrator.dispatch({
+          type,
+          commandId: CommandId.make(`consume:${type}`),
+          threadId: a,
+        });
+        assert.isNull((yield* projections.getThread(a)).snoozeCondition);
+        assert.isNull((yield* projections.getThread(a)).snoozeCommandId);
+        if (type === "thread.archive") {
+          yield* orchestrator.dispatch({
+            type: "thread.unarchive",
+            commandId: CommandId.make("conditional-unarchive"),
+            threadId: a,
+          });
+        }
+      }
+    }),
+  );
   it.effect("carries snooze state through the V2 shell projection", () =>
     Effect.gen(function* () {
       const projects = yield* ProjectService.ProjectService;

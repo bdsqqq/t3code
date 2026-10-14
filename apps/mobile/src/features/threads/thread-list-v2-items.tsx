@@ -18,7 +18,11 @@ import type {
 } from "@t3tools/client-runtime/state/shell";
 import type { EnvironmentThreadSearchMatch } from "@t3tools/client-runtime/state/thread-search";
 import { AuthOrchestrationOperateScope, type EnvironmentMachineKind } from "@t3tools/contracts";
-import { canSnooze, resolveSnoozePresets } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  canSnooze,
+  resolveSnoozePresets,
+  type SnoozeChoice,
+} from "@t3tools/client-runtime/state/thread-settled";
 import type { MenuAction } from "@react-native-menu/menu";
 import { memo, useCallback, useEffect, useMemo, useState, type ComponentProps } from "react";
 import { Alert, Pressable, useWindowDimensions, View } from "react-native";
@@ -547,7 +551,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly onRenameThread: (thread: EnvironmentThreadShell) => void;
   readonly onRegenerateThreadTitle: (thread: EnvironmentThreadShell) => void;
   readonly onSettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
-  readonly onSnoozeThread: (thread: EnvironmentThreadShell, snoozedUntil: string) => void;
+  readonly onSnoozeThread: (thread: EnvironmentThreadShell, choice: SnoozeChoice) => void;
   readonly onUnsnoozeThread: (thread: EnvironmentThreadShell) => void;
   readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
   readonly onArchiveThread: (thread: EnvironmentThreadShell) => void;
@@ -559,6 +563,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   readonly settlementSupported: boolean;
   /** False on servers that predate thread.snooze/unsnooze. */
   readonly snoozeSupported: boolean;
+  readonly conditionalSnoozeSupported: boolean;
   /** False on servers that predate thread.pin/unpin. */
   readonly pinningSupported: boolean;
   /** False on servers that predate thread.auto-settle.set. */
@@ -603,6 +608,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     onMoveThread,
   } = props;
   const snoozedRow = props.snoozed === true;
+  const conditionalSnoozedRow = snoozedRow && thread.snoozeCondition != null;
   const pinnedRow = props.pinned === true;
   const dormant = useSwipeRowDormant(props.activationKey);
 
@@ -651,6 +657,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   );
   const handleSettle = useCallback(() => onSettleThread(thread), [onSettleThread, thread]);
   const [customSnoozeOpen, setCustomSnoozeOpen] = useState(false);
+  const [customSnoozeMode, setCustomSnoozeMode] = useState<"thread" | "pull-request" | undefined>();
   // A recycled cell reassigns this mounted row to a different thread without
   // remounting it, and the render closure stops running while list equality
   // says the item is unchanged — so any row-local UI state must be dismissed
@@ -665,7 +672,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
     setCustomSnoozeOpen(false);
   }
   const handleSnooze = useCallback(
-    (snoozedUntil: string) => onSnoozeThread(thread, snoozedUntil),
+    (choice: SnoozeChoice) => onSnoozeThread(thread, choice),
     [onSnoozeThread, thread],
   );
   const handleUnsnooze = useCallback(() => onUnsnoozeThread(thread), [onUnsnoozeThread, thread]);
@@ -712,8 +719,14 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         subtitle: preset.whenLabel,
       })),
       { id: "snooze:custom", title: "Custom…" },
+      ...(props.conditionalSnoozeSupported
+        ? [
+            { id: "snooze:thread", title: "Until another thread settles…" },
+            { id: "snooze:pull-request", title: "Until a pull request merges…" },
+          ]
+        : []),
     ],
-    [snoozePresets],
+    [snoozePresets, props.conditionalSnoozeSupported],
   );
   // Pinned cards keep the full lifecycle menu; only the pin item flips to
   // Unpin. (Settling a pinned thread clears the pin server-side; snoozing
@@ -870,6 +883,15 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       }
       if (nativeEvent.event === "delete") handleDelete();
       if (nativeEvent.event === "snooze:custom") {
+        setCustomSnoozeMode(undefined);
+        setCustomSnoozeOpen(true);
+        return;
+      }
+      if (
+        props.conditionalSnoozeSupported &&
+        (nativeEvent.event === "snooze:thread" || nativeEvent.event === "snooze:pull-request")
+      ) {
+        setCustomSnoozeMode(nativeEvent.event === "snooze:thread" ? "thread" : "pull-request");
         setCustomSnoozeOpen(true);
         return;
       }
@@ -879,7 +901,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         now: new Date(),
       });
       if (snoozeSelection._tag === "selected") {
-        handleSnooze(snoozeSelection.preset.snoozedUntil);
+        handleSnooze({ snoozedUntil: snoozeSelection.preset.snoozedUntil });
       } else if (snoozeSelection._tag === "expired") {
         Alert.alert("Could not snooze thread", "That snooze time has passed. Choose another time.");
       }
@@ -902,6 +924,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
       handleUnsnooze,
       setCustomSnoozeOpen,
       snoozePresets,
+      props.conditionalSnoozeSupported,
     ],
   );
   const primaryAction = useMemo(() => {
@@ -1272,6 +1295,14 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             >
               {thread.title}
             </Text>
+            {conditionalSnoozedRow ? (
+              <Text
+                numberOfLines={2}
+                className={cn("text-xs", rowAppearance.mutedForegroundClassName)}
+              >
+                {props.snoozeWakeLabelText}
+              </Text>
+            ) : null}
             {props.searchMatch ? (
               <ThreadSearchMatchExcerpt
                 sidebar={sidebarPane}
@@ -1282,21 +1313,23 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
             ) : null}
           </View>
           {props.hasQueuedMessages ? <QueuedMessageIcon selected={selected} /> : null}
-          <Text
-            className={cn(
-              "text-sm tabular-nums",
-              selected
-                ? selectedThreadRowColors.mutedForegroundClassName
-                : snoozedRow
-                  ? rowAppearance.mutedForegroundClassName
-                  : rowAppearance.tertiaryForegroundClassName,
-            )}
-            style={{ fontFamily: MONO_FONT }}
-          >
-            {snoozedRow && props.snoozeWakeLabelText !== undefined
-              ? props.snoozeWakeLabelText
-              : timeLabel}
-          </Text>
+          {!conditionalSnoozedRow ? (
+            <Text
+              className={cn(
+                "text-sm tabular-nums",
+                selected
+                  ? selectedThreadRowColors.mutedForegroundClassName
+                  : snoozedRow
+                    ? rowAppearance.mutedForegroundClassName
+                    : rowAppearance.tertiaryForegroundClassName,
+              )}
+              style={{ fontFamily: MONO_FONT }}
+            >
+              {snoozedRow && props.snoozeWakeLabelText !== undefined
+                ? props.snoozeWakeLabelText
+                : timeLabel}
+            </Text>
+          ) : null}
         </View>
       </RowPressable>
     );
@@ -1306,7 +1339,13 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
   return (
     <View collapsable={false}>
       {customSnoozeOpen && (
-        <CustomSnoozeSheet onClose={() => setCustomSnoozeOpen(false)} onSnooze={handleSnooze} />
+        <CustomSnoozeSheet
+          thread={thread}
+          conditionalSnoozeSupported={props.conditionalSnoozeSupported}
+          initialMode={customSnoozeMode}
+          onClose={() => setCustomSnoozeOpen(false)}
+          onSnooze={handleSnooze}
+        />
       )}
       <ThreadSwipeable
         dormant={dormant}
@@ -1324,7 +1363,7 @@ export const ThreadListV2Row = memo(function ThreadListV2Row(props: {
         onSwipeableWillOpen={props.onSwipeableWillOpen}
         primaryAction={primaryAction}
         secondaryAction={secondaryAction}
-        resetKey={`${thread.environmentId}:${thread.id}:${variant}:${snoozedRow}:${thread.settledAt}:${thread.unsettledAt}:${thread.snoozedUntil}`}
+        resetKey={`${thread.environmentId}:${thread.id}:${variant}:${snoozedRow}:${thread.settledAt}:${thread.unsettledAt}:${thread.snoozedUntil}:${thread.snoozedAt}`}
         simultaneousWith={props.simultaneousSwipeGesture}
         threadTitle={thread.title}
       >

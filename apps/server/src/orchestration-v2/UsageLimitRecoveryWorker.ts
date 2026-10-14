@@ -21,6 +21,7 @@ export function limitRecoveryCommand(
     !thread.usageLimitResetAt ||
     thread.archivedAt !== null ||
     thread.settledOverride === "settled" ||
+    thread.snoozeCondition != null ||
     thread.pendingRuntimeRequest !== null
   )
     return null;

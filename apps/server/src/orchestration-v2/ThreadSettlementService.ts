@@ -150,7 +150,8 @@ export function isAutoSettlementCandidate(
   if (backgroundWorkHoldsCompletion(thread.pendingBackgroundTasks ?? [])) return false;
   if (threadHasQueuedTurnStart(thread, nowMs)) return false;
   const snoozedUntilMs = toMillis(thread.snoozedUntil);
-  if (snoozedUntilMs === null || snoozedUntilMs <= nowMs) return true;
+  if (thread.snoozeCondition == null && (snoozedUntilMs === null || snoozedUntilMs <= nowMs))
+    return true;
   // A snoozed thread that woke early (error or completed work) can settle;
   // one still parked on its wake time keeps its stronger statement.
   const snoozedAtMs = toMillis(thread.snoozedAt);
@@ -164,7 +165,7 @@ export function isAutoSettlementCandidate(
 }
 
 /**
- * Whether a thread is parked on its snooze: its wake time is in the future and
+ * Whether a thread is parked on its snooze: a future wake time or a condition, and
  * it has not raised its hand with a pending request, a fresh failure, or work
  * that completed after the snooze. Server twin of the client's
  * `effectiveSnoozed`, so agents and the sidebar agree on what is snoozed. One
@@ -175,12 +176,18 @@ export function isAutoSettlementCandidate(
 export function isSnoozed(
   thread: Pick<
     ProjectionStore.ProjectionSettlementCandidate,
-    "snoozedUntil" | "snoozedAt" | "latestRunCompletedAt" | "status" | "pendingRuntimeRequest"
+    | "snoozedUntil"
+    | "snoozeCondition"
+    | "snoozedAt"
+    | "latestRunCompletedAt"
+    | "status"
+    | "pendingRuntimeRequest"
   >,
   nowMs: number,
 ): boolean {
   const snoozedUntilMs = toMillis(thread.snoozedUntil);
-  if (snoozedUntilMs === null || snoozedUntilMs <= nowMs) return false;
+  if (thread.snoozeCondition == null && (snoozedUntilMs === null || snoozedUntilMs <= nowMs))
+    return false;
   if (thread.pendingRuntimeRequest !== null) return false;
   const snoozedAtMs = toMillis(thread.snoozedAt);
   const completedAtMs = toMillis(thread.latestRunCompletedAt);

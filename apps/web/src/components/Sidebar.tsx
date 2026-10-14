@@ -34,6 +34,8 @@ import {
   canSnooze,
   effectiveSnoozed,
   threadWokeAt,
+  snoozeConditionLabel,
+  type SnoozeChoice,
 } from "@t3tools/client-runtime/state/thread-settled";
 import { createInboxReturnTracker } from "@t3tools/client-runtime/state/thread-inbox";
 import { formatDiffCount } from "@t3tools/client-runtime/diff-count";
@@ -256,7 +258,7 @@ import {
   useLinkedThreadPullRequest,
   ThreadSearchPullRequestNumber,
 } from "./ThreadStatusIndicators";
-import { resolveSnoozePresets, snoozeWakeLabel, type SnoozePreset } from "./Sidebar.snooze";
+import { resolveSnoozePresets, snoozeWakeLabel } from "./Sidebar.snooze";
 import { ProjectFavicon, type ProjectFaviconProject } from "./ProjectFavicon";
 import { ThreadSearchMatchExcerpt } from "./ThreadSearchMatch";
 import { makeWorkspaceFileDropHandlers } from "./chat/workspaceFileDrop";
@@ -581,9 +583,10 @@ function SidebarThreadTooltip({
  * actions while the menu is up).
  */
 function SnoozeMenuButton(props: {
+  threadRef: ScopedThreadRef;
   open: boolean;
   onOpenChange: (open: boolean) => void;
-  onSnooze: (preset: Pick<SnoozePreset, "snoozedUntil">) => void;
+  onSnooze: (preset: SnoozeChoice) => void;
   timestampFormat: TimestampFormat;
 }) {
   const { open, onOpenChange, onSnooze, timestampFormat } = props;
@@ -632,7 +635,7 @@ function SnoozeMenuButton(props: {
         <MenuItem
           onClick={async (event) => {
             event.stopPropagation();
-            const choice = await requestCustomSnooze();
+            const choice = await requestCustomSnooze([props.threadRef]);
             if (choice) onSnooze(choice);
           }}
         >
@@ -1173,7 +1176,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     event: PointerEvent,
   ) => void;
   onUnsettle: (threadRef: ScopedThreadRef) => void;
-  onSnooze: (threadRef: ScopedThreadRef, preset: Pick<SnoozePreset, "snoozedUntil">) => void;
+  onSnooze: (threadRef: ScopedThreadRef, preset: SnoozeChoice) => void;
   onUnsnooze: (threadRef: ScopedThreadRef) => void;
   onUnpin: (threadRef: ScopedThreadRef) => void;
   onAcknowledgeWoke: (threadRef: ScopedThreadRef, visitedAt: string) => void;
@@ -1538,7 +1541,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
     [onUnpin, threadRef],
   );
   const handleSnoozePreset = useCallback(
-    (preset: Pick<SnoozePreset, "snoozedUntil">) => {
+    (preset: SnoozeChoice) => {
       onSnooze(threadRef, preset);
     },
     [onSnooze, threadRef],
@@ -1866,7 +1869,10 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   {variantAction === "unsnooze" && props.snoozeWakeLabelText !== null ? (
                     // Snoozed rows show when they come BACK, not when they were
                     // last touched — the return ticket is the row's whole story.
-                    <span className="text-xs text-info-foreground tabular-nums">
+                    <span
+                      className="max-w-28 truncate text-xs text-info-foreground tabular-nums"
+                      title={props.snoozeWakeLabelText}
+                    >
                       {props.snoozeWakeLabelText}
                     </span>
                   ) : isWoke ? (
@@ -2126,6 +2132,7 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                       ) : null}
                       {showSnoozeButton ? (
                         <SnoozeMenuButton
+                          threadRef={threadRef}
                           open={snoozeMenuOpen}
                           onOpenChange={setSnoozeMenuOpen}
                           onSnooze={handleSnoozePreset}
@@ -2860,7 +2867,12 @@ export default function Sidebar() {
         ).push(
           optimisticDrop.clearsSnooze
             ? projected
-            : { ...projected, snoozedAt: thread.snoozedAt, snoozedUntil: thread.snoozedUntil },
+            : {
+                ...projected,
+                snoozedAt: thread.snoozedAt,
+                snoozedUntil: thread.snoozedUntil,
+                snoozeCondition: thread.snoozeCondition ?? null,
+              },
         );
       } else {
         const section = resolveSidebarThreadSection({
@@ -2911,8 +2923,12 @@ export default function Sidebar() {
       // Soonest wake first: "what comes back next" is the shelf's question.
       snoozedThreads: snoozed.toSorted(
         (left, right) =>
-          firstValidTimestampMs(left.snoozedUntil ?? null) -
-          firstValidTimestampMs(right.snoozedUntil ?? null),
+          (left.snoozedUntil == null
+            ? Number.MAX_SAFE_INTEGER
+            : firstValidTimestampMs(left.snoozedUntil)) -
+          (right.snoozedUntil == null
+            ? Number.MAX_SAFE_INTEGER
+            : firstValidTimestampMs(right.snoozedUntil)),
       ),
       settledThreads: sortSettledThreads(settled),
       snoozeNow: preciseNow,
@@ -3707,14 +3723,19 @@ export default function Sidebar() {
       if (
         canonicalSection === optimisticDrop.section &&
         thread.pinnedAt == null &&
-        (!optimisticDrop.clearsSnooze || thread.snoozedUntil == null)
+        (!optimisticDrop.clearsSnooze ||
+          (thread.snoozedUntil == null && thread.snoozeCondition == null))
       ) {
         setOptimisticDrop(null);
       }
       return;
     }
     if (canonicalSection !== optimisticDrop.section) return;
-    if (optimisticDrop.clearsSnooze && thread.snoozedUntil != null) return;
+    if (
+      optimisticDrop.clearsSnooze &&
+      (thread.snoozedUntil != null || thread.snoozeCondition != null)
+    )
+      return;
     const destinationKeys = optimisticDrop.section === "pinned" ? pinnedKeys : activeKeys;
     const canonicalDestination = destinationKeys.flatMap((key) => {
       const canonical = canonicalByKey.get(key);
@@ -4213,7 +4234,7 @@ export default function Sidebar() {
   const performSnooze = useCallback(
     async (
       threadRef: ScopedThreadRef,
-      preset: Pick<SnoozePreset, "snoozedUntil">,
+      preset: SnoozeChoice,
       opts: { coSnoozingKeys?: ReadonlySet<string> } = {},
     ) => {
       const threadKey = scopedThreadKey(threadRef);
@@ -4225,7 +4246,7 @@ export default function Sidebar() {
         // Snoozing the open thread moves you forward, same as settle —
         // both park the thread you're done with for now.
         const navigateAfterSnooze = planForwardNavigation(threadKey, opts.coSnoozingKeys);
-        const result = await snoozeThread(threadRef, preset.snoozedUntil);
+        const result = await snoozeThread(threadRef, preset);
         if (result._tag === "Failure") {
           // Never navigate away from a thread that did not snooze.
           return isAtomCommandInterrupted(result)
@@ -4255,7 +4276,7 @@ export default function Sidebar() {
   const attemptSnooze = useCallback(
     (
       threadRef: ScopedThreadRef,
-      preset: Pick<SnoozePreset, "snoozedUntil">,
+      preset: SnoozeChoice,
       opts: { coSnoozingKeys?: ReadonlySet<string> } = {},
     ) => {
       void (async () => {
@@ -4403,7 +4424,9 @@ export default function Sidebar() {
       if (clicked.value?.startsWith("snooze:")) {
         const preset =
           clicked.value === "snooze:custom"
-            ? await requestCustomSnooze()
+            ? await requestCustomSnooze(
+                selectedThreads.map((thread) => scopeThreadRef(thread.environmentId, thread.id)),
+              )
             : snoozePresets.find((candidate) => `snooze:${candidate.id}` === clicked.value);
         if (preset) {
           // Post-snooze navigation must skip threads snoozing in this same
@@ -4676,7 +4699,7 @@ export default function Sidebar() {
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"
-              ? await requestCustomSnooze()
+              ? await requestCustomSnooze([threadRef])
               : snoozePresets.find((candidate) => `snooze:${candidate.id}` === clicked.value);
           if (preset) attemptSnooze(threadRef, preset);
           return;
@@ -5311,11 +5334,27 @@ export default function Sidebar() {
                               actionSweep?.keys.has(threadKey) ? actionSweep.action : null
                             }
                             snoozeWakeLabelText={
-                              section === "snoozed" && thread.snoozedUntil != null
-                                ? snoozeWakeLabel(thread.snoozedUntil, {
-                                    now: new Date().toISOString(),
-                                  })
-                                : null
+                              section !== "snoozed"
+                                ? null
+                                : thread.snoozeCondition != null
+                                  ? snoozeConditionLabel(
+                                      thread.snoozeCondition,
+                                      thread.snoozeCondition.type === "thread-settled"
+                                        ? threadByKey.get(
+                                            scopedThreadKey(
+                                              scopeThreadRef(
+                                                thread.environmentId,
+                                                thread.snoozeCondition.threadId,
+                                              ),
+                                            ),
+                                          )?.title
+                                        : null,
+                                    )
+                                  : thread.snoozedUntil != null
+                                    ? snoozeWakeLabel(thread.snoozedUntil, {
+                                        now: new Date().toISOString(),
+                                      })
+                                    : null
                             }
                             // All sections: a woken thread can classify straight
                             // into the settled tail (PR merged while snoozed), and

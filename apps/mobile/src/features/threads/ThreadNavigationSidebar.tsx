@@ -321,6 +321,7 @@ function ThreadNavigationSidebarPane(
     machineByEnvironmentId,
     settlementEnvironmentIds,
     snoozeEnvironmentIds,
+    conditionalSnoozeEnvironmentIds,
     pinningEnvironmentIds,
     autoSettleOptOutEnvironmentIds,
     pinReorderEnvironmentIds,
@@ -421,6 +422,10 @@ function ThreadNavigationSidebarPane(
     // unchanged: after a clamped fire (wake beyond the 32-bit setTimeout
     // range) the boundary string is identical and the chain would die.
   }, [nextSnoozeWakeAt, snoozeWakeTick]);
+  const threadTitlesByKey = useMemo(
+    () => new Map(threads.map((thread) => [`${thread.environmentId}:${thread.id}`, thread.title])),
+    [threads],
+  );
   const listItems = useMemo<readonly SidebarListItem[]>(() => {
     // Queued offline tasks are not thread shells, so the v2 item builder
     // never sees them; the shared splice puts them below the active block
@@ -452,6 +457,7 @@ function ThreadNavigationSidebarPane(
       settledShelfExpanded,
       settledShelfHeaderIndex: threadListV2Layout.settledShelfHeaderIndex,
       snoozeLabelNow: `${nowMinute}:00.000Z`,
+      threadTitlesByKey,
       snoozeEnvironmentIds,
       queuedThreadKeys,
       moveAvailability: threadMoveAvailability,
@@ -478,6 +484,7 @@ function ThreadNavigationSidebarPane(
     snoozedShelfExpanded,
     snoozeEnvironmentIds,
     threadListV2Layout,
+    threadTitlesByKey,
     workingShelfExpanded,
   ]);
   const listMenuActions = useMemo<MenuAction[]>(
@@ -732,6 +739,7 @@ function ThreadNavigationSidebarPane(
               settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
               onSettleThread={settleThread}
               snoozeSupported={snoozeEnvironmentIds.has(thread.environmentId)}
+              conditionalSnoozeSupported={conditionalSnoozeEnvironmentIds.has(thread.environmentId)}
               pinningSupported={pinningEnvironmentIds.has(thread.environmentId)}
               autoSettleOptOutSupported={autoSettleOptOutEnvironmentIds.has(thread.environmentId)}
               reorderSupported={
@@ -830,6 +838,7 @@ function ThreadNavigationSidebarPane(
       sidebarScrollGesture,
       snoozeEnvironmentIds,
       snoozeThread,
+      conditionalSnoozeEnvironmentIds,
       toggleSettledShelf,
       toggleSnoozedShelf,
       toggleWorkingShelf,

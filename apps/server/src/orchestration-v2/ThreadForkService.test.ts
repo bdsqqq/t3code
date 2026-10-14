@@ -1,5 +1,6 @@
 import { assert, it } from "@effect/vitest";
 import {
+  CommandId,
   ContextTransferId,
   MessageId,
   type ModelSelection,
@@ -57,6 +58,14 @@ function makeSourceThread(): OrchestrationV2AppThread {
     settledAt: null,
     lastVisitedAt: null,
     snoozedUntil,
+    snoozeCondition: {
+      type: "pull-request-merged",
+      host: "github.com",
+      repository: "org/repo",
+      number: 1,
+    },
+    snoozeCommandId: CommandId.make("snooze:source"),
+    lastSnoozeWakeAt: snoozedAt,
     snoozedAt,
     deletedAt: null,
   };
@@ -146,6 +155,9 @@ it.effect("keeps a fork awake when its source thread is snoozed", () =>
     const result = yield* planFork(sourceRun);
 
     assert.isNull(result.targetThread.snoozedUntil);
+    assert.isNull(result.targetThread.snoozeCondition);
+    assert.isNull(result.targetThread.snoozeCommandId);
+    assert.isNull(result.targetThread.lastSnoozeWakeAt);
     assert.isNull(result.targetThread.snoozedAt);
     assert.equal(result.targetThread.projectId, sourceThread.projectId);
     assert.equal(result.targetThread.providerInstanceId, sourceThread.providerInstanceId);

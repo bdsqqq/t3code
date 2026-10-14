@@ -6,6 +6,7 @@ import {
   RunAttemptId,
   MessageId,
   EventId,
+  CommandId,
   TurnItemId,
   type OrchestrationV2Run,
   type OrchestrationV2AppThread,
@@ -97,6 +98,9 @@ it("keeps a subagent child awake when its parent thread is snoozed", () => {
 
   assert.isNull(childThread.snoozedUntil);
   assert.isNull(childThread.snoozedAt);
+  assert.isNull(childThread.snoozeCondition);
+  assert.isNull(childThread.snoozeCommandId);
+  assert.isNull(childThread.lastSnoozeWakeAt);
   assert.equal(childThread.projectId, parentThread.projectId);
   assert.equal(childThread.runtimeMode, parentThread.runtimeMode);
   assert.equal(childThread.interactionMode, parentThread.interactionMode);
@@ -115,6 +119,30 @@ it("keeps a subagent child awake when its parent thread is snoozed", () => {
     type: "node",
     nodeId: parentNodeId,
   });
+});
+
+it("does not inherit a parent's dependency snooze or wake notification", () => {
+  const child = makeSubagentChildThread({
+    parentThread: {
+      ...makeParentThread(),
+      snoozedUntil: null,
+      snoozeCondition: { type: "thread-settled", threadId: ThreadId.make("dependency") },
+      snoozeCommandId: CommandId.make("parent-snooze"),
+      lastSnoozeWakeAt: snoozedAt,
+    },
+    childThreadId,
+    parentNodeId: NodeId.make("parent-node"),
+    activeProviderThreadId: ProviderThreadId.make("child-provider-thread"),
+    providerInstanceId: childProviderInstanceId,
+    modelSelection: childModelSelection,
+    title: "Awake child",
+    now: childCreatedAt,
+    createdBy: "agent",
+    creationSource: "provider",
+  });
+  assert.isNull(child.snoozeCondition);
+  assert.isNull(child.snoozeCommandId);
+  assert.isNull(child.lastSnoozeWakeAt);
 });
 
 it("attributes native subagent prompts to their parent thread", () => {

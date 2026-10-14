@@ -2308,6 +2308,47 @@ describe("orchestrator MCP toolkit", () => {
               reason: "user",
             });
 
+            const condition = {
+              type: "pull-request-merged",
+              host: "github.com",
+              repository: "another/repository",
+              number: 42,
+            } as const;
+            const conditionalCall = yield* invoke("t3_thread_organize", {
+              action: "snooze",
+              threadId: emptyThread.threadId,
+              condition,
+              clientRequestId: "conditional-snooze",
+            });
+            expect(conditionalCall.isError).not.toBe(true);
+            const conditionalReadCall = yield* invoke("t3_thread_read", {
+              threadId: emptyThread.threadId,
+            });
+            const conditionalRead = yield* decodeThreadReadResult(
+              conditionalReadCall.structuredContent,
+            ).pipe(Effect.orDie);
+            expect(conditionalRead.thread).toMatchObject({
+              snoozed: true,
+              snoozedUntil: null,
+              snoozeCondition: condition,
+            });
+            const conditionalListCall = yield* invoke("t3_thread_list", {
+              snoozed: true,
+              limit: 100,
+            });
+            const conditionalList = yield* decodeThreadListResult(
+              conditionalListCall.structuredContent,
+            ).pipe(Effect.orDie);
+            expect(
+              conditionalList.threads.find((thread) => thread.threadId === emptyThread.threadId),
+            ).toMatchObject({ snoozed: true, snoozedUntil: null, snoozeCondition: condition });
+            const wakeCall = yield* invoke("t3_thread_organize", {
+              action: "unsnooze",
+              threadId: emptyThread.threadId,
+              clientRequestId: "conditional-unsnooze",
+            });
+            expect(wakeCall.isError).not.toBe(true);
+
             const unlinkedCall = yield* invoke("t3_thread_update", {
               threadId: emptyThread.threadId,
               action: "unlink_pull_request",

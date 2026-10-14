@@ -95,7 +95,11 @@ import {
 } from "@t3tools/client-runtime/errors";
 import { readPastedComposerContext } from "./composerInlineTokenPaste";
 import { isPasteAsTextShortcut } from "@t3tools/client-runtime/text-paste";
-import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  effectiveSnoozed,
+  threadWokeAt,
+  snoozeConditionLabel,
+} from "@t3tools/client-runtime/state/thread-settled";
 import { childThreadInputsTitle } from "@t3tools/client-runtime/state/threads";
 import { useAcknowledgeThreadWoke, useThreadActions } from "../hooks/useThreadActions";
 import {
@@ -2369,6 +2373,17 @@ export default function ChatView(props: ChatViewProps) {
     widthStorageKey: `t3code:preview-panel-width:${activeThreadKey}`,
   });
   const activeThreadShell = useThreadShell(isServerThread ? activeThreadRef : null);
+  const snoozeDependencyRef = useMemo(
+    () =>
+      activeThreadShell?.snoozeCondition?.type === "thread-settled"
+        ? scopeThreadRef(
+            activeThreadShell.environmentId,
+            activeThreadShell.snoozeCondition.threadId,
+          )
+        : null,
+    [activeThreadShell?.environmentId, activeThreadShell?.snoozeCondition],
+  );
+  const snoozeDependency = useThreadShell(snoozeDependencyRef);
   const timelineThreadError =
     serverRuntime?.status === "failed" &&
     serverRuntime.lastErrorClass === "usage_limit" &&
@@ -7514,9 +7529,11 @@ export default function ChatView(props: ChatViewProps) {
       <ThreadStatusLine
         icon={<AlarmClockIcon />}
         label={
-          activeThreadShell?.snoozedUntil
-            ? `Snoozed, ${formatRelativeTimeUntilLabel(activeThreadShell.snoozedUntil)}`
-            : "Snoozed"
+          activeThreadShell?.snoozeCondition
+            ? `Snoozed · ${snoozeConditionLabel(activeThreadShell.snoozeCondition, snoozeDependency?.title)}`
+            : activeThreadShell?.snoozedUntil
+              ? `Snoozed, ${formatRelativeTimeUntilLabel(activeThreadShell.snoozedUntil)}`
+              : "Snoozed"
         }
         actionLabel={isUnsnoozing ? "Waking..." : "Wake now"}
         actionDisabled={!canOperateThread || isUnsnoozing}
@@ -7547,6 +7564,8 @@ export default function ChatView(props: ChatViewProps) {
     activeThreadSettled,
     activeThreadShell?.settledAt,
     activeThreadShell?.snoozedUntil,
+    activeThreadShell?.snoozeCondition,
+    snoozeDependency?.title,
     activeThreadSnoozed,
     activeThreadWokeVisible,
     canOperateThread,

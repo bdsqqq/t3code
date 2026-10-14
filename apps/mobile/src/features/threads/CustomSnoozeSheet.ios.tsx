@@ -35,6 +35,7 @@ import { useMobileNavigationTheme } from "../../lib/useMobileNavigationTheme";
 import { NativeHeaderToolbar } from "../../native/StackHeader";
 import { NATIVE_LIQUID_GLASS_SUPPORTED } from "../../native/native-glass";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
+import { CustomSnoozeSheet as SharedCustomSnoozeSheet } from "./CustomSnoozeSheet.shared";
 
 const durationAmounts = Array.from({ length: 99 }, (_, index) => index + 1);
 const SnoozeStack = createNativeStackNavigator<{ CustomSnooze: undefined }>();
@@ -48,10 +49,17 @@ const units = [
   { value: "days", label: "Days" },
 ] as const;
 
-export function CustomSnoozeSheet(props: {
-  readonly onClose: () => void;
-  readonly onSnooze: (snoozedUntil: string) => void;
-}) {
+type Props = Parameters<typeof SharedCustomSnoozeSheet>[0];
+
+export function CustomSnoozeSheet(props: Props) {
+  return props.conditionalSnoozeSupported && props.initialMode ? (
+    <SharedCustomSnoozeSheet {...props} />
+  ) : (
+    <TimeSnoozeSheet {...props} />
+  );
+}
+
+function TimeSnoozeSheet(props: Props) {
   const { width, height } = useWindowDimensions();
   const [mode, setMode] = useState<CustomSnoozeInput["mode"]>("date");
   const [date, setDate] = useState(() => new Date(Date.now() + 3_600_000));
@@ -78,7 +86,7 @@ export function CustomSnoozeSheet(props: {
       );
       return;
     }
-    props.onSnooze(snoozedUntil);
+    props.onSnooze({ snoozedUntil });
     props.onClose();
   };
 

@@ -1,4 +1,4 @@
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type ThreadSnoozeCondition } from "@t3tools/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { useThreadActions } from "./useThreadActions";
@@ -43,6 +43,7 @@ const threadShell = vi.hoisted(() => ({
   pinOrderKey: "a0",
   pinnedAt: null as string | null,
   snoozedUntil: null as string | null,
+  snoozeCondition: null as ThreadSnoozeCondition | null,
   projectId: "project",
   environmentId: "undo-env",
   session: null,
@@ -99,6 +100,7 @@ beforeEach(() => {
   router.state.matches[0]!.params = {};
   threadShell.pinnedAt = null;
   threadShell.snoozedUntil = null;
+  threadShell.snoozeCondition = null;
 });
 afterEach(() => {
   vi.runAllTimers();
@@ -199,6 +201,17 @@ describe("settle and snooze Undo", () => {
     });
   });
 
+  it("restores the dependency, not a made-up timer, when undoing settlement", async () => {
+    const condition = { type: "thread-settled", threadId: ThreadId.make("dependency") } as const;
+    threadShell.snoozeCondition = condition;
+    await useThreadActions().settleThread(target);
+    await currentUndo()();
+    expect(commands.snooze).toHaveBeenCalledExactlyOnceWith({
+      environmentId: target.environmentId,
+      input: { threadId: target.threadId, condition },
+    });
+  });
+
   it("expires an older unpin Undo when the thread is settled", async () => {
     const actions = useThreadActions();
     await actions.unpinThread(target);
@@ -211,7 +224,9 @@ describe("settle and snooze Undo", () => {
   it("wakes the thread from the snooze notice", async () => {
     const add = vi.spyOn(toastManager, "add").mockReturnValue("toast");
     const actions = useThreadActions();
-    await actions.snoozeThread(target, new Date(Date.now() + 60_000).toISOString());
+    await actions.snoozeThread(target, {
+      snoozedUntil: new Date(Date.now() + 60_000).toISOString(),
+    });
     expect(useThreadUndoNotice.getState().notice).toMatchObject({ action: "Snoozed", count: 1 });
     expect(add).not.toHaveBeenCalled();
     await currentUndo()();

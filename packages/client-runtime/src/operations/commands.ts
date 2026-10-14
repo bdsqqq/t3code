@@ -34,6 +34,7 @@ import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 
 import { getInitialServerConfig, request } from "../rpc/client.ts";
+import type { SnoozeChoice } from "../state/threadSettled.ts";
 
 interface CommandMetadata {
   readonly commandId?: CommandId;
@@ -107,9 +108,7 @@ export interface ReorderActiveThreadInput extends ThreadCommandInput {
   readonly orderKey: string;
 }
 
-export interface SnoozeThreadInput extends ThreadCommandInput {
-  readonly snoozedUntil: string;
-}
+export type SnoozeThreadInput = ThreadCommandInput & SnoozeChoice;
 
 export interface UnsnoozeThreadInput extends ThreadCommandInput {
   readonly reason: "user";
@@ -526,6 +525,7 @@ export const snoozeThread = Effect.fn("EnvironmentCommands.snoozeThread")(functi
     commandId: yield* allocateCommandId(input),
     threadId: input.threadId,
     snoozedUntil: input.snoozedUntil,
+    condition: input.condition,
   });
 });
 
