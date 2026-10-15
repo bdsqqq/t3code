@@ -2767,6 +2767,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
 
     const now = yield* DateTime.now;
     if (command.type === "thread.metadata.update" && command.limitRecovery != null) {
+      // The worker's limit-arm namespace identifies automatic configuration.
+      // A user condition snoozed after its snapshot takes precedence; explicit
+      // recovery controls use their own command IDs and may replace it.
+      if (command.commandId.startsWith("limit-arm:") && thread.snoozeCondition != null) {
+        yield* emit(
+          events,
+          command,
+        )({
+          type: "thread.metadata-updated",
+          threadId: command.threadId,
+          occurredAt: now,
+          payload: thread,
+        });
+        return;
+      }
       const projection = yield* loadProjectionForCommand(
         command,
         ["runs", "runtimeRequests", "turnItems"],
@@ -3065,7 +3080,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             ...thread,
             ...(command.title === undefined ? {} : { title: command.title }),
             ...(command.limitRecovery === undefined ? {} : { limitRecovery }),
-            ...(command.limitRecovery === undefined
+            // Recovery controls do not wake an unrelated condition snooze.
+            // Only explicitly snoozing until the reset replaces that condition.
+            ...(command.limitRecovery?.snooze !== true
               ? {}
               : {
                   snoozeCondition: null,
@@ -4708,6 +4725,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           !isRestartContinuationSource(source, projection.providerTurns) ||
           projection.thread.archivedAt !== null ||
           projection.thread.deletedAt !== null ||
+          // A condition snooze may commit after continuation preparation reads
+          // its snapshot; automatic dispatch must respect the live condition.
+          projection.thread.snoozeCondition != null ||
           projection.thread.providerInstanceId !== source.providerInstanceId ||
           // Held queued runs never started; they wait behind the continuation.
           projection.runs.some(

@@ -2373,15 +2373,14 @@ export default function ChatView(props: ChatViewProps) {
     widthStorageKey: `t3code:preview-panel-width:${activeThreadKey}`,
   });
   const activeThreadShell = useThreadShell(isServerThread ? activeThreadRef : null);
+  const snoozeCondition = activeThreadShell?.snoozeCondition;
+  const snoozeEnvironmentId = activeThreadShell?.environmentId;
   const snoozeDependencyRef = useMemo(
     () =>
-      activeThreadShell?.snoozeCondition?.type === "thread-settled"
-        ? scopeThreadRef(
-            activeThreadShell.environmentId,
-            activeThreadShell.snoozeCondition.threadId,
-          )
+      snoozeEnvironmentId !== undefined && snoozeCondition?.type === "thread-settled"
+        ? scopeThreadRef(snoozeEnvironmentId, snoozeCondition.threadId)
         : null,
-    [activeThreadShell?.environmentId, activeThreadShell?.snoozeCondition],
+    [snoozeEnvironmentId, snoozeCondition],
   );
   const snoozeDependency = useThreadShell(snoozeDependencyRef);
   const timelineThreadError =

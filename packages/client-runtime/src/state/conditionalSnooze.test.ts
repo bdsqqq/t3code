@@ -63,6 +63,26 @@ describe("conditional snooze", () => {
     expect(threadWokeAt(completed, { now })).toBe(now);
   });
 
+  it("does not mistake recovery metadata for a fresh failure", () => {
+    const failed = {
+      ...shell,
+      runtime: { status: "failed", updatedAt: now },
+      latestRun: { status: "failed", completedAt: "2026-10-14T09:00:00.000Z" },
+    };
+    expect(effectiveSnoozed(failed, { now })).toBe(true);
+    expect(threadWokeAt(failed, { now })).toBeNull();
+  });
+
+  it("timestamps a new failure wake at the run failure, not a later metadata update", () => {
+    const failed = {
+      ...shell,
+      runtime: { status: "failed", updatedAt: "2026-10-14T12:30:00.000Z" },
+      latestRun: { status: "failed", completedAt: now },
+    };
+    expect(effectiveSnoozed(failed, { now })).toBe(false);
+    expect(threadWokeAt(failed, { now })).toBe(now);
+  });
+
   it("resolves a selected thread and rejects an empty selection", () => {
     expect(resolveConditionalSnooze({ mode: "thread", threadId: " dependency " })).toEqual(
       condition,

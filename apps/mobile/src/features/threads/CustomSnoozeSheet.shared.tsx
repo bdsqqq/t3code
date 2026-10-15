@@ -125,6 +125,8 @@ export function CustomSnoozeSheet(props: {
                       );
                     else next.setHours(selected.getHours(), selected.getMinutes(), 0, 0);
                     setDate(next);
+                    // Android confirms a dialog; iOS keeps its inline spinner mounted.
+                    if (Platform.OS === "android") setPicker(null);
                     setError(null);
                   }}
                 />

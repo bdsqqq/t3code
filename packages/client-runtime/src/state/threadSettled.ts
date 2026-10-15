@@ -112,14 +112,17 @@ export function threadRaisedHandWhileSnoozed(shell: ThreadSnoozeShell): boolean 
   if (shell.pendingSubagentRequest != null) return true;
   const runtime = shell.runtime ?? shell.session ?? null;
   const latestRun = shell.latestRun ?? shell.latestTurn ?? null;
-  // Only a FRESH failure raises the hand: a thread snoozed while already
-  // failed stays snoozed — that snooze was the user saying "I saw it, not
-  // now". session.updatedAt stamps the status edge, so an error newer than
-  // the snooze is new information.
+  // A failure the user already saw stays acknowledged. Recovery controls also
+  // update runtime.updatedAt, so conditional waits use the run's failure time;
+  // timed/legacy snoozes retain the session status edge.
+  const failureAt =
+    shell.snoozeCondition != null
+      ? (latestRun?.completedAt ?? runtime?.updatedAt)
+      : runtime?.updatedAt;
   if (
     (runtime?.status === "error" || runtime?.status === "failed") &&
     (shell.snoozedAt == null ||
-      (runtime.updatedAt != null && Date.parse(runtime.updatedAt) > Date.parse(shell.snoozedAt)))
+      (failureAt != null && Date.parse(failureAt) > Date.parse(shell.snoozedAt)))
   ) {
     return true;
   }
@@ -212,8 +215,11 @@ export function threadWokeAt(
     const runtime = shell.runtime ?? shell.session ?? null;
     if (
       shell.snoozedAt != null &&
-      (latestRun?.state === "completed" || latestRun?.status === "completed") &&
-      latestRun.completedAt != null &&
+      (latestRun?.state === "completed" ||
+        latestRun?.status === "completed" ||
+        (shell.snoozeCondition != null &&
+          (runtime?.status === "error" || runtime?.status === "failed"))) &&
+      latestRun?.completedAt != null &&
       Date.parse(latestRun.completedAt) > Date.parse(shell.snoozedAt)
     ) {
       return latestRun.completedAt;

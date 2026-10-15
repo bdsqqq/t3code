@@ -3157,18 +3157,18 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
-  it.effect(
-    "admits restart continuations once and rejects a stale continuation behind newer work",
-    () =>
+  it.effect.each(["awake", "condition-snoozed"] as const)(
+    "guards restart continuations against stale dispatch on a %s thread",
+    (scenario) =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const eventSink = yield* EventSink.EventSinkV2;
-        const threadId = ThreadId.make("runtime-layer-restart-continuation");
+        const threadId = ThreadId.make(`runtime-layer-restart-continuation:${scenario}`);
         yield* orchestrator.dispatch({
           type: "thread.create",
           createdBy: "user",
           creationSource: "web",
-          commandId: CommandId.make("restart-create"),
+          commandId: CommandId.make(`restart-create:${scenario}`),
           threadId,
           projectId: ProjectId.make("restart-project"),
           title: "Restart",
@@ -3182,9 +3182,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           type: "message.dispatch",
           createdBy: "user",
           creationSource: "web",
-          commandId: CommandId.make("restart-user-message"),
+          commandId: CommandId.make(`restart-user-message:${scenario}`),
           threadId,
-          messageId: MessageId.make("restart-user-message"),
+          messageId: MessageId.make(`restart-user-message:${scenario}`),
           text: "Original work",
           attachments: [],
           modelSelection,
@@ -3193,13 +3193,13 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         const original = (yield* orchestrator.getThreadProjection(threadId)).runs[0]!;
         const now = yield* DateTime.now;
         yield* eventSink.commitCommand({
-          commandId: CommandId.make("restart-cancel"),
+          commandId: CommandId.make(`restart-cancel:${scenario}`),
           threadId,
           commandType: "provider-runtime.reconcile",
           acceptedAt: now,
           events: [
             {
-              id: EventId.make("restart-cancel-event"),
+              id: EventId.make(`restart-cancel-event:${scenario}`),
               type: "run.updated",
               threadId,
               runId: original.id,
@@ -3213,9 +3213,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           type: "message.dispatch" as const,
           createdBy: "agent" as const,
           creationSource: "server" as const,
-          commandId: CommandId.make("restart-automatic-message"),
+          commandId: CommandId.make(`restart-automatic-message:${scenario}`),
           threadId,
-          messageId: MessageId.make("restart-automatic-message"),
+          messageId: MessageId.make(`restart-automatic-message:${scenario}`),
           text: "Continue where you left off.",
           notification: {
             source: { kind: "system" as const },
@@ -3228,6 +3228,44 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           dispatchMode: { type: "start_immediately" as const },
           restartContinuationOfRunId: original.id,
         };
+        if (scenario === "condition-snoozed") {
+          // The continuation was prepared while awake; snoozing commits before
+          // its final dispatch, after the snapshot guard has already run.
+          yield* orchestrator.dispatch({
+            type: "thread.snooze",
+            commandId: CommandId.make("restart-raced-condition"),
+            threadId,
+            condition: {
+              type: "pull-request-merged",
+              host: "github.com",
+              repository: "any/repo",
+              number: 1,
+            },
+          });
+          const before = yield* orchestrator.getThreadProjection(threadId);
+          yield* orchestrator.dispatch(command);
+          yield* orchestrator.dispatch(command);
+          const after = yield* orchestrator.getThreadProjection(threadId);
+          assert.deepEqual(after.thread, before.thread);
+          assert.deepEqual(after.runs, before.runs);
+          assert.deepEqual(after.messages, before.messages);
+          const outbox = yield* EffectOutbox.EffectOutboxV2;
+          assert.isEmpty(yield* outbox.listByCommandId(command.commandId));
+          // A user submission still deliberately wakes the thread.
+          yield* orchestrator.dispatch({
+            ...command,
+            commandId: CommandId.make("restart-manual-wake"),
+            messageId: MessageId.make("restart-manual-wake"),
+            restartContinuationOfRunId: undefined,
+            notification: undefined,
+            createdBy: "user",
+            creationSource: "web",
+          });
+          const resumed = yield* orchestrator.getThreadProjection(threadId);
+          assert.isNull(resumed.thread.snoozeCondition);
+          assert.lengthOf(resumed.runs, 2);
+          return;
+        }
         yield* orchestrator.dispatch(command);
         yield* orchestrator.dispatch(command);
         const admitted = yield* orchestrator.getThreadProjection(threadId);
@@ -3247,12 +3285,14 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         // A differently identified stale delivery still must not create another run.
         yield* orchestrator.dispatch({
           ...command,
-          commandId: CommandId.make("restart-stale-race"),
-          messageId: MessageId.make("restart-stale-race"),
+          commandId: CommandId.make(`restart-stale-race:${scenario}`),
+          messageId: MessageId.make(`restart-stale-race:${scenario}`),
         });
         const raced = yield* orchestrator.getThreadProjection(threadId);
         assert.lengthOf(raced.runs, 2);
-        assert.isFalse(raced.messages.some((message) => message.id === "restart-stale-race"));
+        assert.isFalse(
+          raced.messages.some((message) => message.id === `restart-stale-race:${scenario}`),
+        );
       }),
   );
 
@@ -5460,6 +5500,14 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
     "replacement",
     "manual-snooze",
     "manual-snooze-after-recovery",
+    "condition-cancel-resume",
+    "condition-enable-resume",
+    "condition-clear-recovery",
+    "condition-disable-recovery-snooze",
+    "condition-recovery-snooze",
+    "condition-automatic-arm",
+    "condition-automatic-arm-snooze",
+    "condition-automatic-arm-snooze-only",
     "invalid-snooze",
     "snooze-only",
     "snooze-resume",
@@ -5621,10 +5669,40 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
         "wake",
         "cancel-resume-keep-snooze",
         "wake-preserve-resume",
+        "condition-automatic-arm-snooze",
+        "condition-automatic-arm-snooze-only",
       ].includes(scenario);
-      const autoResume = scenario !== "snooze-only" && scenario !== "wake";
+      const autoResume =
+        scenario !== "snooze-only" &&
+        scenario !== "wake" &&
+        scenario !== "condition-automatic-arm-snooze-only";
       const arm = limitRecoveryCommand(shell, autoResume, DateTime.toEpochMillis(now), snooze);
       assert.isNotNull(arm);
+      if (scenario.startsWith("condition-automatic-arm")) {
+        // The worker has built its command from an awake snapshot, but the
+        // user's condition snooze reaches the serialized dispatch first.
+        yield* orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`recovery:raced-condition:${scenario}`),
+          threadId,
+          condition: {
+            type: "pull-request-merged",
+            host: "github.com",
+            repository: "any/repo",
+            number: 1,
+          },
+        });
+        const before = yield* orchestrator.getThreadProjection(threadId);
+        yield* orchestrator.dispatch(arm!);
+        yield* orchestrator.dispatch(arm!);
+        const after = yield* orchestrator.getThreadProjection(threadId);
+        assert.deepEqual(after.thread, before.thread);
+        assert.deepEqual(after.runs, before.runs);
+        assert.deepEqual(after.messages, before.messages);
+        const outbox = yield* EffectOutbox.EffectOutboxV2;
+        assert.isEmpty(yield* outbox.listByCommandId(arm!.commandId));
+        return;
+      }
       yield* orchestrator.dispatch(arm!);
       let armedShell = (yield* orchestrator.getShellSnapshot()).threads.find(
         (thread) => thread.id === threadId,
@@ -5638,6 +5716,61 @@ it.layer(layerTest)("usage-limit recovery", (it) => {
       });
       if (snooze)
         assert.equal(DateTime.toEpochMillis(armedShell.snoozedUntil!), Date.parse(resetAt));
+      if (scenario.startsWith("condition-")) {
+        const condition = {
+          type: "pull-request-merged" as const,
+          host: "github.com",
+          repository: "any/repo",
+          number: 1,
+        };
+        yield* orchestrator.dispatch({
+          type: "thread.snooze",
+          commandId: CommandId.make(`recovery:condition:${scenario}`),
+          threadId,
+          condition,
+        });
+        const before = (yield* orchestrator.getThreadProjection(threadId)).thread;
+        assert.isTrue(before.limitRecovery!.autoResume);
+        assert.isFalse(before.limitRecovery!.snooze);
+        yield* TestClock.adjust("10 seconds");
+        yield* orchestrator.dispatch({
+          type: "thread.metadata.update",
+          commandId: CommandId.make(`recovery:condition-patch:${scenario}`),
+          threadId,
+          limitRecovery:
+            scenario === "condition-clear-recovery"
+              ? null
+              : {
+                  runId: run.id,
+                  resetAt,
+                  ...(scenario === "condition-recovery-snooze"
+                    ? { snooze: true }
+                    : scenario === "condition-disable-recovery-snooze"
+                      ? { snooze: false }
+                      : { autoResume: scenario === "condition-enable-resume" }),
+                },
+        });
+        const after = (yield* orchestrator.getThreadProjection(threadId)).thread;
+        if (scenario === "condition-recovery-snooze") {
+          assert.isNull(after.snoozeCondition);
+          assert.isNull(after.snoozeCommandId);
+          assert.equal(DateTime.toEpochMillis(after.snoozedUntil!), Date.parse(resetAt));
+          assert.isTrue(after.limitRecovery!.autoResume);
+          assert.isTrue(after.limitRecovery!.snooze);
+        } else {
+          assert.deepEqual(after.snoozeCondition, condition);
+          assert.equal(after.snoozeCommandId, before.snoozeCommandId);
+          assert.deepEqual(after.snoozedAt, before.snoozedAt);
+          assert.deepEqual(after.lastSnoozeWakeAt, before.lastSnoozeWakeAt);
+          assert.isNull(after.snoozedUntil);
+          if (scenario === "condition-clear-recovery") assert.isNull(after.limitRecovery);
+          else {
+            assert.equal(after.limitRecovery!.autoResume, scenario !== "condition-cancel-resume");
+            assert.isFalse(after.limitRecovery!.snooze);
+          }
+        }
+        return;
+      }
       if (scenario === "cancel-resume-keep-snooze" || scenario === "wake-preserve-resume") {
         yield* TestClock.adjust("10 seconds");
         yield* orchestrator.dispatch({

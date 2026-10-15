@@ -1869,12 +1869,16 @@ const SidebarThreadRow = memo(function SidebarThreadRow(props: {
                   {variantAction === "unsnooze" && props.snoozeWakeLabelText !== null ? (
                     // Snoozed rows show when they come BACK, not when they were
                     // last touched — the return ticket is the row's whole story.
-                    <span
-                      className="max-w-28 truncate text-xs text-info-foreground tabular-nums"
-                      title={props.snoozeWakeLabelText}
-                    >
-                      {props.snoozeWakeLabelText}
-                    </span>
+                    <Tooltip>
+                      <TooltipTrigger
+                        render={
+                          <span className="max-w-28 truncate text-xs text-info-foreground tabular-nums" />
+                        }
+                      >
+                        {props.snoozeWakeLabelText}
+                      </TooltipTrigger>
+                      <TooltipPopup>{props.snoozeWakeLabelText}</TooltipPopup>
+                    </Tooltip>
                   ) : isWoke ? (
                     // A wake can land straight in the settled tail (e.g. PR
                     // merged while snoozed); the signal must survive the trip.
