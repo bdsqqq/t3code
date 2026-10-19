@@ -79,7 +79,7 @@
     "@t3tools/shared": "workspace:*",
     "@tabler/icons-react-native": "^3.44.0",
     "clsx": "^2.1.1",
-    "diff": "8.0.3",
+    "diff": "9.0.0",
     "effect": "catalog:",
     "expo": "58.0.2",
     "expo-asset": "~58.0.10",
