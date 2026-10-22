@@ -58,6 +58,8 @@ export interface Layout {
 
 export interface WorkspacePaneLayout {
   readonly primarySidebarVisible: boolean;
+  /** Whether the sidebar shows once a collapsed split expands; independent of the current width. */
+  readonly primarySidebarWhenExpanded: boolean;
   readonly primarySidebarSuppressedByAuxiliary: boolean;
   readonly contentPaneWidth: number;
   readonly supportsAuxiliaryPane: boolean;
@@ -139,18 +141,26 @@ export interface VerticalHinge {
   readonly width: number;
 }
 
-/** Moves the list/detail split onto a book-posture hinge so neither pane straddles the crease. */
+/**
+ * Moves the list/detail split onto a book-posture hinge so neither pane straddles the crease.
+ * `leadingWidth` is chrome left of the list pane, such as the Android navigation rail.
+ */
 export function alignListPaneToHinge(input: {
   readonly layout: Layout;
   readonly hinge: VerticalHinge | null;
   readonly viewportWidth: number;
+  readonly leadingWidth: number;
 }): Layout {
   const { layout, hinge } = input;
   if (!hinge || !layout.usesSplitView) return layout;
-  if (hinge.x < SPLIT_SIDEBAR_MIN_WIDTH || input.viewportWidth - hinge.x - hinge.width < 320) {
+  const listPaneWidth = hinge.x - input.leadingWidth;
+  if (
+    listPaneWidth < SPLIT_SIDEBAR_MIN_WIDTH ||
+    input.viewportWidth - hinge.x - hinge.width < 320
+  ) {
     return layout;
   }
-  return { ...layout, listPaneWidth: hinge.x, listPaneGap: hinge.width };
+  return { ...layout, listPaneWidth, listPaneGap: hinge.width };
 }
 
 /**
@@ -207,6 +217,7 @@ export function deriveWorkspacePaneLayout(input: {
 
     return {
       primarySidebarVisible,
+      primarySidebarWhenExpanded: input.primarySidebarPreferredVisible,
       primarySidebarSuppressedByAuxiliary,
       contentPaneWidth: Math.max(0, viewportWidth - primarySidebarWidth),
       supportsAuxiliaryPane: fileInspector.supported,
@@ -227,6 +238,7 @@ export function deriveWorkspacePaneLayout(input: {
 
   return {
     primarySidebarVisible: preferredPrimarySidebarVisible,
+    primarySidebarWhenExpanded: input.primarySidebarPreferredVisible,
     primarySidebarSuppressedByAuxiliary: false,
     contentPaneWidth,
     supportsAuxiliaryPane,

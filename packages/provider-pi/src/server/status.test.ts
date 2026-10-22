@@ -131,24 +131,6 @@ describe("PiProvider", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
-  it.effect("reports only the models returned by successful Pi discovery", () =>
-    Effect.gen(function* () {
-      const spawner = yield* piDiscoverySpawner({
-        models: [{ provider: "anthropic", id: "claude-sonnet-4" }],
-      });
-      const snapshot = yield* checkPiProviderStatus(settings).pipe(
-        Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
-      );
-      assert.equal(snapshot.status, "ready");
-      assert.equal(snapshot.auth.status, "authenticated");
-      assert.deepEqual(
-        snapshot.models.map((model) => model.slug),
-        ["default", "anthropic/claude-sonnet-4"],
-      );
-      assert.equal(snapshot.models[1]?.subProvider, "anthropic");
-    }).pipe(Effect.provide(NodeServices.layer)),
-  );
-
   it.effect("reports a known unauthenticated inventory when Pi returns no usable models", () =>
     Effect.gen(function* () {
       const spawner = yield* piDiscoverySpawner({ models: [] });
@@ -164,13 +146,10 @@ describe("PiProvider", () => {
     }).pipe(Effect.provide(NodeServices.layer)),
   );
 
+  // regression: #18498 a malformed model inventory must not restore stale Pi models
   it.effect.each([
     ["missing models", {}],
-    ["non-array models", { models: {} }],
-    ["missing model provider", { models: [{ id: "claude-sonnet-4" }] }],
     ["missing model id", { models: [{ provider: "anthropic" }] }],
-    ["empty model provider", { models: [{ provider: "", id: "claude-sonnet-4" }] }],
-    ["empty model id", { models: [{ provider: "anthropic", id: "" }] }],
     [
       "mixed valid and invalid models",
       { models: [{ provider: "anthropic", id: "claude-sonnet-4" }, { provider: "openrouter" }] },

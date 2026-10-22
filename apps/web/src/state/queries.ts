@@ -211,7 +211,7 @@ type ProjectPathSearchTarget = ComposerPathSearchTarget & {
   readonly imageOnly?: boolean | undefined;
 };
 
-export function areProjectPathSearchTargetsEqual(
+function areProjectPathSearchTargetsEqual(
   left: ProjectPathSearchTarget,
   right: ProjectPathSearchTarget,
 ): boolean {
@@ -272,6 +272,7 @@ export function useProjectPathSearch(
     isPending:
       !areProjectPathSearchTargetsEqual(normalizedTarget, debouncedTarget) ||
       (hasTarget && (fileAccess.isPending || result.isPending)),
+    searchedTarget: debouncedTarget,
     searchedQuery: debouncedTarget.query ?? "",
     truncated: result.data?.truncated ?? false,
     refresh: result.refresh,

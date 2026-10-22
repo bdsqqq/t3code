@@ -41,6 +41,7 @@ const reads = new Set<string>([
   WS_METHODS.pullRequestsThreadComments,
   WS_METHODS.pullRequestsDiffFileContents,
   WS_METHODS.pullRequestsFilesViewed,
+  WS_METHODS.pullRequestsChangeBreakdown,
   WS_METHODS.pullRequestsReviewerCandidates,
   WS_METHODS.pullRequestsLabelCandidates,
 ]);
@@ -60,7 +61,9 @@ const writes = new Set<string>([
   WS_METHODS.pullRequestsSetLabels,
 ]);
 const isRef = Schema.is(PullRequestRef);
-const hasState = Schema.is(Schema.Struct({ state: PullRequestState }));
+const hasState = Schema.is(
+  Schema.Struct({ state: PullRequestState, isDraft: Schema.optional(Schema.Boolean) }),
+);
 const isInvalidation = Schema.is(PullRequestInvalidateInput);
 const readTimeout = (environmentId: EnvironmentId) =>
   Effect.timeoutOrElse({
@@ -161,7 +164,13 @@ const routingAllowed = Effect.fn("PullRequestRouting.allowed")(function* (
   const entries = yield* SubscriptionRef.get(registry.entries);
   const origin = entries.get(originId);
   const destination = entries.get(destinationId);
-  if (!origin?.enabled || !destination?.enabled) return false;
+  if (
+    !origin?.enabled ||
+    !destination?.enabled ||
+    origin.unsupportedReason !== undefined ||
+    destination.unsupportedReason !== undefined
+  )
+    return false;
   const permissions = yield* GitHubRoutingPermissions;
   const source = yield* permissions.get(origin);
   const target = yield* permissions.get(destination);
@@ -202,7 +211,7 @@ const invalidateTarget = Effect.fn("PullRequestRouting.invalidateTarget")(functi
     inputs,
     (input) =>
       registry.run(target, request(WS_METHODS.pullRequestsInvalidate, input)).pipe(
-        // GitHub already accepted the write. A stalled reader must not delay its confirmation.
+        // A stalled reader must not delay the write's answer.
         Effect.timeoutOption("1 second"),
         Effect.orElseSucceed(() => undefined),
       ),
@@ -216,14 +225,13 @@ const invalidateTarget = Effect.fn("PullRequestRouting.invalidateTarget")(functi
  */
 const reportState = (
   { allowStale: _allowStale, expectedAccountId: _expectedAccountId, ...reference }: PullRequestRef,
-  state: PullRequestState,
+  status: { readonly state: PullRequestState; readonly isDraft?: boolean | undefined },
 ) =>
-  request(WS_METHODS.pullRequestsReportState, { reference, state }).pipe(
-    Effect.timeoutOption("5 seconds"),
-    Effect.ignore,
-    Effect.forkDetach,
-    Effect.asVoid,
-  );
+  request(WS_METHODS.pullRequestsReportState, {
+    reference,
+    state: status.state,
+    ...(status.isDraft === undefined ? {} : { isDraft: status.isDraft }),
+  }).pipe(Effect.timeoutOption("5 seconds"), Effect.ignore, Effect.forkDetach, Effect.asVoid);
 
 /** Credentials stay on their environments. Only a verified host and account cross the wire. */
 export function createPullRequestRouter() {
@@ -272,42 +280,39 @@ export function createPullRequestRouter() {
       ref.repository.toLowerCase(),
       String(ref.number),
     ]);
-    const finish = (operation: ReturnType<typeof request<T>>) =>
-      operation.pipe(
-        Effect.tap(() => {
-          if (!writes.has(tag) || used.size === 0) return Effect.void;
-          const targets = new Map<EnvironmentId, PullRequestRef[]>([
-            [origin.target.environmentId, [ref]],
-          ]);
-          for (const entry of used.values()) {
-            if (
-              entry.origin !== origin.target.environmentId ||
-              !matchesReference(entry.reference, ref)
-            )
-              continue;
-            for (const target of [...entry.targets, origin.target.environmentId]) {
-              const refs = targets.get(target) ?? [];
-              if (!refs.some((existing) => existing.host === entry.reference.host))
-                refs.push(entry.reference);
-              targets.set(target, refs);
-            }
-          }
-          return Effect.forEach(
-            targets,
-            ([target, refs]) =>
-              invalidateTarget(registry, origin.target.environmentId, target, [
-                ...refs.map((reference) => ({
-                  reference,
-                  ...(tag === WS_METHODS.pullRequestsSetFilesViewed
-                    ? { filesViewedOnly: true }
-                    : {}),
-                })),
-                ...(tag === WS_METHODS.pullRequestsSetFilesViewed ? [] : [{}]),
-              ]),
-            { concurrency: 4, discard: true },
-          );
-        }),
+    const invalidateReaders = Effect.suspend(() => {
+      if (!writes.has(tag) || used.size === 0) return Effect.void;
+      const targets = new Map<EnvironmentId, PullRequestRef[]>([
+        [origin.target.environmentId, [ref]],
+      ]);
+      for (const entry of used.values()) {
+        if (entry.origin !== origin.target.environmentId || !matchesReference(entry.reference, ref))
+          continue;
+        for (const target of [...entry.targets, origin.target.environmentId]) {
+          const refs = targets.get(target) ?? [];
+          if (!refs.some((existing) => existing.host === entry.reference.host))
+            refs.push(entry.reference);
+          targets.set(target, refs);
+        }
+      }
+      return Effect.forEach(
+        targets,
+        ([target, refs]) =>
+          invalidateTarget(registry, origin.target.environmentId, target, [
+            ...refs.map((reference) => ({
+              reference,
+              ...(tag === WS_METHODS.pullRequestsSetFilesViewed ? { filesViewedOnly: true } : {}),
+            })),
+            ...(tag === WS_METHODS.pullRequestsSetFilesViewed ? [] : [{}]),
+          ]),
+        { concurrency: 4, discard: true },
       );
+    });
+    // A failed viewed-files batch may have applied some paths. Other writes invalidate on success.
+    const finish = (operation: ReturnType<typeof request<T>>) =>
+      tag === WS_METHODS.pullRequestsSetFilesViewed
+        ? operation.pipe(Effect.ensuring(invalidateReaders))
+        : operation.pipe(Effect.tap(() => invalidateReaders));
     const alternatives = [];
     for (const [id, entry] of entries) {
       if (id === origin.target.environmentId) continue;
@@ -374,7 +379,7 @@ export function createPullRequestRouter() {
       ).pipe(
         Effect.tap((result) =>
           id !== origin.target.environmentId && hasState(result)
-            ? reportState(ref, result.state)
+            ? reportState(ref, result)
             : Effect.void,
         ),
         Effect.tap(() =>

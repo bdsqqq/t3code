@@ -3,15 +3,18 @@ import * as NodeHttp2 from "node:http2";
 import * as NodeNet from "node:net";
 import * as NodeTls from "node:tls";
 
+import * as NodeServices from "@effect/platform-node/NodeServices";
 import { it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as Stream from "effect/Stream";
+import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import { FetchHttpClient, HttpClient } from "effect/http";
 import * as Undici from "undici";
 import { afterAll, afterEach, beforeAll, describe, expect } from "vite-plus/test";
 
 import {
   builtinFetchUsesHttp2,
-  extendConnectionAttemptTimeout,
+  ignoreMacosTypeOfServiceEinval,
   installHttp1FetchDispatcher,
 } from "./outboundHttp.ts";
 
@@ -97,16 +100,70 @@ describe("installHttp1FetchDispatcher", () => {
   );
 });
 
-describe("extendConnectionAttemptTimeout", () => {
-  it("raises a default below the floor to 1000 ms", () => {
-    NodeNet.setDefaultAutoSelectFamilyAttemptTimeout(50);
-    extendConnectionAttemptTimeout();
-    expect(NodeNet.getDefaultAutoSelectFamilyAttemptTimeout()).toBe(1_000);
+const runNode = Effect.fnUntraced(function* (args: Array<string>) {
+  const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+  const child = yield* spawner.spawn(ChildProcess.make(process.execPath, args));
+  return yield* Effect.all(
+    {
+      stdout: child.stdout.pipe(Stream.decodeText(), Stream.mkString),
+      stderr: child.stderr.pipe(Stream.decodeText(), Stream.mkString),
+      exitCode: child.exitCode.pipe(Effect.map(Number)),
+    },
+    { concurrency: "unbounded" },
+  );
+}, Effect.scoped);
+
+describe("ignoreMacosTypeOfServiceEinval", () => {
+  const errnoError = (code: string) =>
+    Object.assign(new Error(`setTypeOfService ${code}`), { code, syscall: "setTypeOfService" });
+
+  it("swallows only an Error with code EINVAL on macOS", () => {
+    let error: unknown = errnoError("EINVAL");
+    const prototype = {
+      setTypeOfService(this: NodeNet.Socket, _typeOfService: number): NodeNet.Socket {
+        throw error;
+      },
+    };
+    ignoreMacosTypeOfServiceEinval("darwin", prototype);
+
+    const socket = new NodeNet.Socket();
+    expect(prototype.setTypeOfService.call(socket, 0)).toBe(socket);
+
+    error = errnoError("EPERM");
+    expect(() => prototype.setTypeOfService.call(socket, 0)).toThrow(error);
+
+    error = { code: "EINVAL" };
+    expect(() => prototype.setTypeOfService.call(socket, 0)).toThrow();
   });
 
-  it("keeps a larger configured timeout", () => {
-    NodeNet.setDefaultAutoSelectFamilyAttemptTimeout(5_000);
-    extendConnectionAttemptTimeout();
-    expect(NodeNet.getDefaultAutoSelectFamilyAttemptTimeout()).toBe(5_000);
-  });
+  // Bundled undici 7 calls this API from a socket callback. Keep the real fetch
+  // in a child so an escaped EINVAL exits that process instead of breaking Vitest.
+  it.effect.runIf(
+    typeof (NodeNet.Socket.prototype as { setTypeOfService?: unknown }).setTypeOfService ===
+      "function" && process.versions.undici?.startsWith("7.") === true,
+  )("keeps built-in fetch working when setTypeOfService throws EINVAL", () =>
+    Effect.gen(function* () {
+      const child = yield* runNode([
+        "--input-type=module",
+        "--eval",
+        `
+import * as NodeNet from "node:net";
+import * as NodeTls from "node:tls";
+import { ignoreMacosTypeOfServiceEinval } from ${JSON.stringify(new URL("./outboundHttp.ts", import.meta.url).href)};
+
+NodeTls.setDefaultCACertificates([${JSON.stringify(TEST_CERT)}]);
+let calls = 0;
+NodeNet.Socket.prototype.setTypeOfService = () => {
+  calls++;
+  throw Object.assign(new Error("setTypeOfService EINVAL"), { code: "EINVAL" });
+};
+ignoreMacosTypeOfServiceEinval("darwin");
+console.log(await (await fetch(${JSON.stringify(origin)})).text());
+if (calls === 0) throw new Error("fetch did not call setTypeOfService");
+`,
+      ]);
+      expect(child.exitCode, child.stderr).toBe(0);
+      expect(child.stdout.trim()).toBe("1.1");
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
 });

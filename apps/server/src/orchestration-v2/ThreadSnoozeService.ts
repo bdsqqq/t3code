@@ -38,16 +38,17 @@ export const make = Effect.gen(function* () {
   const sweep = Effect.fn("ThreadSnoozeService.sweep")(function* (request: Sweep) {
     const candidates = yield* projections.getConditionalSnoozeCandidates(request.threadId);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    const wake = (thread: (typeof candidates)[number]) =>
-      Effect.gen(function* () {
-        if (thread.snoozeCommandId == null) return;
-        yield* orchestrator.dispatch({
-          type: "thread.snooze.wake",
-          commandId: CommandId.make(`server:snooze-wake:${yield* crypto.randomUUIDv4()}`),
-          threadId: thread.id,
-          expectedSnoozeCommandId: thread.snoozeCommandId,
-        });
+    const wake = Effect.fn("ThreadSnoozeService.wake")(function* (
+      thread: (typeof candidates)[number],
+    ) {
+      if (thread.snoozeCommandId == null) return;
+      yield* orchestrator.dispatch({
+        type: "thread.snooze.wake",
+        commandId: CommandId.make(`server:snooze-wake:${yield* crypto.randomUUIDv4()}`),
+        threadId: thread.id,
+        expectedSnoozeCommandId: thread.snoozeCommandId,
       });
+    });
     const prCandidates: Array<(typeof candidates)[number]> = [];
     yield* Effect.forEach(
       candidates,
@@ -153,7 +154,7 @@ export const make = Effect.gen(function* () {
           case "runtime-request.updated":
             return requestSweep({ threadId: event.threadId });
           case "run.updated":
-            return event.payload.status === "completed" || event.payload.status === "failed"
+            return event.payload.status === "failed"
               ? requestSweep({ threadId: event.threadId })
               : Effect.void;
           default:

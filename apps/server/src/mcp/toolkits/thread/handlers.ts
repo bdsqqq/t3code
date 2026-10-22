@@ -55,10 +55,7 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
 }) {
   const context = yield* readThread(input.threadId, ["runtimeRequests", "turnItems"]);
   const request = context.projection.runtimeRequests.find(
-    (request) =>
-      request.id === input.requestId &&
-      request.kind === "user_input" &&
-      request.status === "pending",
+    (request) => request.id === input.requestId && request.kind === "user_input",
   );
   const item = context.projection.turnItems.find(
     (item) => item.type === "user_input_request" && item.requestId === input.requestId,
@@ -67,6 +64,14 @@ const readQuestion = Effect.fn("mcp.readQuestion")(function* (input: {
     return yield* new OrchestratorMcpFailure({
       code: "invalid_request",
       message: "The pending user-input request was not found.",
+    });
+  if (request.status !== "pending")
+    return yield* new OrchestratorMcpFailure({
+      code: "invalid_request",
+      message:
+        request.status === "resolved"
+          ? "The user-input request was already answered."
+          : `The user-input request is no longer pending (${request.status}).`,
     });
   return { ...context, request, item };
 });
@@ -84,12 +89,12 @@ export const layer = McpToolAccess.toLayer(ThreadToolkit, {
           code: "invalid_request",
           message: "The scheduled task was not found.",
         });
-      const { task } = yield* scheduler
+      const { task, threadId } = yield* scheduler
         .runNow({ id: input.taskId })
         .pipe(Effect.mapError(unavailable));
       return {
         taskId: task.id,
-        threadId: task.threadId,
+        threadId,
         lastRunStatus: task.lastRunStatus,
         runCount: task.runCount,
         nextRunAt: task.nextRunAt,

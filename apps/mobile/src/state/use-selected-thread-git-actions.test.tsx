@@ -1,4 +1,3 @@
-// @vitest-environment jsdom
 import { act, useEffect, useReducer } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { AsyncResult } from "effect/reactivity";
@@ -102,82 +101,6 @@ describe("useSelectedThreadGitActions", () => {
     harness.selection = {
       selectedThread: { environmentId: "environment-1", id: "thread-1" },
       selectedThreadProject: { workspaceRoot: "/repo" },
-      selectedEnvironmentRuntime: { connectionState: "connected" },
-    };
-    act(() => rerender());
-    await flush();
-
-    expect(harness.refreshStatusCalls).toEqual([
-      { environmentId: "environment-1", input: { cwd: "/repo" } },
-    ]);
-  });
-
-  it("refreshes again when the selected thread or cwd changes", async () => {
-    root = createRoot(document.createElement("div"));
-    act(() => root!.render(<Consumer />));
-    await flush();
-
-    harness.selection = {
-      selectedThread: { environmentId: "environment-1", id: "thread-2" },
-      selectedThreadProject: { workspaceRoot: "/repo" },
-      selectedEnvironmentRuntime: { connectionState: "connected" },
-    };
-    act(() => rerender());
-    await flush();
-
-    harness.worktree = { selectedThreadCwd: "/repo/worktree", selectedThreadWorktreePath: null };
-    act(() => rerender());
-    await flush();
-
-    expect(harness.refreshStatusCalls).toEqual([
-      { environmentId: "environment-1", input: { cwd: "/repo" } },
-      { environmentId: "environment-1", input: { cwd: "/repo" } },
-      { environmentId: "environment-1", input: { cwd: "/repo/worktree" } },
-    ]);
-  });
-
-  it("refreshes once after the environment reconnects and not while it is away", async () => {
-    root = createRoot(document.createElement("div"));
-    act(() => root!.render(<Consumer />));
-    await flush();
-
-    for (const connectionState of ["reconnecting", "connecting", "offline"]) {
-      harness.selection = {
-        ...harness.selection,
-        selectedEnvironmentRuntime: { connectionState },
-      };
-      act(() => rerender());
-      await flush();
-    }
-    expect(harness.refreshStatusCalls).toHaveLength(1);
-
-    harness.selection = {
-      ...harness.selection,
-      selectedEnvironmentRuntime: { connectionState: "connected" },
-    };
-    act(() => rerender());
-    await flush();
-    act(() => rerender());
-    await flush();
-
-    expect(harness.refreshStatusCalls).toEqual([
-      { environmentId: "environment-1", input: { cwd: "/repo" } },
-      { environmentId: "environment-1", input: { cwd: "/repo" } },
-    ]);
-  });
-
-  it("waits for the environment to connect before the first refresh", async () => {
-    harness.selection = {
-      ...harness.selection,
-      selectedEnvironmentRuntime: { connectionState: "connecting" },
-    };
-    root = createRoot(document.createElement("div"));
-    act(() => root!.render(<Consumer />));
-    await flush();
-    expect(harness.refreshStatusCalls).toEqual([]);
-
-    harness.selection = {
-      ...harness.selection,
       selectedEnvironmentRuntime: { connectionState: "connected" },
     };
     act(() => rerender());

@@ -7,7 +7,6 @@ import * as Context from "effect/Context";
 import * as Crypto from "effect/Crypto";
 import * as Effect from "effect/Effect";
 import * as Base64Url from "effect/encoding/Base64Url";
-import * as Layer from "effect/Layer";
 import * as P from "effect/Predicate";
 import * as Redacted from "effect/Redacted";
 import * as HttpClientError from "effect/http/HttpClientError";
@@ -37,7 +36,7 @@ export class OpenCode2Server extends Context.Service<
  * OpenCode 2 always requires one and prints a generated one to stdout
  * otherwise, so T3 supplies its own and keeps it in memory.
  */
-export const generatePassword = Effect.gen(function* () {
+const generatePassword = Effect.gen(function* () {
   const crypto = yield* Crypto.Crypto;
   const bytes = yield* crypto.randomBytes(32).pipe(Effect.orDie);
   return Redacted.make(Base64Url.encode(bytes), { label: "OPENCODE_PASSWORD" });
@@ -136,12 +135,15 @@ export const make = Effect.fn("OpenCode2Server.make")(function* (input: {
   readonly environment: NodeJS.ProcessEnv;
 }) {
   const opencode = yield* OpenCode2Client.OpenCode2Client;
-  const connectTo = (url: string, password: Redacted.Redacted, external: boolean) =>
-    Effect.gen(function* () {
-      const api = yield* opencode.connect({ baseUrl: url, password });
-      const version = yield* verifyServer(api.client);
-      return { ...api, url, version, external } satisfies OpenCode2Connection;
-    });
+  const connectTo = Effect.fn("OpenCode2Server.connectTo")(function* (
+    url: string,
+    password: Redacted.Redacted,
+    external: boolean,
+  ) {
+    const api = yield* opencode.connect({ baseUrl: url, password });
+    const version = yield* verifyServer(api.client);
+    return { ...api, url, version, external } satisfies OpenCode2Connection;
+  });
   let latest: OpenCode2Connection | undefined;
   const remember = (connection: OpenCode2Connection) =>
     Effect.sync(() => {
@@ -178,6 +180,3 @@ export const make = Effect.fn("OpenCode2Server.make")(function* (input: {
       ),
   });
 });
-
-export const layer = (input: Parameters<typeof make>[0]) =>
-  Layer.effect(OpenCode2Server, make(input));

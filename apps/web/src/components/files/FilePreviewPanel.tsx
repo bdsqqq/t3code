@@ -58,7 +58,7 @@ import { resolveDiffThemeName } from "~/lib/diffRendering";
 import { PREFERRED_HIGHLIGHTER } from "~/lib/syntaxHighlighting";
 import { cn } from "~/lib/utils";
 import type { ChatFileAttachment } from "~/types";
-import { isAbsolutePath } from "@t3tools/shared/path";
+import { isHostPath } from "@t3tools/shared/path";
 import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
 import { ScrollArea } from "~/components/ui/scroll-area";
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
@@ -129,6 +129,7 @@ interface FilePreviewPanelProps {
   composerDraftTarget: ScopedThreadRef | DraftId;
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
+  openInShortcutEnabled: boolean;
   revealLine: number | null;
   revealRequestId: number;
   onOpenFile: (relativePath: string) => void;
@@ -256,6 +257,7 @@ function WorkspaceBrowserPreview(props: {
   return (
     <BrowserDocumentFrame
       src={`${assetUrl.url}${revisionSuffix}`}
+      documentKey={`${props.environmentId}:${resource._tag}:${props.threadRef.threadId}:${props.absolutePath}:${props.workspaceMutationId}`}
       title={props.title}
       pdf={isPdfPreviewFile(props.absolutePath)}
     />
@@ -287,10 +289,15 @@ function WorkspaceVideoPreview(props: {
       void refreshAssetUrl().catch(() => undefined);
     },
   });
+  // Servers that report the file's revision let an unchanged file stay loaded; older ones
+  // only offer the workspace mutation, which changes after every command. The revision also
+  // goes in the URL, since two mints in the same millisecond sign identical URLs.
+  const fileRevision = assetUrl._tag === "Success" ? assetUrl.fileRevision : undefined;
+  const revision = fileRevision ?? props.workspaceMutationId;
   const revisionSuffix =
-    props.workspaceMutationId === null
+    revision === null
       ? ""
-      : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}workspace-revision=${encodeURIComponent(props.workspaceMutationId)}`;
+      : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}${fileRevision !== undefined ? "file" : "workspace"}-revision=${encodeURIComponent(revision)}`;
   const latestUrl = assetUrl._tag === "Success" ? `${assetUrl.url}${revisionSuffix}` : null;
 
   return (
@@ -299,7 +306,7 @@ function WorkspaceVideoPreview(props: {
         src={latestUrl}
         sourceFailed={assetUrl._tag === "Failure"}
         label={props.name}
-        revision={props.workspaceMutationId}
+        revision={revision}
         preload="metadata"
         className="flex h-full min-h-0 w-full max-w-5xl items-center justify-center"
         onRetry={refreshAssetUrl}
@@ -341,10 +348,12 @@ function WorkspaceAudioPreview(props: {
       void refreshAssetUrl().catch(() => undefined);
     },
   });
+  const fileRevision = assetUrl._tag === "Success" ? assetUrl.fileRevision : undefined;
+  const revision = fileRevision ?? props.workspaceMutationId;
   const revisionSuffix =
-    props.workspaceMutationId === null
+    revision === null
       ? ""
-      : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}workspace-revision=${encodeURIComponent(props.workspaceMutationId)}`;
+      : `${assetUrl._tag === "Success" && assetUrl.url.includes("?") ? "&" : "?"}${fileRevision !== undefined ? "file" : "workspace"}-revision=${encodeURIComponent(revision)}`;
   const url = assetUrl._tag === "Success" ? `${assetUrl.url}${revisionSuffix}` : null;
   if (assetUrl._tag === "Failure" || (url !== null && failedUrl === url)) {
     return (
@@ -358,7 +367,14 @@ function WorkspaceAudioPreview(props: {
     );
   }
   if (url === null) return <FileSurfaceLoading />;
-  return <AudioPreview src={url} name={props.name} onError={() => setFailedUrl(url)} />;
+  return (
+    <AudioPreview
+      src={url}
+      name={props.name}
+      revision={revision}
+      onError={() => setFailedUrl(url)}
+    />
+  );
 }
 
 function clampFileLine(contents: string, requestedLine: number): number {
@@ -979,6 +995,7 @@ export default function FilePreviewPanel({
   composerDraftTarget,
   keybindings,
   availableEditors,
+  openInShortcutEnabled,
   revealLine,
   revealRequestId,
   onOpenFile,
@@ -1012,7 +1029,7 @@ export default function FilePreviewPanel({
   const isPdf = relativePath !== null && isPdfPreviewFile(relativePath);
   const isHtml = relativePath !== null && !isPdf && isBrowserPreviewFile(relativePath);
   const isHostFile =
-    attachment !== undefined || (relativePath !== null && isAbsolutePath(relativePath));
+    attachment !== undefined || (relativePath !== null && isHostPath(relativePath));
   const fileAccess = useFilesystemReadAccess(environmentId);
   const { canReadFiles } = fileAccess;
   const canWriteFiles = useEnvironmentScope(environmentId, AuthFilesystemWriteScope);
@@ -1239,7 +1256,9 @@ export default function FilePreviewPanel({
               environmentId={environmentId}
               keybindings={keybindings}
               availableEditors={availableEditors}
+              enableShortcut={openInShortcutEnabled}
               openInCwd={absolutePath}
+              openInCwdIsFile={file.isFile}
               compact
               revealFileManager={revealsInFileManager}
             />

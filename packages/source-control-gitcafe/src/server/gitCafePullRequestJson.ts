@@ -1,4 +1,5 @@
 import { quoteGitPatchPath } from "@t3tools/shared/gitPatchPath";
+import { sortChecks } from "@t3tools/source-control-core/server/pullRequestChecks";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
 import {
@@ -11,6 +12,7 @@ import {
   type PullRequestComment,
   type PullRequestReaction,
   type PullRequestReactionContent,
+  type PullRequestReviewerCandidate,
   type PullRequestReviewThread,
   type PullRequestViewerPermissions,
 } from "@t3tools/contracts";
@@ -28,6 +30,7 @@ const Actor = Schema.Union([
     handle: TrimmedNonEmptyString,
     displayName: Schema.NullOr(Schema.String),
     avatarUrl: Schema.NullOr(Schema.String),
+    bot: Schema.optional(Schema.Boolean),
   }),
   Schema.Struct({
     kind: Schema.Literal("github"),
@@ -142,6 +145,24 @@ export const GitCafeCommits = Schema.Struct({
   headOid: Schema.String,
 });
 
+export const GitCafeLabels = Schema.Struct({
+  items: Schema.Array(
+    Schema.Struct({
+      id: TrimmedNonEmptyString,
+      name: TrimmedNonEmptyString,
+      color: Schema.NullOr(Schema.String),
+      description: Schema.optional(Schema.NullOr(Schema.String)),
+    }),
+  ),
+  next: Schema.NullOr(Schema.String),
+});
+
+/** A pull request's reviewers and its reviewer candidates, each actor under its id. */
+export const GitCafeActorEntries = Schema.Struct({
+  items: Schema.Array(Schema.Struct({ id: TrimmedNonEmptyString, actor: Actor })),
+  next: Schema.NullOr(Schema.String),
+});
+
 export const GitCafeReactions = Schema.Struct({
   items: Schema.Array(
     Schema.Struct({
@@ -248,6 +269,7 @@ function toActor(actor: Actor, host: string): PullRequestActor | null {
   return {
     login: actor.kind === "local" ? actor.handle : actor.login,
     name: actor.kind === "local" ? actor.displayName : null,
+    ...(actor.kind === "local" && actor.bot === true ? { isBot: true } : {}),
     // GitCafe serves its own avatars by path, so a relative one is read against the host.
     avatarUrl: actor.avatarUrl === null ? null : new URL(actor.avatarUrl, `https://${host}`).href,
   };
@@ -260,6 +282,22 @@ export function toReviewers(
   return (pull.reviewers ?? []).flatMap(({ actor }) => {
     const reviewer = toActor(actor, host);
     return reviewer === null ? [] : [reviewer];
+  });
+}
+
+export function toReviewerCandidates(
+  candidates: typeof GitCafeActorEntries.Type,
+  input: {
+    readonly requested: ReadonlySet<string>;
+    readonly authorActorId: string;
+    readonly host: string;
+  },
+): ReadonlyArray<PullRequestReviewerCandidate> {
+  return candidates.items.flatMap(({ id, actor }) => {
+    const reviewer = id === input.authorActorId ? null : toActor(actor, input.host);
+    return reviewer === null
+      ? []
+      : [{ ...reviewer, id, kind: "user" as const, isRequested: input.requested.has(id) }];
   });
 }
 
@@ -292,7 +330,7 @@ export function toChangeRequest(
     reviewRequestLogins: (pull.reviewers ?? []).flatMap(({ actor }) =>
       reviewerLogins(actor, target.host),
     ),
-    labels: pull.labels ?? [],
+    labels: (pull.labels ?? []).map(({ name, color }) => ({ name, color })),
   };
 }
 
@@ -312,7 +350,8 @@ export function toViewerPermissions(detail: GitCafePullDetail): PullRequestViewe
     comment: open,
     resolve: open,
     verdicts: review ? ["approve", "request-changes", "comment"] : [],
-    requestReviewers: false,
+    requestReviewers: edit && detail.state === "open",
+    labels: edit && detail.state === "open",
     editChangeRequest: edit,
     // GitCafe's only branch update moves a whole stack.
     updateMethods: [],
@@ -549,10 +588,12 @@ function checkStatus(check: (typeof GitCafeChecks.Type.items)[number]): PullRequ
 }
 
 export function toChecks(checks: typeof GitCafeChecks.Type): ReadonlyArray<PullRequestCheck> {
-  return checks.items.map((check) => ({
-    name: check.name,
-    status: checkStatus(check),
-    description: check.summary,
-    url: check.detailsUrl,
-  }));
+  return sortChecks(
+    checks.items.map((check) => ({
+      name: check.name,
+      status: checkStatus(check),
+      description: check.summary,
+      url: check.detailsUrl,
+    })),
+  );
 }

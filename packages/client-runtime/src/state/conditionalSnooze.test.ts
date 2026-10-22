@@ -44,7 +44,7 @@ describe("conditional snooze", () => {
     expect(threadWokeAt(awake, { now })).toBe(now);
   });
 
-  it("retains early wake for pending input, errors, and new completed work", () => {
+  it("retains early wake for pending input and errors", () => {
     expect(effectiveSnoozed({ ...shell, hasPendingUserInput: true }, { now })).toBe(false);
     expect(
       effectiveSnoozed(
@@ -55,12 +55,19 @@ describe("conditional snooze", () => {
         { now },
       ),
     ).toBe(false);
+  });
+
+  it.each([
+    condition,
+    { type: "pull-request-merged", host: "github.com", repository: "owner/repo", number: 12 },
+  ] as const)("keeps a $type snooze across a completed run", (snoozeCondition) => {
     const completed = {
       ...shell,
+      snoozeCondition,
       latestRun: { status: "completed", completedAt: now },
     };
-    expect(effectiveSnoozed(completed, { now })).toBe(false);
-    expect(threadWokeAt(completed, { now })).toBe(now);
+    expect(effectiveSnoozed(completed, { now })).toBe(true);
+    expect(threadWokeAt(completed, { now })).toBeNull();
   });
 
   it("does not mistake recovery metadata for a fresh failure", () => {

@@ -275,7 +275,7 @@ export const buildWslRuntimeInstallScript = (
     `runtime_root="$runtime_parent/${safeRuntimeId}"`,
     `ready_marker="$runtime_root/${WSL_RUNTIME_READY_MARKER}"`,
     "runtime_entry_runs() {",
-    '  [ -x "$1/t3" ] && "$1/t3" --version >/dev/null 2>&1',
+    '  [ -x "$1/t3" ] && "$1/t3" --version >/dev/null',
     "}",
     // Hashing the entry is what tells a working cache from one whose `t3` was
     // swapped or half-written after install: the file is still there and may
@@ -286,7 +286,7 @@ export const buildWslRuntimeInstallScript = (
     "}",
     "runtime_is_ready() {",
     '  [ -f "$ready_marker" ] &&',
-    '    runtime_entry_runs "$runtime_root" &&',
+    '    runtime_entry_runs "$runtime_root" 2>/dev/null &&',
     `    recorded_entry_digest=$(tr -d '[:space:]' < "$ready_marker" 2>/dev/null) &&`,
     '    [ -n "$recorded_entry_digest" ] &&',
     '    [ "$recorded_entry_digest" = "$(runtime_server_entry_digest "$runtime_root")" ]',
@@ -463,14 +463,14 @@ cd ${shellQuote(linuxServerDir)} && node <<'NODE' >/dev/null 2>&1
 // The sentinel must be a package the CLI bundle leaves external. It used to be
 // "effect", back when the bundle externalized its runtime deps and the whole
 // node_modules tree was unpacked. The bundle now inlines its JS dependencies,
-// so "effect" no longer exists on disk and only the native packages do —
-// resolving node-pty is what actually validates the unpacked tree.
+// so "effect" no longer exists on disk and only the native packages do.
+// Resolving node-pty is what actually validates the unpacked tree.
 try { require.resolve("node-pty/package.json"); } catch (_e) { process.exit(3); }
 const fs = require("node:fs");
 const path = require("node:path");
 const pkgDir = path.dirname(require.resolve("node-pty/package.json"));
 // node-pty 1.x is N-API based, so a single Linux pty.node is ABI-stable across
-// Node versions — require() succeeding IS the real compatibility test. Look in
+// Node versions, so require() succeeding IS the real compatibility test. Look in
 // the same places node-pty's own loader does.
 const candidates = [
   path.join(pkgDir, "build", "Release", "pty.node"),
@@ -513,7 +513,7 @@ export interface ToolchainReport {
   readonly nodeVersion: string | null;
 }
 
-export const parseToolchainReport = (stdout: string): ToolchainReport => {
+const parseToolchainReport = (stdout: string): ToolchainReport => {
   const lines = stdout
     .split("\n")
     .map((line) => line.trim())
@@ -528,7 +528,7 @@ export const parseToolchainReport = (stdout: string): ToolchainReport => {
   return { missingTools, nodeVersion };
 };
 
-export const parseNodePath = (stdout: string): string | null => {
+const parseNodePath = (stdout: string): string | null => {
   const path = stdout
     .split("\n")
     .map((line) => line.trim())
@@ -538,7 +538,7 @@ export const parseNodePath = (stdout: string): string | null => {
   return path ?? null;
 };
 
-export const parseNodeVersion = (stdout: string): string | null => {
+const parseNodeVersion = (stdout: string): string | null => {
   const version = stdout
     .split("\n")
     .map((line) => line.trim())
@@ -558,7 +558,7 @@ export const parseResolvedPath = (stdout: string): string | null => {
   return resolvedPath.length > 0 ? resolvedPath : null;
 };
 
-export const formatMissingToolsReason = (
+const formatMissingToolsReason = (
   report: ToolchainReport,
   requiredRange: string | null,
 ): string | null => {
@@ -599,141 +599,70 @@ export const formatMissingToolsReason = (
   return `WSL distro is missing required tools: ${issues.join(", ")}. Install ${remediations.join(" and ")}, then retry.`;
 };
 
-const probeWslRuntimeImpl = (
+const probeWslRuntimeImpl = Effect.fn("DesktopWslEnvironment.probeWslRuntimeImpl")(function* (
   distro: string | null,
   linuxAppRoot: string,
-): Effect.Effect<ProbeWslRuntimeResult, never, ChildProcessSpawner.ChildProcessSpawner> =>
-  Effect.gen(function* () {
-    const probe = yield* runWslShell(
-      distro,
-      buildWslRuntimeProbeScript(linuxAppRoot),
-      PROBE_TIMEOUT,
-      {
-        resolveNode: false,
-      },
-    );
-    const transportFailureReason = formatWslShellTransportFailureReason(
-      probe.transportFailure,
-      "the staged runtime",
-    );
-    if (transportFailureReason !== null) {
-      return { ok: false, reason: transportFailureReason } as const;
-    }
-    if (probe.exitCode !== 0) {
-      const trimmedTail = probe.stderr.trim().slice(-500);
-      return {
-        ok: false,
-        reason: `${linuxAppRoot}/t3 --version failed (exit ${probe.exitCode})${trimmedTail ? `: ${trimmedTail}` : ""}`,
-      } as const;
-    }
-    const resolvedPath = parseResolvedPath(probe.stdout);
-    if (resolvedPath === null) {
-      return {
-        ok: false,
-        reason: "WSL login-shell PATH could not be resolved during backend preflight.",
-      } as const;
-    }
-    return { ok: true, resolvedPath } as const;
-  });
+): Effect.fn.Return<ProbeWslRuntimeResult, never, ChildProcessSpawner.ChildProcessSpawner> {
+  const probe = yield* runWslShell(
+    distro,
+    buildWslRuntimeProbeScript(linuxAppRoot),
+    PROBE_TIMEOUT,
+    {
+      resolveNode: false,
+    },
+  );
+  const transportFailureReason = formatWslShellTransportFailureReason(
+    probe.transportFailure,
+    "the staged runtime",
+  );
+  if (transportFailureReason !== null) {
+    return { ok: false, reason: transportFailureReason } as const;
+  }
+  if (probe.exitCode !== 0) {
+    const trimmedTail = probe.stderr.trim().slice(-500);
+    return {
+      ok: false,
+      reason: `${linuxAppRoot}/t3 --version failed (exit ${probe.exitCode})${trimmedTail ? `: ${trimmedTail}` : ""}`,
+    } as const;
+  }
+  const resolvedPath = parseResolvedPath(probe.stdout);
+  if (resolvedPath === null) {
+    return {
+      ok: false,
+      reason: "WSL login-shell PATH could not be resolved during backend preflight.",
+    } as const;
+  }
+  return { ok: true, resolvedPath } as const;
+});
 
-const ensureNodePtyImpl = (
+const ensureNodePtyImpl = Effect.fn("DesktopWslEnvironment.ensureNodePtyImpl")(function* (
   distro: string | null,
   linuxRepoRoot: string,
   options: EnsureWslNodePtyOptions = {},
-): Effect.Effect<EnsureWslNodePtyResult, never, ChildProcessSpawner.ChildProcessSpawner> =>
-  Effect.gen(function* () {
-    // node-pty lives in the apps/server workspace's node_modules; resolve from
-    // there rather than the monorepo root, where Bun's hoist layout omits it.
-    const linuxServerDir = `${linuxRepoRoot}/apps/server`;
+): Effect.fn.Return<EnsureWslNodePtyResult, never, ChildProcessSpawner.ChildProcessSpawner> {
+  // node-pty lives in the apps/server workspace's node_modules; resolve from
+  // there rather than the monorepo root, where Bun's hoist layout omits it.
+  const linuxServerDir = `${linuxRepoRoot}/apps/server`;
 
-    const probe = yield* runWslShell(
-      distro,
-      NODE_PTY_PROBE_SCRIPT(linuxServerDir),
-      PROBE_TIMEOUT,
-      options,
-    );
-    const nodePath = parseNodePath(probe.stdout);
-    const resolvedPath = parseResolvedPath(probe.stdout);
+  const probe = yield* runWslShell(
+    distro,
+    NODE_PTY_PROBE_SCRIPT(linuxServerDir),
+    PROBE_TIMEOUT,
+    options,
+  );
+  const nodePath = parseNodePath(probe.stdout);
+  const resolvedPath = parseResolvedPath(probe.stdout);
 
-    const transportFailureReason = formatWslShellTransportFailureReason(probe.transportFailure);
-    if (transportFailureReason !== null) {
-      return {
-        ok: false,
-        reason: transportFailureReason,
-        fatal: false,
-      } as const;
-    }
+  const transportFailureReason = formatWslShellTransportFailureReason(probe.transportFailure);
+  if (transportFailureReason !== null) {
+    return {
+      ok: false,
+      reason: transportFailureReason,
+      fatal: false,
+    } as const;
+  }
 
-    if (nodePath === null) {
-      const toolchainCheck = yield* runWslShell(
-        distro,
-        TOOLCHAIN_CHECK_SCRIPT,
-        TOOLCHAIN_TIMEOUT,
-        options,
-      );
-      const toolchainTransportFailure = formatWslShellTransportFailureReason(
-        toolchainCheck.transportFailure,
-      );
-      if (toolchainTransportFailure !== null) {
-        return {
-          ok: false,
-          reason: toolchainTransportFailure,
-          fatal: false,
-          retryLimit: TOOLCHAIN_TRANSPORT_RETRY_LIMIT,
-        } as const;
-      }
-      const report = parseToolchainReport(toolchainCheck.stdout);
-      const reason =
-        formatMissingToolsReason(report, options.nodeEngineRange?.trim() || null) ??
-        "Node.js was not found in the WSL distro. Install it (e.g. via nvm) and restart the desktop app.";
-      return { ok: false, reason, fatal: true } as const;
-    }
-
-    if (resolvedPath === null) {
-      return {
-        ok: false,
-        reason: "WSL login-shell PATH could not be resolved during backend preflight.",
-        fatal: true,
-      } as const;
-    }
-
-    if (probe.exitCode === 3) {
-      return {
-        ok: false,
-        reason:
-          'WSL server dependencies could not be loaded (for example "node-pty"). The native packages the server needs are not unpacked where the WSL distro\'s Node can read them — this is a packaging problem with this build. Please report it.',
-        fatal: true,
-      } as const;
-    }
-
-    if (probe.exitCode === 0) {
-      const rawVersion = parseNodeVersion(probe.stdout);
-      if (
-        rawVersion !== null &&
-        options.nodeEngineRange &&
-        !satisfiesSemverRange(rawVersion, options.nodeEngineRange.trim())
-      ) {
-        const range = options.nodeEngineRange.trim();
-        return {
-          ok: false,
-          reason: `WSL Node.js ${rawVersion} does not satisfy the server's required engine range (${range}). Install a compatible version, and restart the desktop app.`,
-          fatal: true,
-        } as const;
-      }
-      return { ok: true, nodePath, resolvedPath } as const;
-    }
-
-    if (options.allowBuild !== true) {
-      const packagedProbeFailure = formatNodePtyProbeFailureReason(probe.exitCode);
-      if (packagedProbeFailure !== null) {
-        return {
-          ok: false,
-          reason: packagedProbeFailure,
-          fatal: true,
-        } as const;
-      }
-    }
-
+  if (nodePath === null) {
     const toolchainCheck = yield* runWslShell(
       distro,
       TOOLCHAIN_CHECK_SCRIPT,
@@ -752,55 +681,124 @@ const ensureNodePtyImpl = (
       } as const;
     }
     const report = parseToolchainReport(toolchainCheck.stdout);
+    const reason =
+      formatMissingToolsReason(report, options.nodeEngineRange?.trim() || null) ??
+      "Node.js was not found in the WSL distro. Install it (e.g. via nvm) and restart the desktop app.";
+    return { ok: false, reason, fatal: true } as const;
+  }
 
-    if (options.allowBuild !== true) {
-      // Packaged builds ship a prebuilt Linux node-pty, so no compiler, node-gyp,
-      // or network is needed — and we must not nag the user to install build
-      // tools they don't need.
-      const nodeOnlyReason = formatMissingToolsReason(
-        {
-          missingTools: report.missingTools.filter((tool) => tool === "node"),
-          nodeVersion: report.nodeVersion,
-        },
-        options.nodeEngineRange?.trim() || null,
-      );
+  if (resolvedPath === null) {
+    return {
+      ok: false,
+      reason: "WSL login-shell PATH could not be resolved during backend preflight.",
+      fatal: true,
+    } as const;
+  }
+
+  if (probe.exitCode === 3) {
+    return {
+      ok: false,
+      reason:
+        'WSL server dependencies could not be loaded (for example "node-pty"). The native packages the server needs are not unpacked where the WSL distro\'s Node can read them. This is a packaging problem with this build. Please report it.',
+      fatal: true,
+    } as const;
+  }
+
+  if (probe.exitCode === 0) {
+    const rawVersion = parseNodeVersion(probe.stdout);
+    if (
+      rawVersion !== null &&
+      options.nodeEngineRange &&
+      !satisfiesSemverRange(rawVersion, options.nodeEngineRange.trim())
+    ) {
+      const range = options.nodeEngineRange.trim();
       return {
         ok: false,
-        reason:
-          nodeOnlyReason ??
-          "The bundled WSL backend binary (node-pty) could not be loaded in this distro. This usually means an unsupported CPU architecture or incompatible system libraries (glibc). Use a glibc-based x64/arm64 WSL distro such as Ubuntu; if you already are, please report this with your distro and the output of `uname -m`.",
+        reason: `WSL Node.js ${rawVersion} does not satisfy the server's required engine range (${range}). Install a compatible version, and restart the desktop app.`,
         fatal: true,
       } as const;
     }
+    return { ok: true, nodePath, resolvedPath } as const;
+  }
 
-    const missingReason = formatMissingToolsReason(report, options.nodeEngineRange?.trim() || null);
-    if (missingReason !== null) {
-      return { ok: false, reason: missingReason, fatal: true } as const;
-    }
-
-    const build = yield* runWslShell(
-      distro,
-      NODE_PTY_BUILD_SCRIPT(linuxServerDir),
-      BUILD_TIMEOUT,
-      options,
-    );
-    const buildTransportFailure = formatWslShellTransportFailureReason(build.transportFailure);
-    if (buildTransportFailure !== null) {
+  if (options.allowBuild !== true) {
+    const packagedProbeFailure = formatNodePtyProbeFailureReason(probe.exitCode);
+    if (packagedProbeFailure !== null) {
       return {
         ok: false,
-        reason: buildTransportFailure,
-        fatal: false,
-        retryLimit: BUILD_TRANSPORT_RETRY_LIMIT,
+        reason: packagedProbeFailure,
+        fatal: true,
       } as const;
     }
-    if (build.exitCode === 0) return { ok: true, nodePath, resolvedPath } as const;
-    const trimmedTail = `${build.stdout}${build.stderr}`.trim().slice(-500);
+  }
+
+  const toolchainCheck = yield* runWslShell(
+    distro,
+    TOOLCHAIN_CHECK_SCRIPT,
+    TOOLCHAIN_TIMEOUT,
+    options,
+  );
+  const toolchainTransportFailure = formatWslShellTransportFailureReason(
+    toolchainCheck.transportFailure,
+  );
+  if (toolchainTransportFailure !== null) {
     return {
       ok: false,
-      reason: `node-pty Linux build failed (exit ${build.exitCode}): ${trimmedTail || "no stderr captured"}`,
+      reason: toolchainTransportFailure,
+      fatal: false,
+      retryLimit: TOOLCHAIN_TRANSPORT_RETRY_LIMIT,
+    } as const;
+  }
+  const report = parseToolchainReport(toolchainCheck.stdout);
+
+  if (options.allowBuild !== true) {
+    // Packaged builds ship a prebuilt Linux node-pty, so no compiler, node-gyp,
+    // or network is needed — and we must not nag the user to install build
+    // tools they don't need.
+    const nodeOnlyReason = formatMissingToolsReason(
+      {
+        missingTools: report.missingTools.filter((tool) => tool === "node"),
+        nodeVersion: report.nodeVersion,
+      },
+      options.nodeEngineRange?.trim() || null,
+    );
+    return {
+      ok: false,
+      reason:
+        nodeOnlyReason ??
+        "The bundled WSL backend binary (node-pty) could not be loaded in this distro. This usually means an unsupported CPU architecture or incompatible system libraries (glibc). Use a glibc-based x64/arm64 WSL distro such as Ubuntu; if you already are, please report this with your distro and the output of `uname -m`.",
       fatal: true,
     } as const;
-  });
+  }
+
+  const missingReason = formatMissingToolsReason(report, options.nodeEngineRange?.trim() || null);
+  if (missingReason !== null) {
+    return { ok: false, reason: missingReason, fatal: true } as const;
+  }
+
+  const build = yield* runWslShell(
+    distro,
+    NODE_PTY_BUILD_SCRIPT(linuxServerDir),
+    BUILD_TIMEOUT,
+    options,
+  );
+  const buildTransportFailure = formatWslShellTransportFailureReason(build.transportFailure);
+  if (buildTransportFailure !== null) {
+    return {
+      ok: false,
+      reason: buildTransportFailure,
+      fatal: false,
+      retryLimit: BUILD_TRANSPORT_RETRY_LIMIT,
+    } as const;
+  }
+  if (build.exitCode === 0) return { ok: true, nodePath, resolvedPath } as const;
+  const trimmedTail = `${build.stdout}${build.stderr}`.trim().slice(-500);
+  return {
+    ok: false,
+    reason: `node-pty Linux build failed (exit ${build.exitCode}): ${trimmedTail || "no stderr captured"}`,
+    fatal: true,
+  } as const;
+});
 
 const prepareWslRuntimeImpl = Effect.fn("desktop.wsl.prepareRuntimeImpl")(function* (
   distro: string | null,
@@ -890,7 +888,7 @@ const invalidateWslRuntimeImpl = Effect.fn("desktop.wsl.invalidateRuntimeImpl")(
   });
 });
 
-export const probeWslDistros: Effect.Effect<
+const probeWslDistros: Effect.Effect<
   readonly WslDistro[],
   DesktopWslDistroListError,
   ChildProcessSpawner.ChildProcessSpawner
@@ -1059,17 +1057,16 @@ const getUserHomeImpl = (
     Effect.orElseSucceed(() => Option.none<string>()),
   );
 
-const makeIsAvailable = (
+const makeIsAvailable = Effect.fn("DesktopWslEnvironment.makeIsAvailable")(function* (
   platform: NodeJS.Platform,
   windir: string,
-): Effect.Effect<boolean, never, FileSystem.FileSystem | Path.Path> =>
-  Effect.gen(function* () {
-    if (platform !== "win32") return false;
-    const path = yield* Path.Path;
-    const fileSystem = yield* FileSystem.FileSystem;
-    const wslExePath = path.join(windir, "System32", "wsl.exe");
-    return yield* fileSystem.exists(wslExePath).pipe(Effect.orElseSucceed(() => false));
-  });
+): Effect.fn.Return<boolean, never, FileSystem.FileSystem | Path.Path> {
+  if (platform !== "win32") return false;
+  const path = yield* Path.Path;
+  const fileSystem = yield* FileSystem.FileSystem;
+  const wslExePath = path.join(windir, "System32", "wsl.exe");
+  return yield* fileSystem.exists(wslExePath).pipe(Effect.orElseSucceed(() => false));
+});
 
 export interface DesktopWslEnvironmentTestStub {
   readonly isAvailable?: boolean;

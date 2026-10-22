@@ -1,12 +1,15 @@
-import { HStack, Image, Spacer, Text, VStack, ZStack } from "@expo/ui/swift-ui";
+import { Circle, HStack, Image, Spacer, Text, VStack, ZStack } from "@expo/ui/swift-ui";
 import type { ComponentProps } from "react";
 import {
+  accessibilityElement,
+  accessibilityLabel,
   activityBackgroundTint,
   font,
   foregroundStyle,
   frame,
   layoutPriority,
   lineLimit,
+  minimumScaleFactor,
   padding,
   resizable,
   widgetURL,
@@ -149,6 +152,8 @@ export function AgentActivity(
     : environment.isStale
       ? "Out of date"
       : `${props.activeCount} active`;
+  const showCompactCount = !attentionRow && !allDone && !environment.isStale;
+  const compactCountLabel = props.activeCount > 99 ? "99+" : `${props.activeCount}`;
   const summary = attentionSuffix || activeLabel;
 
   // Any registered scheme variant routes back to this app; taps are delivered
@@ -158,6 +163,7 @@ export function AgentActivity(
     deepLinkRow && deepLinkRow.deepLink.startsWith("/") && !deepLinkRow.deepLink.startsWith("//")
       ? `t3code://${deepLinkRow.deepLink.slice(1)}`
       : null;
+  const linkModifiers = deepLink ? [widgetURL(deepLink)] : [];
 
   type SFName = NonNullable<ComponentProps<typeof Image>["systemName"]>;
   const phaseSymbol = (phase: AgentActivityPhase): SFName => {
@@ -182,8 +188,15 @@ export function AgentActivity(
 
   // SF Symbols, like the logo, ignore frame/foregroundStyle applied directly to
   // the image; size + tint them through a container the resizable symbol fills.
-  const renderGlyph = (systemName: SFName, size: number, color: Foreground) => (
-    <HStack modifiers={[frame({ width: size, height: size }), foregroundStyle(color)]}>
+  const renderGlyph = (
+    systemName: SFName,
+    size: number,
+    color: Foreground,
+    modifiers: typeof linkModifiers = [],
+  ) => (
+    <HStack
+      modifiers={[frame({ width: size, height: size }), foregroundStyle(color), ...modifiers]}
+    >
       <Image systemName={systemName} modifiers={[resizable()]} />
     </HStack>
   );
@@ -223,8 +236,10 @@ export function AgentActivity(
   // dropped), so we size it via a container frame the resizable image fills and
   // tint it through the container's foreground style, which the template image
   // inherits.
-  const renderLogo = (height: number, color: Foreground) => (
-    <HStack modifiers={[frame({ width: height * 1.5, height }), foregroundStyle(color)]}>
+  const renderLogo = (height: number, color: Foreground, modifiers: typeof linkModifiers = []) => (
+    <HStack
+      modifiers={[frame({ width: height * 1.5, height }), foregroundStyle(color), ...modifiers]}
+    >
       <Image assetName="T3Mark" modifiers={[resizable()]} />
     </HStack>
   );
@@ -315,9 +330,39 @@ export function AgentActivity(
         ) : null}
       </VStack>
     ),
-    compactLeading: renderLogo(14, tint),
-    compactTrailing: (
-      <Text modifiers={[font({ weight: "semibold", size: 11 }), foregroundStyle(tint)]}>
+    compactLeading: renderLogo(14, tint, linkModifiers),
+    compactTrailing: showCompactCount ? (
+      <ZStack
+        modifiers={[
+          frame({ width: 28, height: 28 }),
+          accessibilityElement("ignore"),
+          accessibilityLabel(agentsLabel),
+          ...linkModifiers,
+        ]}
+      >
+        <Circle modifiers={[foregroundStyle(tint)]} />
+        <Text
+          modifiers={[
+            font({ weight: "bold", size: 14 }),
+            foregroundStyle("#000000"),
+            lineLimit(1),
+            minimumScaleFactor(0.75),
+            frame({ width: 24, height: 28 }),
+          ]}
+        >
+          {compactCountLabel}
+        </Text>
+      </ZStack>
+    ) : (
+      <Text
+        modifiers={[
+          font({ weight: "semibold", size: 11 }),
+          foregroundStyle(tint),
+          lineLimit(1),
+          minimumScaleFactor(0.5),
+          ...linkModifiers,
+        ]}
+      >
         {attentionRow
           ? attentionRow.phase === "waiting_for_approval"
             ? "Approval"
@@ -327,8 +372,8 @@ export function AgentActivity(
     ),
     minimal:
       (attentionRow || failedRow || allDone) && heroRow
-        ? renderGlyph(phaseSymbol(heroRow.phase), 13, phaseTint(heroRow.phase))
-        : renderLogo(11, tint),
+        ? renderGlyph(phaseSymbol(heroRow.phase), 13, phaseTint(heroRow.phase), linkModifiers)
+        : renderLogo(11, tint, linkModifiers),
     expandedLeading: (
       <HStack spacing={5} alignment="center" modifiers={[padding({ leading: 4, vertical: 4 })]}>
         {renderLogo(15, tint)}

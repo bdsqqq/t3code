@@ -19,7 +19,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { useTheme } from "~/hooks/useTheme";
 import { useWorkspaceMutationRefresh } from "~/hooks/useWorkspaceMutationRefresh";
 import { cn } from "~/lib/utils";
-import { isAbsolutePath } from "@t3tools/shared/path";
+import { isHostPath } from "@t3tools/shared/path";
 
 import {
   breadcrumbPathOf,
@@ -201,7 +201,7 @@ function BreadcrumbMenuContent(props: {
           <MenuSeparator />
           <MenuItem closeOnClick={false} onClick={entriesQuery.refresh}>
             <RefreshIcon refreshing={entriesQuery.isPending} />
-            Refresh failed — retry
+            Refresh failed. Retry
           </MenuItem>
         </>
       ) : null}
@@ -300,7 +300,7 @@ function FolderBreadcrumb(props: {
  * menu: the browser below already lists the folder it moves to.
  */
 export function FileBreadcrumbs(props: FileBreadcrumbsProps) {
-  const hostPath = isAbsolutePath(props.relativePath);
+  const hostPath = isHostPath(props.relativePath);
   const breadcrumbs = fileBreadcrumbs(props.projectName, props.trail);
   const currentPath = breadcrumbPathOf(props.relativePath);
   const currentIndex = breadcrumbs.findIndex((crumb) => crumb.path === currentPath);

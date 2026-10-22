@@ -1,5 +1,5 @@
+import { SheetHeader } from "../../components/ui/SheetHeader";
 import { AsyncResult } from "effect/reactivity";
-import { Toolbar } from "../../components/ui/Toolbar";
 import { AppActivityIndicator } from "../../components/ui/AppActivityIndicator";
 import { usePullRequestConnected } from "./usePullRequestConnected";
 import { useAtomValue } from "@effect/atom-react";
@@ -18,9 +18,9 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { ScrollViewMarker } from "react-native-screens";
 import { AppText as Text, AppTextInput as TextInput } from "../../components/ui/AppText";
-import { AndroidScreenHeader } from "../../components/ui/AndroidScreenHeader";
 import { EmptyState } from "../../components/ui/EmptyState";
 import { Button } from "../../components/ui/Button";
+import { useRestingTopOffset } from "../../native/useRestingTopOffset";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { NativeStackScreenOptions } from "../../native/StackHeader";
 import { useNativeLayoutMetrics } from "../../native/native-layout-metrics";
@@ -36,14 +36,15 @@ import { pullRequestTarget, type PullRequestParams } from "./usePullRequestDiff"
 
 function ReviewerScrollView(props: ScrollViewProps) {
   const insets = useSafeAreaInsets();
+  const restingOffset = useRestingTopOffset(insets.top, props);
   return (
     <ScrollViewMarker style={{ flex: 1 }}>
       <ScrollView
         {...props}
+        {...restingOffset}
         automaticallyAdjustContentInsets={false}
         contentInsetAdjustmentBehavior="never"
         contentInset={{ top: insets.top }}
-        contentOffset={props.contentOffset ?? { x: 0, y: -insets.top }}
       />
     </ScrollViewMarker>
   );
@@ -140,17 +141,14 @@ export function PullRequestReviewersScreen({ route }: StaticScreenProps<PullRequ
   };
   return (
     <View className="flex-1 bg-sheet">
-      <Toolbar placement="left">
-        <Toolbar.Button
-          icon="xmark"
-          accessibilityLabel="Close request review"
-          onPress={() => navigation.goBack()}
-        />
-      </Toolbar>
+      <SheetHeader
+        title="Request review"
+        subtitle={`#${route.params.number} · ${route.params.repository}`}
+        onClose={() => navigation.goBack()}
+        accessibilityLabel="Close request review"
+      />
       <NativeStackScreenOptions
         options={{
-          title: "Request review",
-          unstable_headerSubtitle: `#${route.params.number} · ${route.params.repository}`,
           headerSearchBarOptions: listCandidates ? searchOptions : undefined,
           unstable_headerToolbarItems: () =>
             listCandidates && integratedSearch
@@ -165,9 +163,6 @@ export function PullRequestReviewersScreen({ route }: StaticScreenProps<PullRequ
               : [],
         }}
       />
-      {Platform.OS === "android" ? (
-        <AndroidScreenHeader title="Request review" onBack={() => navigation.goBack()} />
-      ) : null}
       {listCandidates ? (
         <FlatList
           ref={listRef}

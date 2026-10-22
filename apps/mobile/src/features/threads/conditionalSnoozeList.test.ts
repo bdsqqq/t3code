@@ -19,6 +19,7 @@ describe("conditional snoozes in mobile lists", () => {
         thread,
         variant: "slim" as const,
         snoozed: true,
+        wokeAt: null,
         pinned: false,
         isLast: true,
       },

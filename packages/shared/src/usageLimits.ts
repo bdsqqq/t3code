@@ -18,6 +18,13 @@ const HOUR = 60 * MINUTE;
 const DAY = 24 * HOUR;
 
 export const CHATGPT_USAGE_URL = "https://chatgpt.com/#settings/Usage";
+export const CHATGPT_USAGE_LIMIT_CODE = "subscription_sharing_usage_limit_exceeded";
+/** A ChatGPT Business admin caps plan use in other apps; only the admin can raise it. */
+export const CHATGPT_WORKSPACE_USAGE_LIMIT_CODE =
+  "subscription_sharing_workplace_individual_usage_limit_exceeded";
+/** OpenAI's partner guidelines fix this wording; the user sends it to their admin themselves. */
+export const CHATGPT_WORKSPACE_ADMIN_REQUEST =
+  "I've reached the limit for using my ChatGPT plan in T3 Code. Could you increase our workspace's usage limits so I can continue?\n\nGo to admin.openai.com → Workspace → Usage limits. Thank you!";
 
 export function usesChatGptSharing(provider: ServerProvider | null | undefined): boolean {
   return provider?.auth.status === "authenticated" && provider.auth.subscriptionSharing === true;
@@ -50,9 +57,7 @@ function cursorUsageWindowRank(id: string): number {
   return rank < 0 ? CURSOR_USAGE_WINDOWS.length : rank;
 }
 
-export function providersWithLimits(
-  providers: readonly ServerProvider[],
-): readonly ServerProvider[] {
+function providersWithLimits(providers: readonly ServerProvider[]): readonly ServerProvider[] {
   return providers.filter(
     (provider) =>
       provider.enabled &&
@@ -546,6 +551,15 @@ export function elapsedShare(window: ServerProviderUsageWindow, now: number): nu
   return Math.max(0, Math.min(1, (length - (resetsAt - now)) / length));
 }
 
+// Bars show quota remaining, so even pace tracks time remaining.
+export function paceRemainingPercent(
+  window: ServerProviderUsageWindow,
+  now: number,
+): number | null {
+  const elapsed = elapsedShare(window, now);
+  return elapsed === null ? null : Math.round((1 - elapsed) * 100);
+}
+
 export type LimitPace = "ahead" | "on" | "under";
 
 export function paceOf(window: ServerProviderUsageWindow, now: number): LimitPace | null {
@@ -653,25 +667,52 @@ export function collectProviderUsageLimits(
 ): UsageLimitsReport | null {
   const selected = providers.find((provider) => provider.instanceId === instanceId);
   if (!selected || !hasProviderUsageLimits(selected.driver, providers, sources)) return null;
-  const native = providersWithLimits(providers).filter(
-    (provider) => provider.driver === selected.driver,
-  );
   const resolveKey = accountKeyResolver([
     ...providers.filter((provider) => provider.enabled).map(nativeReport),
     ...sources.flatMap((source) => source.accounts),
   ]);
-  const nativeAccounts = new Set(
-    native.flatMap((provider) => {
+  type NativeSnapshot = { provider: ServerProvider; limits: ServerProviderUsageLimits };
+  const nativeByAccount = new Map<
+    string,
+    { usage: NativeSnapshot; credits: NativeSnapshot | null }
+  >();
+  for (const provider of providersWithLimits(providers)) {
+    if (provider.driver !== selected.driver || !provider.usageLimits) continue;
+    const snapshot = { provider, limits: provider.usageLimits };
+    const key = resolveKey(nativeReport(provider)) ?? `instance:${provider.instanceId}`;
+    const previous = nativeByAccount.get(key);
+    const previousUsable = previous ? limitsNotice(previous.usage.limits) === null : false;
+    const usable = limitsNotice(snapshot.limits) === null;
+    const providerWins =
+      !previous ||
+      (usable && !previousUsable) ||
+      (usable === previousUsable &&
+        Date.parse(snapshot.limits.checkedAt) > Date.parse(previous.usage.limits.checkedAt));
+    const previousCredit = previous?.credits;
+    const credits =
+      snapshot.limits.resetCredits &&
+      (!previousCredit ||
+        Date.parse(snapshot.limits.checkedAt) > Date.parse(previousCredit.limits.checkedAt))
+        ? snapshot
+        : (previousCredit ?? null);
+    nativeByAccount.set(key, {
+      usage: providerWins ? snapshot : previous.usage,
+      credits,
+    });
+  }
+  const native = [...nativeByAccount.values()];
+  const nativeAccountKeys = new Set(
+    native.flatMap(({ usage: { provider, limits } }) => {
       const key = resolveKey(nativeReport(provider));
-      return key && provider.usageLimits?.windows.length && !provider.usageLimits.unavailable
-        ? [key]
-        : [];
+      return key && limits.windows.length && !limits.unavailable ? [key] : [];
     }),
   );
   const accounts: Array<UsageLimitsReport["accounts"][number]> = [];
   const notices: string[] = [];
-  for (const provider of native) {
-    if (!provider.usageLimits) continue;
+  for (const {
+    usage: { provider, limits },
+    credits,
+  } of native) {
     const key = resolveKey(nativeReport(provider));
     const hubCredits = sources
       .flatMap((source) => source.accounts.map((account) => ({ source, account })))
@@ -689,9 +730,12 @@ export function collectProviderUsageLimits(
     const hubCreditId = hubCredits?.account.usageLimits.resetCredits?.nextCreditId;
     const showHubCredits =
       hubCredits &&
-      (!provider.usageLimits.resetCredits ||
+      (!credits ||
         Date.parse(hubCredits.account.usageLimits.checkedAt) >
-          Date.parse(provider.usageLimits.checkedAt));
+          Date.parse(credits.limits.checkedAt));
+    const shownCredits = showHubCredits
+      ? hubCredits.account.usageLimits.resetCredits
+      : credits?.limits.resetCredits;
     accounts.push({
       id: provider.instanceId,
       driver: provider.driver,
@@ -705,20 +749,18 @@ export function collectProviderUsageLimits(
               accountId: hubCredits.account.id,
               creditId: hubCreditId,
             }
-          : { instanceId: provider.instanceId },
+          : { instanceId: credits?.provider.instanceId ?? provider.instanceId },
       ...(provider.displayName ? { displayName: provider.displayName } : {}),
       ...(provider.accentColor ? { accentColor: provider.accentColor } : {}),
       ...(provider.auth.email ? { email: provider.auth.email } : {}),
-      limits: showHubCredits
-        ? { ...provider.usageLimits, resetCredits: hubCredits.account.usageLimits.resetCredits }
-        : provider.usageLimits,
+      limits: shownCredits ? { ...limits, resetCredits: shownCredits } : limits,
     });
   }
   for (const source of sources) {
     const matching = source.accounts.filter((account) => account.driver === selected.driver);
     for (const account of matching) {
       const key = resolveKey(account);
-      if (key && nativeAccounts.has(key)) continue;
+      if (key && nativeAccountKeys.has(key)) continue;
       accounts.push({
         id: `${source.id}:${account.id}`,
         driver: account.driver,

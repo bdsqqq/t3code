@@ -1,5 +1,5 @@
-export const COMPOSER_FOOTER_COMPACT_BREAKPOINT_PX = 620;
-export const COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX = 780;
+const COMPOSER_FOOTER_COMPACT_BREAKPOINT_PX = 620;
+const COMPOSER_FOOTER_WIDE_ACTIONS_COMPACT_BREAKPOINT_PX = 780;
 const RESTING_COMPOSER_IMAGE_THUMBNAIL_LIMIT = 3;
 
 export function getRestingComposerImagePreviewCounts(imageCount: number): {
@@ -47,7 +47,7 @@ export function shouldUseRestingComposerLayout(input: {
  * 8px of top padding, the prompt clamps from min-h-17.5 (70px) to 32px, and
  * the 48px footer leaves flow.
  */
-export const COMPOSER_RESTING_EXPANSION_MIN_PX = 94;
+const COMPOSER_RESTING_EXPANSION_MIN_PX = 94;
 
 /**
  * Reserving only the resting height lets a scroll to the end land flush against the short
@@ -59,16 +59,20 @@ export function resolveComposerTimelineInset(input: {
   overlayHeight: number;
   isResting: boolean;
   restingOnlyHeight?: number;
+  expandedNoticesHeight?: number;
 }): number {
+  // Expanded notices temporarily cover the timeline. Remove their growth before
+  // rounding so fractional measurements reserve exactly the collapsed height.
+  const overlayHeight = Math.ceil(input.overlayHeight - (input.expandedNoticesHeight ?? 0));
   return input.isResting
     ? Math.max(
         input.currentInset,
-        input.overlayHeight +
+        overlayHeight +
           (input.currentInset === 0
             ? COMPOSER_RESTING_EXPANSION_MIN_PX - (input.restingOnlyHeight ?? 0)
             : 0),
       )
-    : input.overlayHeight;
+    : overlayHeight;
 }
 
 export function overlayComposerIsResting(input: {

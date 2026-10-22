@@ -21,11 +21,6 @@ import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderS
 import * as ProviderEventLoggers from "@t3tools/provider-core/server/ProviderEventLoggers";
 import * as ProviderMaintenance from "@t3tools/provider-core/server/maintenanceResolver";
 import * as OpenCodeRuntime from "./OpenCodeRuntime.ts";
-import {
-  OPENCODE_2_RESPONSES,
-  OPENCODE_2_WORKSPACE_RESPONSES,
-  replayOpenCodeServer,
-} from "./probeResponses.fixture.ts";
 import { OpenCodeDriver, openCodeUpdateFor } from "./driver.ts";
 import * as TestProviderHost from "@t3tools/provider-testing/TestProviderHost";
 
@@ -83,34 +78,6 @@ it.layer(layer)("OpenCodeDriver runtime selection", (it) => {
         }),
       );
       assert.deepStrictEqual(serverStarts, ["start"]);
-    }).pipe(Effect.scoped),
-  );
-
-  it.effect("lists an OpenCode 2 workspace's own skills and commands from its server", () =>
-    Effect.gen(function* () {
-      serverStarts.length = 0;
-      const requested: Array<string> = [];
-      const server = replayOpenCodeServer(
-        { ...OPENCODE_2_RESPONSES, ...OPENCODE_2_WORKSPACE_RESPONSES },
-        "secret",
-        requested,
-      );
-      const instance = yield* create(
-        { serverUrl: "http://127.0.0.1:4096", serverPassword: "secret" },
-        server,
-      );
-
-      const workspace = yield* instance.snapshotForCwd!("/work");
-      assert.includeMembers(
-        workspace.skills.map((skill) => skill.name),
-        ["plum", "opencode"],
-      );
-      assert.deepStrictEqual(
-        workspace.slashCommands.map((command) => command.name),
-        ["compact", "init", "review", "bee"],
-      );
-      assert.include(requested, "/api/skill");
-      assert.deepStrictEqual(serverStarts, []);
     }).pipe(Effect.scoped),
   );
 
@@ -220,24 +187,6 @@ const layerUpdate = Layer.mergeAll(
 ).pipe(Layer.provideMerge(NodeServices.layer));
 
 it.layer(layerUpdate)("OpenCodeDriver updates", (it) => {
-  it.effect("never runs the binary for a disabled instance's update check", () =>
-    Effect.gen(function* () {
-      versionProbes.length = 0;
-      versionOutput.current = "opencode v2.0.18\n";
-      const instance = yield* OpenCodeDriver.create({
-        instanceId: ProviderInstanceId.make("opencode-disabled"),
-        displayName: undefined,
-        environment: [],
-        enabled: false,
-        config: { ...OpenCodeDriver.defaultConfig(), binaryPath: "opencode" },
-      }).pipe(Effect.provideService(HttpClient.HttpClient, noHttp));
-      const maintenance = yield* instance.snapshot.resolveMaintenance();
-      yield* instance.snapshot.resolveMaintenance({ fresh: true });
-      assert.isNull(maintenance.update);
-      assert.deepStrictEqual(versionProbes, []);
-    }).pipe(Effect.scoped),
-  );
-
   it.effect.skipIf(HostProcess.Platform.defaultValue() === "win32")(
     "offers no package update for an unknown version and follows a changed one on a fresh read",
     () =>

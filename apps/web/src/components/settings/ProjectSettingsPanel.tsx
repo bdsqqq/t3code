@@ -10,12 +10,13 @@ import {
   type AtomCommandResult,
 } from "@t3tools/client-runtime/state/runtime";
 import { scopeProjectRef, scopeThreadRef } from "@t3tools/client-runtime/environment";
+import { planProjectRemoval } from "@t3tools/client-runtime/state/projects";
 import { AsyncResult } from "effect/reactivity";
 import { type EnvironmentId, type ProjectIconOverride } from "@t3tools/contracts";
 import { useLocation, useNavigate } from "@tanstack/react-router";
 import * as Cause from "effect/Cause";
 import { InfoIcon, Trash2Icon } from "lucide-react";
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 
 import { useComposerDraftStore } from "../../composerDraftStore";
 import { releaseProjectDraftUploads } from "../../lib/composerDraftUploads";
@@ -55,20 +56,18 @@ const ProjectIconPickerDialog = lazy(() =>
   })),
 );
 
-function memberKey(member: { environmentId: string; id: string }): string {
-  return `${member.environmentId}:${member.id}`;
-}
-
 export type ProjectSettingsCategory = "general" | "source-control" | "project";
 
 export function ProjectSettingsPanel({
   projectKey,
   environmentId = null,
   checkoutKey = null,
+  unavailable,
 }: {
   projectKey: string;
   environmentId?: EnvironmentId | null;
   checkoutKey?: string | null;
+  unavailable?: ReactNode;
 }) {
   const groups = useSettingsProjectGroups();
   const navigate = useNavigate({ from: "/settings" });
@@ -125,6 +124,8 @@ export function ProjectSettingsPanel({
       });
     }
   }, [groups, navigate, pathname, projectKey, members.length, environmentId, checkoutKey]);
+
+  if ((!selected || members.length === 0) && unavailable != null) return unavailable;
 
   if (!selected) {
     return (
@@ -315,40 +316,15 @@ function ProjectDetail({
     const api = readLocalApi();
     if (!api) return;
 
-    const memberKeys = new Set(members.map(memberKey));
-    const projectThreads = threads.filter((thread) =>
-      memberKeys.has(`${thread.environmentId}:${thread.projectId}`),
-    );
-    const isWholeGroup = members.length === group.memberProjects.length;
-    const targetKind = hasOtherMembers || !isWholeGroup ? "checkout" : "project";
-    const singleMember = members.length === 1 ? members[0]! : null;
-    const targetLabel = singleMember?.title ?? group.displayName;
+    const { projectThreads, isWholeGroup, confirmationMessage } = planProjectRemoval({
+      members,
+      groupMemberCount: group.memberProjects.length,
+      hasOtherMembers,
+      displayName: group.displayName,
+      threads,
+    });
     const confirmed = await settlePromise(() =>
-      api.dialogs.confirm(
-        [
-          projectThreads.length > 0
-            ? `Remove ${targetKind} "${targetLabel}" and delete its ${projectThreads.length} thread${projectThreads.length === 1 ? "" : "s"}?`
-            : `Remove ${targetKind} "${targetLabel}"?`,
-          ...(singleMember
-            ? [
-                `Path: ${singleMember.workspaceRoot}`,
-                ...(singleMember.environmentLabel
-                  ? [`Environment: ${singleMember.environmentLabel}`]
-                  : []),
-              ]
-            : [`This removes ${members.length} grouped project entries.`]),
-          ...(projectThreads.length > 0
-            ? [
-                "This permanently clears conversation history for those threads and any archived threads.",
-              ]
-            : ["This permanently clears any archived conversation history."]),
-          isWholeGroup && !hasOtherMembers
-            ? "This removes only the project entries, not the files on disk."
-            : "Other entries in this grouped project are unaffected.",
-          "This action cannot be undone.",
-        ].join("\n"),
-        { variant: "destructive" },
-      ),
+      api.dialogs.confirm(confirmationMessage, { variant: "destructive" }),
     );
     if (confirmed._tag === "Failure" || !confirmed.value) return;
     if (checkProjectAccess(members, "Failed to remove project")) return;
@@ -387,7 +363,11 @@ function ProjectDetail({
     }
 
     if (isWholeGroup && !hasOtherMembers) {
-      void navigate({ to: "/", replace: true });
+      void navigate({
+        to: "/settings/projects",
+        search: ({ machine }) => ({ project: undefined, machine, checkout: undefined }),
+        replace: true,
+      });
     }
   };
 

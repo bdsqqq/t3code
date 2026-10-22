@@ -35,6 +35,49 @@ export interface EnvironmentThread {
   readonly projection: OrchestrationV2ThreadProjection;
 }
 
+type ProjectionTurnItem = OrchestrationV2ThreadProjection["turnItems"][number];
+type StreamedProjectionTurnItem = Extract<
+  ProjectionTurnItem,
+  { readonly type: "assistant_message" | "reasoning" }
+>;
+
+/** A turn item without the fields that move while it streams. */
+export type ThreadStructureTurnItem =
+  | Exclude<ProjectionTurnItem, StreamedProjectionTurnItem>
+  | Omit<Extract<ProjectionTurnItem, { readonly type: "assistant_message" }>, "text" | "updatedAt">
+  | Omit<Extract<ProjectionTurnItem, { readonly type: "reasoning" }>, "text" | "updatedAt">;
+
+export type ThreadStructureVisibleTurnItem = Omit<
+  OrchestrationV2ThreadProjection["visibleTurnItems"][number],
+  "item"
+> & {
+  readonly item: ThreadStructureTurnItem;
+};
+
+/**
+ * A thread projection without the fields that move while a reply streams, so a
+ * reader of the quiet thread cannot depend on them and go stale. A full
+ * projection is assignable to it.
+ */
+export type ThreadStructureThread = Omit<
+  OrchestrationV2ThreadProjection["thread"],
+  "updatedAt" | "lastVisitedAt"
+>;
+
+export type ThreadStructure = Omit<
+  OrchestrationV2ThreadProjection,
+  "thread" | "turnItems" | "visibleTurnItems" | "updatedAt"
+> & {
+  readonly thread: ThreadStructureThread;
+  readonly turnItems: ReadonlyArray<ThreadStructureTurnItem>;
+  readonly visibleTurnItems: ReadonlyArray<ThreadStructureVisibleTurnItem>;
+};
+
+export interface EnvironmentThreadStructure {
+  readonly environmentId: EnvironmentId;
+  readonly projection: ThreadStructure;
+}
+
 export interface ThreadRunSummary {
   readonly runId: RunId;
   readonly status: OrchestrationV2RunStatus;
@@ -61,11 +104,15 @@ export interface ThreadRuntimeSummary {
   readonly providerName: string | null;
   readonly lastError: string | null;
   readonly lastErrorClass?: OrchestrationV2ProviderFailureClass | null;
+  readonly lastErrorCode?: string | null;
   readonly usageLimitResetAt?: string | null;
   readonly updatedAt: string;
 }
 
-export function threadRuntimeIsActive(runtime: ThreadRuntimeSummary | null | undefined): boolean {
+/** The runtime summary a thread's structure determines; see ThreadStructure. */
+export type ThreadStructureRuntime = Omit<ThreadRuntimeSummary, "updatedAt">;
+
+export function threadRuntimeIsActive(runtime: ThreadStructureRuntime | null | undefined): boolean {
   return runtime !== null && runtime !== undefined && threadRunStatusIsActive(runtime.status);
 }
 
@@ -104,6 +151,7 @@ export interface EnvironmentThreadShell {
   readonly activeProviderThreadId: OrchestrationV2ThreadShell["activeProviderThreadId"];
   readonly latestRun: ThreadRunSummary | null;
   readonly runtime: ThreadRuntimeSummary | null;
+  readonly blockedOnThreadWait?: boolean;
   readonly latestUserMessageAt: string | null;
   readonly latestUserAuthoredMessageAt?: string | null;
   readonly hasPendingApprovals: boolean;
@@ -187,6 +235,7 @@ function shellRuntime(thread: OrchestrationV2ThreadShell): ThreadRuntimeSummary 
     providerName: null,
     lastError: thread.lastError ?? null,
     lastErrorClass: thread.lastErrorClass ?? null,
+    lastErrorCode: thread.lastErrorCode ?? null,
     usageLimitResetAt: thread.usageLimitResetAt ?? null,
     updatedAt: iso(thread.updatedAt),
   };
@@ -223,6 +272,12 @@ export function presentThreadShell(
               : nullableIso(thread.latestRunCompletedAt),
           assistantMessageId: null,
         } satisfies ThreadRunSummary);
+  const runtime = shellRuntime(thread);
+  // Waiting runs have ended their provider turn and are only draining effects.
+  const runtimeIsWorking =
+    runtime?.status === "preparing" ||
+    runtime?.status === "starting" ||
+    runtime?.status === "running";
   return {
     environmentId,
     id: thread.id,
@@ -244,7 +299,8 @@ export function presentThreadShell(
     forkedFrom: thread.forkedFrom,
     activeProviderThreadId: thread.activeProviderThreadId,
     latestRun,
-    runtime: shellRuntime(thread),
+    runtime,
+    blockedOnThreadWait: thread.blockedOnThreadWait ?? false,
     latestUserMessageAt: nullableIso(thread.latestUserMessageAt),
     ...(thread.latestUserAuthoredMessageAt === undefined
       ? {}
@@ -253,7 +309,9 @@ export function presentThreadShell(
       thread.pendingRuntimeRequest !== null &&
       thread.pendingRuntimeRequest.kind !== "user_input" &&
       thread.pendingRuntimeRequest.kind !== "auth_refresh",
-    hasPendingUserInput: thread.pendingRuntimeRequest?.kind === "user_input",
+    hasPendingUserInput:
+      thread.pendingRuntimeRequest?.kind === "user_input" &&
+      (thread.pendingRuntimeRequest.blocking !== false || !runtimeIsWorking),
     pendingSubagentRequest,
     hasActionableProposedPlan: thread.hasActionableProposedPlan,
     pendingBackgroundTasks: thread.pendingBackgroundTasks ?? [],
@@ -327,4 +385,12 @@ export function resolveThreadWorkingStartedAt(input: {
     return valid(run.startedAt) ?? valid(run.requestedAt);
   }
   return null;
+}
+
+export function formatWorkingDurationLabel(elapsedMs: number): string {
+  const seconds = Number.isFinite(elapsedMs) ? Math.max(0, Math.floor(elapsedMs / 1000)) : 0;
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`;
 }

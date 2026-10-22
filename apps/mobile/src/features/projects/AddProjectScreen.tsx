@@ -54,7 +54,13 @@ import {
   resolveEnvironmentMachineKind,
   SourceControlProviderKind,
 } from "@t3tools/contracts";
-import { CommonActions, StackActions, useNavigation } from "@react-navigation/native";
+import {
+  CommonActions,
+  StackActions,
+  useNavigation,
+  type NavigationState,
+  type ParamListBase,
+} from "@react-navigation/native";
 import { SymbolView } from "../../components/ui/AppSymbol";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { Platform, Pressable, View } from "react-native";
@@ -262,20 +268,7 @@ function PrimaryActionButton(props: {
   readonly loading?: boolean;
   readonly onPress: () => void;
 }) {
-  if (Platform.OS === "android") return <Button {...props} tone="primary" fullWidth />;
-  return (
-    <Pressable
-      disabled={props.disabled}
-      onPress={props.onPress}
-      className="h-12 items-center justify-center rounded-full bg-primary active:opacity-70 disabled:opacity-45"
-    >
-      {props.loading ? (
-        <AppActivityIndicator colorClassName={String("accent-primary-foreground")} />
-      ) : (
-        <Text className="text-base font-t3-bold text-primary-foreground">{props.label}</Text>
-      )}
-    </Pressable>
-  );
+  return <Button {...props} tone="primary" fullWidth />;
 }
 
 function ProjectPathInput(props: {
@@ -446,12 +439,13 @@ function EmptyEnvironmentState() {
       <Text className="text-center text-sm leading-normal text-foreground-muted">
         Start or reconnect an environment before adding a project.
       </Text>
-      <Pressable
-        onPress={() => navigation.dispatch(StackActions.replace("ConnectionsNew"))}
-        className="mt-1 rounded-full bg-primary px-4 py-2.5 active:opacity-70"
-      >
-        <Text className="text-sm font-t3-bold text-primary-foreground">Add environment</Text>
-      </Pressable>
+      <View className="mt-1">
+        <Button
+          label="Add environment"
+          tone="primary"
+          onPress={() => navigation.dispatch(StackActions.replace("ConnectionsNew"))}
+        />
+      </View>
     </View>
   );
 }
@@ -660,7 +654,10 @@ export function AddProjectSourceScreen() {
 }
 
 function openNewTaskDraft(
-  navigation: { dispatch: (action: ReturnType<typeof CommonActions.reset>) => void },
+  navigation: {
+    dispatch: (action: ReturnType<typeof CommonActions.reset>) => void;
+    getState: () => NavigationState<ParamListBase> | undefined;
+  },
   params: {
     environmentId: EnvironmentId;
     projectId: ProjectId;
@@ -669,9 +666,14 @@ function openNewTaskDraft(
     draftId?: string;
   },
 ) {
-  navigation.dispatch(
-    CommonActions.reset({ index: 0, routes: [{ name: "NewTaskDraft", params }] }),
-  );
+  const state = navigation.getState();
+  if (!state) return;
+  const threadIndex = state.routes.findLastIndex((route) => route.name === "Thread");
+  const routes = [
+    ...state.routes.slice(0, threadIndex < 0 ? state.index : threadIndex),
+    { key: uuidv4(), name: "Thread", params: { draft: params } },
+  ];
+  navigation.dispatch(CommonActions.reset({ ...state, index: routes.length - 1, routes }));
 }
 
 async function draftWithPrompt(
@@ -710,21 +712,11 @@ function useCreateProject(environment: EnvironmentOption | null) {
     });
     if (existing) {
       Dialog.alert("Project already exists", existing.title);
-      navigation.dispatch(
-        CommonActions.reset({
-          index: 0,
-          routes: [
-            {
-              name: "NewTaskDraft",
-              params: {
-                environmentId: existing.environmentId,
-                projectId: existing.id,
-                title: existing.title,
-              },
-            },
-          ],
-        }),
-      );
+      openNewTaskDraft(navigation, {
+        environmentId: existing.environmentId,
+        projectId: existing.id,
+        title: existing.title,
+      });
       return;
     }
 
@@ -741,21 +733,11 @@ function useCreateProject(environment: EnvironmentOption | null) {
     if (AsyncResult.isFailure(result)) {
       return result;
     }
-    navigation.dispatch(
-      CommonActions.reset({
-        index: 0,
-        routes: [
-          {
-            name: "NewTaskDraft",
-            params: {
-              environmentId: environment.environmentId,
-              projectId,
-              title: inferProjectTitleFromPath(workspaceRoot),
-            },
-          },
-        ],
-      }),
-    );
+    openNewTaskDraft(navigation, {
+      environmentId: environment.environmentId,
+      projectId,
+      title: inferProjectTitleFromPath(workspaceRoot),
+    });
     return result;
   };
 }

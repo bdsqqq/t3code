@@ -32,6 +32,7 @@ import type { PlatformError } from "effect/PlatformError";
 import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
+import { parse as parseYaml } from "yaml";
 
 import * as ServerConfig from "./config.ts";
 import * as GitManager from "./git/GitManager.ts";
@@ -45,15 +46,24 @@ import * as Settings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { isFilesystemRoot, managedWorktreesDirectories } from "./worktreesDirectory.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
+import { removeLinkedWorktree } from "./vcs/worktreeRemoval.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
+import { isNetworkPath } from "@t3tools/shared/path";
 
 const decodeCleanupThread = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2AppThreadJson),
 );
 const decodeCleanupSession = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderSessionJson),
+);
+// pnpm 11 writes this file as JSON, older versions as YAML.
+const decodePnpmModulesManifest = Schema.decodeUnknownEffect(
+  Schema.Struct({
+    storeDir: Schema.String,
+    virtualStoreDir: Schema.optional(Schema.String),
+  }),
 );
 
 const DAY_MS = 86_400_000;
@@ -247,14 +257,40 @@ const make = Effect.gen(function* () {
         );
       });
 
-  const measureWorktree = (worktreePath: string) =>
-    Effect.gen(function* () {
+  // pnpm imports packages by clone or reflink when its store shares a device
+  // with the worktree. Those files have one link but share blocks with the
+  // store, so removing them frees almost nothing. A store on another device
+  // forces real copies, which still count.
+  const sharedPnpmVirtualStore = Effect.fnUntraced(
+    function* (root: string) {
+      const nodeModules = path.join(root, "node_modules");
+      const text = yield* fs.readFileString(path.join(nodeModules, ".modules.yaml"));
+      const manifest = yield* decodePnpmModulesManifest(yield* Effect.try(() => parseYaml(text)));
+      // An agent can write this manifest, and statting a network path makes
+      // Windows sign in to its host with the user's NTLM credentials.
+      if (isNetworkPath(manifest.storeDir) || isNetworkPath(manifest.virtualStoreDir ?? "")) {
+        return null;
+      }
+      const virtualStore = path.resolve(nodeModules, manifest.virtualStoreDir ?? ".pnpm");
+      const [store, virtual] = yield* Effect.all([
+        fs.stat(manifest.storeDir),
+        fs.stat(virtualStore),
+      ]);
+      return store.dev === virtual.dev ? virtualStore : null;
+    },
+    Effect.orElseSucceed(() => null),
+  );
+
+  const measureWorktree = Effect.fn("storageCleanup.measureWorktree")(
+    function* (worktreePath: string) {
       const root = yield* fs.realPath(worktreePath);
+      const skipped = yield* sharedPnpmVirtualStore(root);
       const pending = [root];
       let entries = 1;
       let bytes = 0;
       while (pending.length > 0) {
         const target = pending.pop()!;
+        if (target === skipped) continue;
         // Effect's stat follows links. Probe with readLink first to get lstat
         // semantics, including skipping dangling links and directory links.
         const isLink = yield* fs.readLink(target).pipe(
@@ -270,8 +306,14 @@ const make = Effect.gen(function* () {
         if (isLink) continue;
         if ((yield* fs.realPath(target)) !== target) return null;
         const stat = yield* fs.stat(target);
-        if (stat.type === "File") bytes += Number(stat.size);
-        else if (stat.type === "Directory") {
+        if (stat.type === "File") {
+          // Removing a shared hardlink leaves its blocks allocated.
+          if (Option.getOrElse(stat.nlink, () => 1n) !== 1n) continue;
+          bytes += Option.match(stat.blocks, {
+            onNone: () => Number(stat.size),
+            onSome: (blocks) => Number(blocks * 512n),
+          });
+        } else if (stat.type === "Directory") {
           const names = yield* fs.readDirectory(target);
           entries += names.length;
           if (entries > 2_000_000) return null;
@@ -283,19 +325,17 @@ const make = Effect.gen(function* () {
         }
       }
       return bytes;
-    }).pipe(
-      Effect.timeout("30 seconds"),
-      Effect.orElseSucceed(() => null),
-    );
+    },
+    Effect.timeout("30 seconds"),
+    Effect.orElseSucceed(() => null),
+  );
 
   // The snapshot takes seconds on large databases, so it runs on the reader
   // worker instead of the event loop.
   const readThreads = Effect.fn("StorageCleanup.readThreads")(function* () {
-    const { threads } = yield* projections
-      .getShellSnapshot({ location: "active" })
-      .pipe(NodeSqliteClient.readOnly);
+    const snapshot = yield* projections.getShellSnapshot().pipe(NodeSqliteClient.readOnly);
     const projects = yield* projectStore.listShells();
-    return { projects, threads };
+    return { projects, threads: [...snapshot.threads, ...snapshot.archivedThreads] };
   });
 
   const containsProjectRoot = Effect.fn("StorageCleanup.containsProjectRoot")(function* (
@@ -410,6 +450,7 @@ const make = Effect.gen(function* () {
             ? "No thread uses this worktree"
             : "No thread uses this folder, and it isn't a git worktree",
           path: worktreePath,
+          projectPath: null,
           threadId: null,
           threadTitle: null,
           bytes,
@@ -533,6 +574,122 @@ const make = Effect.gen(function* () {
     return file === undefined ? null : `has ignored files (${file})`;
   });
 
+  const submoduleRemoval = Effect.fn("StorageCleanup.submoduleRemoval")(
+    function* (cwd: string, rules: WorktreeCleanupRules) {
+      const inspect = (args: string[], maxOutputBytes = 64 * 1024) =>
+        git.execute({
+          operation: "StorageCleanup.submodules",
+          cwd,
+          args,
+          maxOutputBytes,
+        });
+      const admin = yield* inspect(["rev-parse", "--absolute-git-dir"]);
+      if (admin.stdoutTruncated || admin.stderrTruncated)
+        return { force: false, reason: "submodule inspection exceeded the limit" };
+      const modules = path.join(admin.stdout.replace(/\n$/, ""), "modules");
+      const stored = yield* fs.exists(modules);
+      if (!stored && !(yield* fs.exists(path.join(cwd, ".gitmodules"))))
+        return { force: false, reason: null };
+      const populated = yield* inspect([
+        "submodule",
+        "foreach",
+        "--recursive",
+        "--quiet",
+        'printf "%s\\0" "$toplevel/$sm_path"',
+      ]);
+      if (populated.stdoutTruncated || populated.stderrTruncated)
+        return { force: false, reason: "submodule inspection exceeded the limit" };
+      const paths = populated.stdout.split("\0").filter(Boolean);
+      const pending = [modules];
+      for (const submodule of paths) {
+        const directory = yield* inspect(["-C", submodule, "rev-parse", "--absolute-git-dir"]);
+        if (directory.stdoutTruncated || directory.stderrTruncated)
+          return { force: false, reason: "submodule inspection exceeded the limit" };
+        pending.push(directory.stdout.replace(/\n$/, ""));
+      }
+      const visited = new Set<string>();
+      while (pending.length > 0) {
+        const directory = pending.pop()!;
+        if (!(yield* fs.exists(directory))) continue;
+        const canonical = yield* fs.realPath(directory);
+        if (visited.has(canonical)) continue;
+        visited.add(canonical);
+        if (visited.size > 10_000)
+          return { force: false, reason: "submodule inspection exceeded the limit" };
+        if ((yield* fs.stat(directory)).type !== "Directory")
+          return { force: false, reason: "submodule repository could not be inspected" };
+        if (yield* fs.exists(path.join(directory, "HEAD"))) {
+          const unpushed = yield* inspect([
+            "--git-dir",
+            directory,
+            "--work-tree",
+            cwd,
+            "rev-list",
+            "--max-count=1",
+            "HEAD",
+            "--all",
+            "--reflog",
+            "--not",
+            "--remotes",
+          ]);
+          if (unpushed.stdoutTruncated || unpushed.stderrTruncated)
+            return { force: false, reason: "submodule inspection exceeded the limit" };
+          if (unpushed.stdout.trim() !== "")
+            return { force: false, reason: "submodule has commits not on a remote-tracking ref" };
+          pending.push(path.join(directory, "modules"));
+        } else {
+          for (const name of yield* fs.readDirectory(directory))
+            pending.push(path.join(directory, name));
+        }
+      }
+      // Check files after walking stored history to shorten the gap before forced removal.
+      for (const submodule of paths) {
+        const changes = yield* localChangesReason(submodule, rules);
+        if (changes !== null) return { force: false, reason: `submodule ${changes}` };
+      }
+      const force = stored || paths.length > 0;
+      if (force && rules.worktreeKeepWhen !== "tracked-changes") {
+        const root = yield* fs.realPath(cwd);
+        // Git status and foreach omit files inside deinitialized gitlink directories.
+        const populatedPaths = new Set(paths.map(pathKey));
+        const unchecked: string[] = [];
+        for (const repository of [root, ...paths]) {
+          const index = yield* inspect(
+            ["-C", repository, "ls-files", "--stage", "-z"],
+            16 * 1024 * 1024,
+          );
+          if (index.stdoutTruncated || index.stderrTruncated)
+            return { force: false, reason: "submodule inspection exceeded the limit" };
+          for (const entry of index.stdout.split("\0")) {
+            if (!entry.startsWith("160000 ")) continue;
+            const submodule = path.resolve(repository, entry.slice(entry.indexOf("\t") + 1));
+            if (!inside(root, submodule))
+              return { force: false, reason: "submodules could not be inspected" };
+            if (!populatedPaths.has(pathKey(submodule)) && (yield* fs.exists(submodule)))
+              unchecked.push(submodule);
+          }
+        }
+        let inspected = unchecked.length;
+        while (unchecked.length > 0) {
+          if (inspected > 10_000)
+            return { force: false, reason: "submodule inspection exceeded the limit" };
+          const target = unchecked.pop()!;
+          if (
+            (yield* fs.realPath(target)) !== path.resolve(target) ||
+            (yield* fs.stat(target)).type !== "Directory"
+          )
+            return { force: false, reason: "submodule has local files" };
+          if (path.basename(target) === "node_modules") continue;
+          const names = yield* fs.readDirectory(target);
+          inspected += names.length;
+          for (const name of names) unchecked.push(path.join(target, name));
+        }
+      }
+      return { force, reason: null };
+    },
+    Effect.orElseSucceed(() => ({ force: false, reason: "submodules could not be inspected" })),
+  );
+
   const cleanupGit = Effect.fn("StorageCleanup.cleanupGit")(function* (
     cwd: string,
     args: string[],
@@ -588,6 +745,7 @@ const make = Effect.gen(function* () {
     )).filter((thread) => thread.worktreePath !== null && thread.branch !== null);
     const snapshot = yield* readThreads();
     const refreshedDefaultRefs = new Map<string, Set<string>>();
+    const defaultBranches = new Map<string, string | null>();
     const groups = Map.groupBy(
       snapshot.threads.filter((thread) => thread.worktreePath !== null),
       (thread) => path.resolve(thread.worktreePath!),
@@ -611,6 +769,7 @@ const make = Effect.gen(function* () {
         outcome: "kept",
         reason: "",
         path: worktreePath,
+        projectPath: project?.workspaceRoot ?? null,
         threadId: thread.id,
         threadTitle: thread.title,
         bytes: null,
@@ -680,7 +839,30 @@ const make = Effect.gen(function* () {
         if (!eligible && (settings.worktreeUnchanged || settings.worktreeOnMerge)) {
           const repositoryCwd = path.resolve(project.workspaceRoot);
           const remote = yield* git.resolvePrimaryRemoteName(repositoryCwd);
-          const branch = yield* git.resolveDefaultBranchName(repositoryCwd, remote);
+          const defaultBranchKey = `${repositoryCwd}\0${remote}`;
+          let branch = defaultBranches.get(defaultBranchKey);
+          if (branch === undefined) {
+            branch = yield* git.resolveDefaultBranchName(repositoryCwd, remote);
+            // Without a local HEAD ref, only the remote can identify its default;
+            // a conventional name may be a feature branch.
+            if (branch === null) {
+              branch = yield* git
+                .execute({
+                  operation: "StorageCleanup.resolveDefaultBranch",
+                  cwd: repositoryCwd,
+                  args: ["ls-remote", "--symref", "--", remote, "HEAD"],
+                  timeoutMs: 20_000,
+                })
+                .pipe(
+                  Effect.map(
+                    (result) =>
+                      /^ref: refs\/heads\/(.+)\tHEAD\r?$/m.exec(result.stdout)?.[1] ?? null,
+                  ),
+                  Effect.orElseSucceed(() => null),
+                );
+            }
+            defaultBranches.set(defaultBranchKey, branch);
+          }
           if (branch === null) return keep("default branch is unavailable");
           const defaultRef = `refs/remotes/${remote}/${branch}`;
           const refreshed = refreshedDefaultRefs.get(repositoryCwd) ?? new Set<string>();
@@ -740,9 +922,9 @@ const make = Effect.gen(function* () {
           const latestProjects = yield* projectStore.listShells();
           if (yield* containsProjectRoot(worktreePath, [project, ...latestProjects]))
             return "contains a project checkout";
-          const latest = (yield* projections.getThreadWorktreePaths()).filter(
-            (entry) => path.resolve(entry.worktreePath) === worktreePath,
-          );
+          const latest = (yield* projections.getThreadWorktreePaths({
+            includeArchived: true,
+          })).filter((entry) => path.resolve(entry.worktreePath) === worktreePath);
           if (hasTerminal(worktreePath)) return "open terminal";
           if (deleted) {
             if (
@@ -829,15 +1011,24 @@ const make = Effect.gen(function* () {
           )
         )
           return keep("settings changed since check");
-        // Clean only untracked files; Git must still refuse removal if a tracked
-        // edit arrives after our last status check.
+        // Clean only untracked files. Ordinary worktrees retain Git's final tracked-edit check.
         if (settings.worktreeKeepWhen === "tracked-changes")
           yield* cleanupGit(worktreePath, ["clean", "-ffdx"], "git clean");
-        yield* cleanupGit(
-          project.workspaceRoot,
-          ["-c", "status.showUntrackedFiles=normal", "worktree", "remove", "--", worktreePath],
-          "git worktree remove",
-        );
+        const submodules = yield* submoduleRemoval(worktreePath, settings);
+        if (submodules.reason !== null) return keep(submodules.reason);
+        if (submodules.force) {
+          const changes = yield* localChangesReason(worktreePath, settings);
+          if (changes !== null) return keep(changes);
+        }
+        yield* removeLinkedWorktree({
+          operation: "StorageCleanup.cleanupGit",
+          cwd: project.workspaceRoot,
+          worktreePath,
+          // Git requires force for submodules; recursive checks above cannot make removal atomic.
+          force: submodules.force,
+          execute: git.execute,
+          run: (args) => cleanupGit(project.workspaceRoot, [...args], "git worktree remove"),
+        });
         entries.push({ ...entry, outcome: "removed", reason: sentence(removalReason), bytes });
         yield* gitManager.invalidateStatus(project.workspaceRoot);
         // Preserve branch and path: ProviderTurnStartService recreates the checkout
@@ -919,6 +1110,7 @@ const make = Effect.gen(function* () {
             outcome: "failed",
             reason: cleanupFailureReason(error),
             path: null,
+            projectPath: null,
             threadId: null,
             threadTitle: null,
             bytes: null,
@@ -951,6 +1143,7 @@ const make = Effect.gen(function* () {
             outcome: files > 0 ? "removed" : "kept",
             reason: files === 0 ? "No expired files" : `Removed ${files} ${category.label}`,
             path: null,
+            projectPath: null,
             threadId: null,
             threadTitle: null,
             bytes: files > 0 ? bytes : null,
@@ -964,6 +1157,7 @@ const make = Effect.gen(function* () {
               outcome: "failed",
               reason: cleanupFailureReason(error),
               path: null,
+              projectPath: null,
               threadId: null,
               threadTitle: null,
               bytes: removed.files > 0 ? removed.bytes : null,

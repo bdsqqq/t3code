@@ -7,14 +7,19 @@ import { EmptyState } from "../../components/ui/EmptyState";
 import { ScreenContent } from "../../components/ui/ScreenContent";
 import { useAndroidControlSizing } from "../../components/ui/useAndroidControlSizing";
 import { HomeRouteScreen } from "../home/HomeRouteScreen";
+import { PullRequestFilterMenuProvider } from "../pull-requests/PullRequestFilterMenuContext";
 import { PullRequestsScreen } from "../pull-requests/PullRequestsScreen";
 import { PullRequestToolbar } from "../pull-requests/PullRequestToolbar.android";
 import { useAdaptiveWorkspaceLayout } from "../layout/AdaptiveWorkspaceLayout";
 import { AndroidWorkspaceNavigation } from "./AndroidWorkspaceNavigation";
 import { WorkspaceTabsContext, useWorkspaceTabs } from "./WorkspaceTabsContext";
+import { WorkspaceTabPanes } from "./WorkspaceTabPanes";
+import type { WorkspaceTab } from "./workspace-tabs-state";
+
+const TABS: readonly WorkspaceTab[] = ["threads", "pullRequests"];
 
 export function WorkspaceRootScreen() {
-  const { layout } = useAdaptiveWorkspaceLayout();
+  const { layout, startNewTask } = useAdaptiveWorkspaceLayout();
   const workspace = useWorkspaceTabs()!;
   const insets = useSafeAreaInsets();
   const { fabClearance } = useAndroidControlSizing();
@@ -25,22 +30,31 @@ export function WorkspaceRootScreen() {
     }),
     [workspace, fabClearance],
   );
+  const tab = workspace.state.selectedTab;
 
   if (layout.usesSplitView) {
-    return workspace.state.selectedTab === "threads" ? (
-      <HomeRouteScreen />
-    ) : (
-      <>
-        <NativeStackScreenOptions options={{ headerShown: false }} />
-        <AndroidScreenHeader title="Pull requests" />
-        <View className="flex-1 items-center justify-center px-10">
-          <EmptyState
-            title="Select a pull request"
-            detail="Choose a pull request from the sidebar to review it."
-            variant="plain"
-          />
-        </View>
-      </>
+    return (
+      <WorkspaceTabPanes
+        tabs={TABS}
+        selected={tab}
+        renderTab={(tab) =>
+          tab === "threads" ? (
+            <HomeRouteScreen />
+          ) : (
+            <>
+              <NativeStackScreenOptions options={{ headerShown: false }} />
+              <AndroidScreenHeader title="Pull requests" />
+              <View className="flex-1 items-center justify-center px-10">
+                <EmptyState
+                  title="Select a pull request"
+                  detail="Choose a pull request from the sidebar to review it."
+                  variant="plain"
+                />
+              </View>
+            </>
+          )
+        }
+      />
     );
   }
 
@@ -49,20 +63,24 @@ export function WorkspaceRootScreen() {
       <View className="flex-1 bg-header">
         <NativeStackScreenOptions options={{ headerShown: false }} />
         <SafeAreaInsetsContext value={{ ...insets, bottom: 0 }}>
-          <View className="flex-1">
-            {workspace.state.selectedTab === "threads" ? (
-              <HomeRouteScreen />
-            ) : (
-              <>
-                <PullRequestToolbar />
-                <ScreenContent>
-                  <PullRequestsScreen />
-                </ScreenContent>
-              </>
-            )}
-          </View>
+          <WorkspaceTabPanes
+            tabs={TABS}
+            selected={tab}
+            renderTab={(tab) =>
+              tab === "threads" ? (
+                <HomeRouteScreen />
+              ) : (
+                <PullRequestFilterMenuProvider>
+                  <PullRequestToolbar />
+                  <ScreenContent>
+                    <PullRequestsScreen />
+                  </ScreenContent>
+                </PullRequestFilterMenuProvider>
+              )
+            }
+          />
         </SafeAreaInsetsContext>
-        <AndroidWorkspaceNavigation />
+        <AndroidWorkspaceNavigation onNewThread={startNewTask} />
       </View>
     </WorkspaceTabsContext>
   );

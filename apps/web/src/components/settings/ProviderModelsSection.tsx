@@ -1,5 +1,3 @@
-"use client";
-
 import { ArrowDownIcon, ArrowUpIcon, PencilIcon, PlusIcon, StarIcon, XIcon } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import {
@@ -56,9 +54,7 @@ function describeModelCapabilities(model: ServerProviderModel): string[] {
   return labels;
 }
 
-export function groupModelsForDisplay<
-  T extends { readonly slug: string; readonly isCustom: boolean },
->(
+function groupModelsForDisplay<T extends { readonly slug: string; readonly isCustom: boolean }>(
   models: ReadonlyArray<T>,
   options: {
     readonly favoriteModels: ReadonlySet<string>;
@@ -79,7 +75,7 @@ export function groupModelsForDisplay<
   ];
 }
 
-export function nextHiddenModelsForBulkToggle(
+function nextHiddenModelsForBulkToggle(
   models: ReadonlyArray<Pick<ServerProviderModel, "slug" | "isCustom">>,
   hiddenModels: ReadonlyArray<string>,
 ): string[] {
@@ -501,11 +497,29 @@ function ProviderModelRow({
         </TooltipPopup>
       </Tooltip>
       <span className="flex min-w-0 items-baseline gap-2">
-        <span className={cn(nameClassName, "truncate")}>{model.name}</span>
-        {model.name !== model.slug ? (
-          <code className="truncate font-mono text-2xs text-muted-foreground/70">{model.slug}</code>
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <span tabIndex={0} className="flex min-w-0 items-baseline gap-2 overflow-hidden" />
+            }
+          >
+            <span className={cn(nameClassName, "max-w-full shrink-0 truncate")}>{model.name}</span>
+            {model.name !== model.slug ? (
+              <code className="truncate font-mono text-2xs text-muted-foreground/70">
+                {model.slug}
+              </code>
+            ) : null}
+          </TooltipTrigger>
+          <TooltipPopup side="top" align="start">
+            <div>{model.name}</div>
+            {model.name !== model.slug ? (
+              <code className="font-mono text-2xs text-muted-foreground">{model.slug}</code>
+            ) : null}
+          </TooltipPopup>
+        </Tooltip>
+        {model.isCustom ? (
+          <span className="shrink-0 text-2xs text-muted-foreground/70">custom</span>
         ) : null}
-        {model.isCustom ? <span className="text-2xs text-muted-foreground/70">custom</span> : null}
       </span>
       <span className="text-2xs text-muted-foreground/70">
         {capLabels.length > 0 ? (

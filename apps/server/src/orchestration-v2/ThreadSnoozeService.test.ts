@@ -312,7 +312,7 @@ it("conditional snoozes park timerless threads and prevent inactivity settlement
   const parked = shell(makeThread("a"));
   assert.isTrue(isSnoozed(parked, DateTime.toEpochMillis(now)));
   assert.isFalse(isAutoSettlementCandidate(parked, DateTime.toEpochMillis(now)));
-  assert.isFalse(
+  assert.isTrue(
     isSnoozed(
       { ...parked, status: "completed", latestRunCompletedAt: DateTime.add(now, { minutes: 1 }) },
       DateTime.toEpochMillis(now),
