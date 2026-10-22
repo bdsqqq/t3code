@@ -116,6 +116,7 @@ export type {
   RespondToThreadApprovalInput,
   RespondToThreadUserInputInput,
   DismissThreadUserInputInput,
+  RetryWorkspacePreparationInput,
   RevertThreadCheckpointInput,
   SetThreadInteractionModeInput,
   SetThreadRuntimeModeInput,
@@ -448,11 +449,7 @@ export function createThreadEnvironmentAtoms<R, E>(
               input.snoozedUntil === undefined ? null : DateTime.makeUnsafe(input.snoozedUntil),
             snoozeCondition: input.condition ?? null,
             snoozeCommandId: input.commandId ?? null,
-            snoozedAt:
-              thread.snoozedUntil != null &&
-              DateTime.formatIso(thread.snoozedUntil) === input.snoozedUntil
-                ? (thread.snoozedAt ?? now)
-                : now,
+            snoozedAt: now,
           },
     ),
     unsnooze: optimistic.wrap(commands.unsnooze, (thread) => ({

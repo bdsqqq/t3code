@@ -124,8 +124,6 @@ describe("DesktopBackendPool", () => {
       assert.equal(yield* Option.getOrThrow(fetchedWsl).label, "WSL (Ubuntu)");
       assert.isTrue(Option.isNone(fetchedMissing));
       assert.lengthOf(all, 2);
-      // First instance becomes primary in layerTest so single-instance
-      // stubs don't have to wire an explicit primary.
       assert.equal(resolvedPrimary.id, DesktopBackendPool.PRIMARY_INSTANCE_ID);
     }).pipe(
       Effect.provide(
@@ -156,6 +154,52 @@ describe("DesktopBackendPool", () => {
 
         assert.equal(yield* primary.label, "WSL (Ubuntu)");
       }),
+    ),
+  );
+
+  it.effect("unregister stops the registered instance", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const id = DesktopBackendPool.BackendInstanceId("wsl:Ubuntu");
+        const pool = yield* DesktopBackendPool.DesktopBackendPool;
+        const instance = yield* pool.register({
+          id,
+          label: Effect.succeed("WSL (Ubuntu)"),
+          // A transient preflight failure leaves a restart fiber scheduled
+          // without needing a real child process.
+          configResolve: Effect.succeed({
+            executablePath: "/electron",
+            args: [],
+            entryPath: "/server/bin.mjs",
+            cwd: "/server",
+            env: {},
+            bootstrap: {
+              mode: "desktop",
+              noBrowser: true,
+              port: 3774,
+              t3Home: "/tmp/t3",
+              host: "127.0.0.1",
+              desktopBootstrapToken: "token",
+              tailscaleServeEnabled: false,
+              tailscaleServePort: 443,
+            },
+            bootstrapDelivery: "fd3",
+            extendEnv: true,
+            httpBaseUrl: new URL("http://127.0.0.1:3774"),
+            captureOutput: false,
+            preflightFailure: Option.some({ reason: "WSL starting", fatal: false }),
+          } satisfies DesktopBackendStartConfig),
+        });
+        yield* instance.start;
+        assert.equal((yield* instance.snapshot).restartScheduled, true);
+
+        yield* pool.unregister(id);
+
+        const stopped = yield* instance.snapshot;
+        assert.equal(stopped.desiredRunning, false);
+        assert.equal(stopped.restartScheduled, false);
+        assert.equal(Option.isNone(yield* pool.get(id)), true);
+      }).pipe(Effect.provide(layerPool(Ref.makeUnsafe("Windows")))),
     ),
   );
 });

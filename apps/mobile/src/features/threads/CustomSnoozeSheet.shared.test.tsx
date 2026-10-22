@@ -26,10 +26,10 @@ vi.mock("react-native", () => {
     ),
   };
 });
-vi.mock("../../components/AppText", () => ({
+vi.mock("../../components/ui/AppText", () => ({
   AppText: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 }));
-vi.mock("../../components/SegmentedControl", () => ({
+vi.mock("../../components/ui/SegmentedControl", () => ({
   SegmentedControl: (props: {
     options: ReadonlyArray<{ value: string; label: string }>;
     onSelect: (value: string) => void;

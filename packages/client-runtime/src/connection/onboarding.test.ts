@@ -1,5 +1,4 @@
 import {
-  AuthAdministrativeScopes,
   AuthStandardClientScopes,
   EnvironmentId,
   type AuthEnvironmentScope,
@@ -208,7 +207,6 @@ const registerSwitchedOffEnvironment = Effect.gen(function* () {
       connectionId: PAIRED_PROFILE.connectionId,
       label: "Old label",
     }),
-    // Keep the endpoint unchanged: registration alone must retain the stale reason.
     profile: new BearerConnectionProfile({ ...PAIRED_PROFILE, label: "Old label" }),
     credential: new BearerConnectionCredential({ token: "old-token" }),
   });
@@ -424,7 +422,7 @@ describe("connection onboarding", () => {
   );
   it.effect.each([
     { label: "read-only", scopes: ["orchestration:read"] },
-    { label: "administrative", scopes: AuthAdministrativeScopes },
+    { label: "default", scopes: AuthStandardClientScopes },
   ] as const)("preserves the $label grant when pairing a remote environment", ({ scopes }) =>
     Effect.gen(function* () {
       const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
@@ -642,6 +640,8 @@ describe("connection onboarding", () => {
           connectionId: 'ssh:environment-ssh:["devbox","devbox.example.test","developer",22]',
           target,
         },
+        // Saved so the first connect reuses this pairing instead of adding another.
+        credential: { token: "bearer-token" },
       });
     }),
   );

@@ -22,7 +22,6 @@ type ChildProcessCommand = {
   };
 };
 
-// Accesses private properties of ChildProcessCommand for testing purposes
 function asChildProcessCommand(command: unknown): ChildProcessCommand {
   return command as ChildProcessCommand;
 }
@@ -200,6 +199,33 @@ describe("runProcess", () => {
       expect(error).not.toHaveProperty("args");
       expect(error).not.toHaveProperty("resolvedArgs");
       expect(error.message).not.toContain("secret-token-value");
+    }),
+  );
+
+  it.effect("types spawn failures that the platform spawner throws synchronously", () =>
+    Effect.gen(function* () {
+      // A non-directory entry on PATH makes node's spawn throw ENOTDIR
+      // synchronously. The platform spawner calls it inside `Effect.callback`,
+      // so the throw arrives as a defect rather than a typed error.
+      const defect = Object.assign(new Error("spawn jj ENOTDIR"), { code: "ENOTDIR" });
+      const spawner = makeSpawner(() =>
+        Effect.callback<never, never>(() => {
+          throw defect;
+        }),
+      );
+
+      const error = yield* runWith(spawner)({
+        command: "jj",
+        args: ["--version"],
+        cwd: "/repo",
+      }).pipe(Effect.flip);
+
+      expect(error._tag).toBe("ProcessSpawnError");
+      if (error._tag !== "ProcessSpawnError") {
+        return expect.fail("Expected ProcessSpawnError");
+      }
+      expect(error).toMatchObject({ command: "jj", argumentCount: 1, cwd: "/repo" });
+      expect(error.cause).toBe(defect);
     }),
   );
 

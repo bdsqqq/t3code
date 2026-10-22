@@ -1,9 +1,9 @@
 import { useAtomValue } from "@effect/atom-react";
-import { Atom } from "effect/reactivity";
-import { type ReactNode, useCallback, useMemo, useSyncExternalStore } from "react";
+import { type ReactNode, useSyncExternalStore } from "react";
 
 import { cn } from "~/lib/utils";
-import { serverEnvironment } from "~/state/server";
+import { environmentIdsKey } from "~/state/environmentAtomList";
+import { environmentUpdateStatesAtom } from "~/state/server";
 import { useServerUpdate } from "../ServerUpdateAction";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTrigger } from "../ui/popover";
@@ -22,37 +22,26 @@ import {
   retryFailedUpdateRunServers,
 } from "./updateEverythingRun";
 
-/** The current time, rounded down to `intervalMs` so it changes once per
-    interval. With null it is read only when something else renders. */
 function useNow(intervalMs: number | null): number {
   const step = intervalMs ?? 60_000;
-  const subscribe = useCallback(
-    (onChange: () => void) => {
-      if (intervalMs === null) return () => {};
-      const timer = setInterval(onChange, intervalMs);
-      return () => clearInterval(timer);
-    },
-    [intervalMs],
-  );
+  const subscribe = (onChange: () => void) => {
+    if (intervalMs === null) return () => {};
+    const timer = setInterval(onChange, intervalMs);
+    return () => clearInterval(timer);
+  };
   return useSyncExternalStore(subscribe, () => Math.floor(Date.now() / step) * step);
 }
 
 function useUpdateRunMachineViews(run: UpdateEverythingRun): ReadonlyArray<UpdateRunMachineView> {
-  const viewsAtom = useMemo(
-    () =>
-      Atom.make((get) =>
-        run.machines.map((machine) => ({
-          machine,
-          status: resolveUpdateRunMachineStatus(
-            machine,
-            run.phase,
-            get(serverEnvironment.updateStateAtom(machine.environmentId)),
-          ),
-        })),
-      ),
-    [run],
+  const updateStates = useAtomValue(
+    environmentUpdateStatesAtom(
+      environmentIdsKey(run.machines.map(({ environmentId }) => environmentId)),
+    ),
   );
-  return useAtomValue(viewsAtom);
+  return run.machines.map((machine, index) => ({
+    machine,
+    status: resolveUpdateRunMachineStatus(machine, run.phase, updateStates[index]!),
+  }));
 }
 
 function localStatusLabel(run: UpdateEverythingRun, local: UpdateRunLocalState, now: number) {
@@ -66,13 +55,6 @@ function localStatusLabel(run: UpdateEverythingRun, local: UpdateRunLocalState, 
   return "restarts after the servers";
 }
 
-/**
- * The sidebar update button while an "update everything" pass runs. It grows
- * left into the free footer space and names the most urgent thing: this
- * app's restart countdown, a slow machine, progress, or a failure. Click it
- * for every machine. Time labels change once a second only during the
- * countdown, and otherwise once every 30 seconds.
- */
 export function SidebarUpdateCapsule({
   run,
   local,
@@ -82,7 +64,6 @@ export function SidebarUpdateCapsule({
   readonly run: UpdateEverythingRun;
   readonly local: UpdateRunLocalState;
   readonly icon: ReactNode;
-  /** Installs this app's downloaded update after the user postponed it. */
   readonly onRestart?: () => Promise<void>;
 }) {
   const machines = useUpdateRunMachineViews(run);
@@ -129,7 +110,6 @@ export function SidebarUpdateCapsule({
             <span className="text-warning tabular-nums"> {view.slow.elapsed}</span>
           ) : null}
         </span>
-        {/* The footer leaves little room, so an action takes the icon's place. */}
         {view.action !== null ? (
           <button
             type="button"

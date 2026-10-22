@@ -210,9 +210,6 @@ describe("threadHistoryPaging", () => {
   });
 
   it("counts runs that a notification started toward the 150-turn ceiling", () => {
-    // A wake (PR watch, task completion) starts its run with a notification. A
-    // row of the run (a handoff) can come before it, and a wake steered into the
-    // running turn comes after it and starts no turn.
     const inRun = (index: number, run: number, item: object = {}) => {
       const row = makeRow(index);
       return {
@@ -247,7 +244,6 @@ describe("threadHistoryPaging", () => {
       inRun(run * 4 + 3, run),
     ]).flat();
     const first = selectRecentTimelineWindow({ items, snapshotSequence: 1 });
-    // 150 runs from the start of run 11. Its earlier row goes to the older page.
     expect(first.items).toHaveLength(150 * 4 - 1);
     expect(first.items[0]?.sourceItemId).toBe(`item-${11 * 4 + 1}`);
     const older = selectHistoryPageFromCursor({
@@ -373,8 +369,6 @@ describe("threadHistoryPaging", () => {
       snapshotSequence: 3,
       policy: { maxItems: 2, maxEncodedBytes: 10_000_000 },
     });
-    // Clamp exclusive end to items.length and page backward so the client can
-    // dedupe and advance rather than permanently 400 on a dead cursor.
     expect(page.items.map((row) => row.sourceItemId)).toEqual(["item-3", "item-4"]);
     expect(page.hasMoreHistory).toBe(true);
     expect(page.nextCursor).not.toBeNull();
@@ -420,7 +414,6 @@ describe("threadHistoryPaging", () => {
     expect(bounded.hasMoreHistory).toBe(true);
     expect(bounded.historyCursor).not.toBeNull();
     expect(bounded.projection.visibleTurnItems.map((row) => row.position)).toEqual([0, 1, 2, 3, 4]);
-    // Watermark comes from the full projection, not the trimmed window.
     expect(bounded.latestLocalTurnOrdinal).toBe(40);
     expect(computeLatestLocalTurnOrdinal(full.turnItems)).toBe(40);
   });
@@ -471,13 +464,7 @@ describe("threadHistoryPaging", () => {
         threadId: ThreadId.make("parent-thread"),
       },
     };
-    // Full projection still has local turnItems even if the recent window is
-    // only the inherited row (e.g. after aggressive byte budget on a large
-    // local item that is not selected into the recent page). Use a synthetic
-    // projection with local turnItems and inherited-only visible window.
     const full = makeProjection([localOlder, localMid, inherited]);
-    // Force an inherited-only visible window by rebuilding with only inherited
-    // visible rows while retaining full local turnItems for the watermark.
     const inheritedOnly = {
       ...full,
       visibleTurnItems: [inherited],
@@ -496,7 +483,6 @@ describe("threadHistoryPaging", () => {
   });
 
   it("retains an out-of-window run_interrupt_request needed by a visible result", () => {
-    // Older request sits outside a 1-row recent window; result is visible alone.
     const request = interruptRow(0, "run_interrupt_request");
     const filler = makeRow(1);
     const result = interruptRow(2, "run_interrupt_result");
@@ -518,9 +504,6 @@ describe("threadHistoryPaging", () => {
   });
 
   it("retains all run_interrupt_request items even when no result is in the initial window", () => {
-    // Cold open: recent window is only filler. Request and result both live on
-    // older pages, but the request must still ride in turnItems so a later
-    // history page can introduce the result safely under live attempt updates.
     const request = interruptRow(0, "run_interrupt_request");
     const result = interruptRow(1, "run_interrupt_result");
     const recent = makeRow(2);
@@ -564,7 +547,6 @@ describe("threadHistoryPaging", () => {
     expect(bounded.projection.visibleTurnItems.length).toBeGreaterThan(0);
     expect(bounded.projection.visibleTurnItems.length).toBeLessThan(rows.length);
 
-    // History pages only charge the projected row once (no turnItems copy).
     const historyPage = selectRecentTimelineWindow({
       items: rows,
       snapshotSequence: 1,
@@ -577,7 +559,6 @@ describe("threadHistoryPaging", () => {
     expect(historyBytes).toBeLessThanOrEqual(maxEncodedBytes);
     expect(historyPage.items.length).toBeGreaterThan(bounded.projection.visibleTurnItems.length);
 
-    // Dual-cost for one local row exceeds the plain row cost.
     const sample = rows[0]!;
     expect(projectedRowBoundedSnapshotEncodedBytes(sample, THREAD)).toBeGreaterThan(
       projectedRowEncodedBytes(sample),
@@ -636,6 +617,35 @@ describe("threadHistoryPaging", () => {
     expect(Buffer.byteLength(JSON.stringify(bounded.projection), "utf8")).toBeLessThan(
       THREAD_HISTORY_PAGE_POLICY.maxEncodedBytes + 100_000,
     );
+  });
+
+  it("keeps a workflow coordinator's script outside the bounded window", () => {
+    const projection = makeProjection(Array.from({ length: 120 }, (_, index) => makeRow(index)));
+    const message = (index: number, workflowScript?: boolean) => ({
+      id: MessageId.make(`message-${index}`),
+      threadId: THREAD,
+      runId: RunId.make(`old-run-${index}`),
+      nodeId: null,
+      role: "user" as const,
+      text: `message ${index}`,
+      attachments: [],
+      streaming: false,
+      createdBy: "agent" as const,
+      creationSource: "provider" as const,
+      createdAt: NOW,
+      updatedAt: NOW,
+      ...(workflowScript === undefined ? {} : { workflowScript }),
+    });
+    const full = {
+      ...projection,
+      messages: [message(0, true), message(1, false), message(2)],
+    } as typeof projection;
+
+    const bounded = buildBoundedThreadProjection({ projection: full, snapshotSequence: 9 });
+
+    expect(bounded.projection.messages.map((retained) => retained.id)).toEqual([
+      MessageId.make("message-0"),
+    ]);
   });
 
   it("omits historical control details that remain available from history items", () => {
@@ -706,6 +716,41 @@ describe("threadHistoryPaging", () => {
     expect(bounded.payloadBudgetExceeded).toBe(true);
     expect(bounded.projection.plans[0]).toEqual(actionable.plans[0]);
     expect(bounded.projection.visibleTurnItems).toEqual(actionable.visibleTurnItems);
+  });
+
+  it("keeps agent-only turns visible when checkpoint file lists fill the byte budget", () => {
+    const items = Array.from({ length: 3 }, (_, turn) => {
+      const first = makeRow(turn * 5);
+      const prompt = {
+        ...first,
+        item: {
+          ...first.item,
+          type: "user_message" as const,
+          createdBy: "agent" as const,
+          creationSource: "provider" as const,
+          inputIntent: "turn_start" as const,
+          messageId: MessageId.make(`agent-prompt-${turn}`),
+          text: `Step ${turn}`,
+          attachments: [],
+        },
+      } as OrchestrationV2ProjectedTurnItem;
+      return [prompt, ...Array.from({ length: 4 }, (_, index) => makeRow(turn * 5 + index + 1))];
+    }).flat();
+    const files = Array.from(
+      { length: 15_000 },
+      (_, index) =>
+        `work/ws-${index % 40}/.jj/repo/store/extra/${index.toString(16).padStart(40, "0")}`,
+    );
+    const projection = {
+      ...makeProjection(items),
+      checkpoints: [{ id: "checkpoint-1", files }],
+    } as unknown as ReturnType<typeof makeProjection>;
+
+    const bounded = buildBoundedThreadProjection({ projection, snapshotSequence: 1 });
+
+    expect(bounded.projection.visibleTurnItems).toHaveLength(items.length);
+    expect(bounded.hasMoreHistory).toBe(false);
+    expect(bounded.payloadBudgetExceeded).toBe(true);
   });
 
   it("keeps paged historical plan detail in the turn item and only status in its artifact", () => {

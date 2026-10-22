@@ -1,6 +1,7 @@
 import type { QueryPersistence } from "./queryPersistence.ts";
 import { createCommandPermissions } from "./commandPermissions.ts";
 import { followStreamInEnvironment } from "./environmentStreams.ts";
+import { reuseUnchanged } from "./serverConfigProjection.ts";
 export { runStreamInEnvironment, followStreamInEnvironment } from "./environmentStreams.ts";
 import {
   type ClientGuardedRpcTag,
@@ -11,6 +12,7 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom, AtomRegistry } from "effect/reactivity";
@@ -32,6 +34,30 @@ import {
   subscribe,
 } from "../rpc/client.ts";
 import * as EnvironmentSupervisor from "../connection/supervisor.ts";
+import type * as RpcSession from "../rpc/session.ts";
+
+const isEnvironmentRpcUnavailable = Schema.is(EnvironmentRpcUnavailableError);
+
+/**
+ * Holds back the unavailable failure of a query whose session went away. The
+ * query atom reruns when it sees that session change, so settling first would
+ * show a failure for a query that is about to retry. While `session` is still
+ * current no rerun is coming, and the failure stands.
+ */
+const pendingOnceSessionReplaced =
+  (session: RpcSession.RpcSession) =>
+  <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+    effect.pipe(
+      // The query's error type is generic, so its tags are unknown to `catchTags`.
+      Effect.catchIf(isEnvironmentRpcUnavailable, (error) =>
+        EnvironmentSupervisor.EnvironmentSupervisor.pipe(
+          Effect.flatMap((supervisor) => SubscriptionRef.get(supervisor.session)),
+          Effect.flatMap((current) =>
+            Option.isSome(current) && current.value === session ? Effect.fail(error) : Effect.never,
+          ),
+        ),
+      ),
+    );
 
 interface EnvironmentAtomOptions<Input, A, E, R> {
   readonly label: string;
@@ -74,7 +100,6 @@ interface EnvironmentQueryAtomOptions<Input, A, E, R> extends Omit<
     readonly environmentId: EnvironmentIdType;
     readonly input: Input;
   }) => Atom.Atom<unknown> | undefined;
-  /** A value that can no longer change. It stops the interval and `refreshTrigger` re-reads. */
   readonly isFinal?: (value: A) => boolean;
 }
 
@@ -111,13 +136,8 @@ export interface AtomCommand<W, A, E> {
 }
 
 export type AtomCommandConcurrency<W> =
-  /** Every invocation runs independently. */
   | { readonly mode: "parallel" }
   | {
-      /**
-       * `serial` preserves every invocation in FIFO order, `singleFlight` shares an active
-       * invocation, and `latest` coalesces queued invocations to the newest input.
-       */
       readonly mode: "serial" | "singleFlight" | "latest";
       readonly key: (input: W) => string;
     };
@@ -279,7 +299,6 @@ export function createAtomCommandScheduler(): AtomCommandScheduler {
   };
 }
 
-/** Runs one effect inside an existing command scheduler lane. */
 export function scheduleAtomCommandEffect<W, A, E, R>(
   registry: AtomRegistry.AtomRegistry,
   scheduler: AtomCommandScheduler,
@@ -359,7 +378,6 @@ export interface AtomQueryOptions extends AtomCommandOptions {
    * verification flows where a cached failure must not satisfy a retry.
    */
   readonly refresh?: boolean;
-  /** Interrupt the query wait when its caller no longer wants the result. */
   readonly signal?: AbortSignal;
 }
 
@@ -374,8 +392,6 @@ export async function executeAtomQuery<A, E>(
       yield* AtomRegistry.mount(registry, atom);
       if (options.refresh) {
         yield* Effect.sync(() => {
-          // Only a settled value can be a leftover from an earlier read; a
-          // computation that mounting just started is already fresh.
           const current = registry.get(atom);
           if (current._tag !== "Initial" && !current.waiting) {
             registry.refresh(atom);
@@ -480,7 +496,6 @@ function runInEnvironment<A, E, R>(
 }
 
 /**
- * Refreshes a query when `signal` changes, but only while something reads it.
  * `Atom.makeRefreshOnSignal` subscribes to the signal, so a query that outlives its view on an
  * idle TTL still re-runs on every change. Reading the signal as a dependency instead lets the
  * registry re-run a mounted query right away and only mark an idle one stale, which then
@@ -508,7 +523,6 @@ const refreshOnSignalWhileRead =
     );
   };
 
-/** `Atom.withRefresh`, except the timer stops once the value is final. */
 const refreshEveryUntilFinal =
   <V>(intervalMs: number, isFinal: (value: V) => boolean) =>
   <A extends V>(self: Atom.Atom<A>): Atom.Atom<A> =>
@@ -525,6 +539,14 @@ const refreshEveryUntilFinal =
       },
       { initialValueTarget: self },
     );
+
+/**
+ * A query result's data alone. A refetch always publishes a new result (a new
+ * timestamp, `waiting` on and off), while equal data keeps its identity, so a
+ * reader of only this skips the refetches that changed nothing.
+ */
+export const selectEnvironmentQueryData = <A, E>(result: AsyncResult.AsyncResult<A, E>): A | null =>
+  Option.getOrNull(AsyncResult.value(result));
 
 export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry.EnvironmentRegistry | R, ER>,
@@ -572,8 +594,17 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
         const connection = Option.getOrNull(
           AsyncResult.value(get(connectionAtom(target.environmentId))),
         );
+        // A refetch that returns equal content keeps the previous value's
+        // references, so readers of the data skip re-rendering on idle polls.
+        const share = (value: A): A =>
+          reuseUnchanged(
+            Option.getOrUndefined(
+              Option.flatMap(get.self<AsyncResult.AsyncResult<A, unknown>>(), AsyncResult.value),
+            ),
+            value,
+          );
         const emit = (value: A) =>
-          Effect.sync(() => get.setSelf(AsyncResult.success(value, { waiting: true }))).pipe(
+          Effect.sync(() => get.setSelf(AsyncResult.success(share(value), { waiting: true }))).pipe(
             // A value set while the atom builds wins over the build's own
             // result, so a query that then settled synchronously would stay
             // waiting forever. Suspend on a promise (`yieldNow` is drained
@@ -595,7 +626,12 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
           switch (connectionState.phase) {
             case "connected":
               return Option.isSome(session)
-                ? runInEnvironment(target.environmentId, options.execute(target.input, emit))
+                ? runInEnvironment(
+                    target.environmentId,
+                    options
+                      .execute(target.input, emit)
+                      .pipe(pendingOnceSessionReplaced(session.value)),
+                  )
                 : Effect.never;
             case "connecting":
             case "backoff":
@@ -616,7 +652,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
               );
           }
         };
-        if (!options.persistence) return execute();
+        if (!options.persistence) return execute().pipe(Effect.map(share));
         const persistence = options.persistence;
         const cacheKey = JSON.stringify([options.label, target.input]);
         const previous = Option.flatMap(
@@ -635,6 +671,7 @@ export function createEnvironmentQueryAtomFamily<R, ER, Input, A, E>(
           }
           if (Option.isNone(previous) && Option.isSome(cached)) yield* emit(cached.value);
           return yield* execute().pipe(
+            Effect.map(share),
             Effect.tap((value) => persistence.save(target.environmentId, cacheKey, value)),
           );
         });
@@ -675,9 +712,9 @@ export function createEnvironmentSubscriptionAtomFamily<R, ER, Input, A, E>(
     const target = parseEnvironmentRpcKey<Input>(key);
     return runtime
       .atom(
-        followStreamInEnvironment(target.environmentId, options.subscribe(target.input)).pipe(
-          options.completeWhen ? Stream.takeUntil(options.completeWhen) : (stream) => stream,
-        ),
+        Stream.suspend(() =>
+          followStreamInEnvironment(target.environmentId, options.subscribe(target.input)),
+        ).pipe(options.completeWhen ? Stream.takeUntil(options.completeWhen) : (stream) => stream),
       )
       .pipe(
         Atom.setIdleTTL(options.idleTtlMs ?? 5 * 60_000),

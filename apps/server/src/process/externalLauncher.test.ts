@@ -31,7 +31,6 @@ const windowsHost = HostProcess.Platform.defaultValue() === "win32";
 interface MockSpawnResult {
   readonly exitCode?: number;
   readonly stdout?: string;
-  /** Never deliver an exit code, like a child wedged on a broken desktop session. */
   readonly stall?: boolean;
 }
 
@@ -122,6 +121,52 @@ it.effect("launches the default browser through the platform command", () => {
     ),
   );
 });
+
+it.effect.skipIf(windowsHost)(
+  "launched browsers and editors do not inherit ELECTRON_RUN_AS_NODE",
+  () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const binDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-editors-" });
+      const codePath = path.join(binDir, "code");
+      yield* fileSystem.writeFileString(codePath, "#!/bin/sh\n");
+      yield* fileSystem.chmod(codePath, 0o755);
+
+      const spawned: ChildProcess.StandardCommand[] = [];
+      yield* Effect.gen(function* () {
+        const launcher = yield* ExternalLauncher.ExternalLauncher;
+        yield* launcher.launchBrowser("https://example.com");
+        yield* launcher.launchEditor({ editor: "vscode", cwd: "/workspace" });
+      }).pipe(
+        Effect.provide(
+          layerTest({
+            platform: "linux",
+            env: { PATH: binDir, DISPLAY: ":0" },
+            onSpawn: (command) => spawned.push(command),
+          }),
+        ),
+        Effect.provideService(HostProcess.Environment, {
+          PATH: binDir,
+          DISPLAY: ":0",
+          ELECTRON_RUN_AS_NODE: "1",
+        }),
+      );
+
+      assert.deepEqual(
+        spawned.map((command) => ({
+          command: command.command,
+          env: command.options.env,
+          extendEnv: command.options.extendEnv,
+        })),
+        ["xdg-open", "code"].map((command) => ({
+          command,
+          env: { PATH: binDir, DISPLAY: ":0" },
+          extendEnv: false,
+        })),
+      );
+    }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
 
 it.effect.each(["win32", "linux"] as const)(
   "launches the browser through PowerShell on %s",
@@ -303,6 +348,34 @@ it.effect("launches Cursor in classic IDE mode through the Windows command shim"
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
+it.effect("opens a folder in File Explorer with Windows separators", () =>
+  Effect.gen(function* () {
+    const fileSystem = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const binDir = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-editors-" });
+    yield* fileSystem.writeFileString(path.join(binDir, "explorer.EXE"), "");
+
+    let spawned: ChildProcess.StandardCommand | undefined;
+    yield* Effect.gen(function* () {
+      const launcher = yield* ExternalLauncher.ExternalLauncher;
+      yield* launcher.launchEditor({ editor: "file-manager", cwd: "C:/workspace/project" });
+    }).pipe(
+      Effect.provide(
+        layerTest({
+          platform: "win32",
+          env: { PATH: binDir, PATHEXT: ".COM;.EXE;.BAT;.CMD" },
+          onSpawn: (command) => {
+            spawned = command;
+          },
+        }),
+      ),
+    );
+
+    assert.ok(spawned);
+    assert.deepEqual(spawned.args, ["C:\\workspace\\project"]);
+  }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
+);
+
 it.effect.skipIf(windowsHost)("reveals a file in Finder with open -R on macOS", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -357,8 +430,6 @@ it.effect("reveals a file in File Explorer through PowerShell on Windows", () =>
       const launcher = yield* ExternalLauncher.ExternalLauncher;
       yield* launcher.launchEditor({
         editor: "file-manager",
-        // Web file links normalize separators even when the server runs on
-        // Windows. Explorer's `/select` switch requires Windows separators.
         cwd: "C:/workspace with spaces/media/author's clip.mp4",
         reveal: true,
       });
@@ -387,8 +458,6 @@ it.effect("reveals a file in File Explorer through PowerShell on Windows", () =>
     ]);
     const encodedCommand = spawned.args[spawned.args.length - 1] ?? "";
     const decodedCommand = Buffer.from(encodedCommand, "base64").toString("utf16le");
-    // explorer.exe expects `/select,"<path>"` with only the path quoted;
-    // PowerShell 5.1's Start-Process passes the argument string verbatim.
     assert.equal(
       decodedCommand,
       "$ProgressPreference = 'SilentlyContinue'; Start-Process 'explorer.exe' -ArgumentList ('/select,\"' + 'C:\\workspace with spaces\\media\\author''s clip.mp4' + '\"')",
@@ -398,8 +467,6 @@ it.effect("reveals a file in File Explorer through PowerShell on Windows", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// Exercise real spawning, ignored stdio, unref, and scope cleanup. Only the
-// destination application is replaced, so tests never open Explorer or a browser.
 for (const kind of ["browser", "reveal"] as const) {
   it.live.skipIf(!windowsHost)(
     `completes a ${kind} launch through real PowerShell after the launcher scope closes`,
@@ -415,7 +482,6 @@ for (const kind of ["browser", "reveal"] as const) {
             recorderPath,
             `@echo off\r\n>"${stagingPath}" echo(%*\r\nmove /y "${stagingPath}" "${outputPath}" >nul\r\n`,
           );
-          // The rename publishes a complete result; no sleeps or file polling.
           const recorded = new Promise<string>((resolve, reject) => {
             watcher.on("change", () => {
               if (NodeFS.existsSync(outputPath)) {
@@ -510,8 +576,6 @@ it.effect("does not advertise reveal on Windows when PowerShell is missing", () 
       ),
     );
 
-    // Plain "open in file manager" still works through explorer; only the
-    // reveal capability, which launches PowerShell, must stay hidden.
     assert.equal(result.editors.includes("file-manager"), true);
     assert.isUndefined(result.kind);
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
@@ -560,8 +624,6 @@ it.effect.skipIf(windowsHost)(
       assert.equal(result.kind, "file-explorer");
       assert.equal(result.editors.includes("file-manager"), true);
       assert.ok(spawned);
-      // The reveal routes through interop PowerShell so Explorer receives its
-      // raw `/select,"<path>"` switch even for spaced paths.
       assert.equal(spawned.command, "powershell.exe");
       assert.equal(spawned.options.detached, true);
       const encodedCommand = spawned.args[spawned.args.length - 1] ?? "";
@@ -608,9 +670,6 @@ it.effect.skipIf(windowsHost)(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// When interop PowerShell is missing the capability advertises the Linux
-// "files" kind (or nothing), so the reveal must open the Linux file manager
-// the label promised even though plain open still prefers File Explorer.
 it.effect.skipIf(windowsHost)(
   "reveals through the Linux file manager when WSL lacks interop PowerShell",
   () =>
@@ -663,9 +722,6 @@ it.effect.skipIf(windowsHost)(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// Interop can exist without `explorer.exe` on PATH (appendWindowsPath=false)
-// while WSLg still provides a working Linux file manager; the host must keep
-// the Linux open/reveal path instead of losing the editor entirely.
 it.effect.skipIf(windowsHost)(
   "falls back to the Linux file manager when WSL lacks the Explorer bridge",
   () =>
@@ -756,8 +812,6 @@ it.effect.skipIf(windowsHost)(
         ),
       );
 
-      // Explorer's raw switch cannot express a double quote, so the launch
-      // opens the parent directory instead of misparsing a /select argument.
       assert.ok(spawned);
       assert.equal(spawned.command, "explorer.exe");
       assert.deepEqual(spawned.args, ['\\\\wsl.localhost\\Ubuntu-24.04\\home\\t3\\work "quoted"']);
@@ -863,9 +917,6 @@ it.effect.skipIf(windowsHost)(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// `xdg-open` with a display variable but no `inode/directory` handler exits
-// nonzero after the launch has already detached: without this gate the server
-// advertises a reveal that is a silent no-op.
 it.effect.skipIf(windowsHost)(
   "does not advertise a Linux file manager without a directory handler",
   () =>
@@ -929,10 +980,7 @@ it.effect.skipIf(windowsHost)(
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// The handler probe carries its own timeout because the editor scan's outer
-// timeout in server.getConfig degrades to an EMPTY editor list: a wedged
-// xdg-mime must cost only the file manager, never the other editors. Runs on
-// the live clock so the probe's real timeout fires.
+// Runs on the live clock so the probe's real timeout fires.
 it.live.skipIf(windowsHost)("a stalled handler probe drops only the file manager", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
@@ -1169,11 +1217,6 @@ for (const cwd of ["/workspace with spaces/", "/workspace with spaces/file.ts:12
   );
 }
 
-// JetBrains Toolbox names its bundles after the app and the installed version
-// (`IntelliJ IDEA 2026.1.4.app`), so the darwin branch has to list the
-// Applications directories the way the win32 branch does instead of probing
-// exact `<name>.app` paths. The fixtures only use the mocked platform and a
-// temp directory, so this runs on a Windows host too.
 it.effect.each([
   { editor: "webstorm", installPath: "Applications/WebStorm 2026.2.app/Contents/MacOS/webstorm" },
   { editor: "idea", installPath: "Applications/IntelliJ IDEA 2026.1.4.app/Contents/MacOS/idea" },
@@ -1218,8 +1261,6 @@ it.effect.each([
     }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// An app whose name merely starts with the same letters is a different IDE, and
-// an exact `<name>.app` bundle keeps resolving the way it did before.
 it.effect("matches macOS bundles on the name boundary only", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1255,10 +1296,6 @@ it.effect("matches macOS bundles on the name boundary only", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// `Visual Studio Code - Insiders.app` starts with the stable VS Code install
-// name, so a plain prefix match let the stable editor resolve to the Insiders
-// bundle. Insiders has to stay reachable under its own name, stable VS Code has
-// to stay unresolved.
 it.effect("keeps the macOS VS Code Insiders bundle out of stable VS Code", () =>
   Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -1299,8 +1336,6 @@ it.effect("keeps the macOS VS Code Insiders bundle out of stable VS Code", () =>
   }).pipe(Effect.scoped, Effect.provide(NodeServices.layer)),
 );
 
-// `agy` is the standalone Antigravity CLI, which installs to ~/.local/bin on
-// macOS and Linux and to its own bin folder on Windows. It is not the IDE.
 for (const { platform, installPath, onPath } of [
   { platform: "darwin", installPath: ".local/bin/agy", onPath: true },
   { platform: "linux", installPath: ".local/bin/agy", onPath: false },
@@ -1415,14 +1450,11 @@ it.effect("memoizes editor discovery and refreshes after the cache window", () =
     const statCallsAfterFirstScan = statCalls;
     assert.isAbove(statCallsAfterFirstScan, 0);
 
-    // Past the shared command-resolution cache TTL (30s) but within the
-    // discovery cache window: the memoized set is reused without any scan.
     yield* TestClock.adjust("31 seconds");
     const second = yield* launcher.resolveAvailableEditors();
     assert.deepEqual([...second], [...first]);
     assert.equal(statCalls, statCallsAfterFirstScan);
 
-    // Past the discovery cache window the next call rescans.
     yield* TestClock.adjust("30 seconds");
     yield* launcher.resolveAvailableEditors();
     assert.isAbove(statCalls, statCallsAfterFirstScan);
@@ -1445,9 +1477,6 @@ it.effect("memoizes editor discovery and refreshes after the cache window", () =
   );
 });
 
-// Connects run discovery under a timeout and may disconnect mid-scan. Neither
-// may cancel the scan: on a busy host every connect would time out partway
-// through, cache nothing, and leave every client without editors.
 it.effect("keeps scanning after the caller is interrupted and shares that scan", () => {
   const fileInfo = { type: "File" } as FileSystem.File.Info;
   const release = Deferred.makeUnsafe<void>();
@@ -1456,8 +1485,6 @@ it.effect("keeps scanning after the caller is interrupted and shares that scan",
     Layer.provide(
       Layer.mergeAll(
         FileSystem.layerNoop({
-          // Scans park inside `stat` until released, so the interrupt lands
-          // while discovery is in flight.
           stat: () =>
             Effect.gen(function* () {
               if (!Deferred.isDoneUnsafe(release)) {
@@ -1483,7 +1510,6 @@ it.effect("keeps scanning after the caller is interrupted and shares that scan",
     yield* Effect.yieldNow;
     yield* Fiber.interrupt(interrupted);
 
-    // The next connect joins the running scan instead of starting its own.
     const next = yield* Effect.forkChild(launcher.resolveAvailableEditors());
     yield* Effect.yieldNow;
     assert.equal(parkedStats, 1);

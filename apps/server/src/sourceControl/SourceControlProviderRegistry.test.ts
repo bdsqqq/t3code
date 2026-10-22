@@ -12,6 +12,7 @@ import * as PubSub from "effect/PubSub";
 import * as Redacted from "effect/Redacted";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
+import { HttpClient } from "effect/http";
 import { ChildProcessSpawner } from "effect/process";
 import {
   DEFAULT_SERVER_SETTINGS,
@@ -30,7 +31,8 @@ import * as AzureDevOpsPullRequestCli from "@t3tools/source-control-azure-devops
 import * as BitbucketApi from "@t3tools/source-control-bitbucket/server/BitbucketApi";
 import * as BitbucketPullRequestApi from "@t3tools/source-control-bitbucket/server/BitbucketPullRequestApi";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
-import * as GitHubApi from "@t3tools/source-control-github/server/GitHubApi";
+import * as GitHubRest from "@t3tools/source-control-github/server/GitHubRest";
+import * as GitHubRequestPolicy from "@t3tools/source-control-github/server/GitHubRequestPolicy";
 import * as GitHubPullRequestApi from "@t3tools/source-control-github/server/GitHubPullRequestApi";
 import * as GitHubCredentials from "@t3tools/source-control-github/server/GitHubCredentials";
 import * as GitLabCli from "@t3tools/source-control-gitlab/server/GitLabCli";
@@ -63,7 +65,7 @@ function makeRegistry(input: {
     readonly url: string;
   }>;
   readonly process?: Partial<VcsProcess.VcsProcess["Service"]>;
-  readonly githubApi?: Partial<GitHubApi.GitHubApi["Service"]>;
+  readonly githubApi?: Partial<GitHubRest.GitHubRest["Service"]>;
   readonly gitlab?: Partial<GitLabCli.GitLabCli["Service"]>;
   readonly forgejo?: Partial<ForgejoCli.ForgejoCli["Service"]>;
   readonly settings?: Partial<ServerSettings.ServerSettingsService["Service"]>;
@@ -135,7 +137,13 @@ function makeRegistry(input: {
           ? Layer.mock(ServerSettings.ServerSettingsService)(input.settings)
           : ServerSettings.ServerSettingsService.layerTest(),
         Layer.mock(GitHubPullRequestApi.GitHubPullRequestApi)({}),
-        Layer.mock(GitHubApi.GitHubApi)({
+        // The GitHub provider's GraphQL reads go through these; no test here makes one.
+        Layer.mock(GitHubRequestPolicy.GitHubRequestPolicy)({}),
+        Layer.succeed(
+          HttpClient.HttpClient,
+          HttpClient.make(() => Effect.die(new Error("Unexpected GitHub GraphQL read"))),
+        ),
+        Layer.mock(GitHubRest.GitHubRest)({
           // No GitHub credential unless a test supplies one, so custom hosts stay unclaimed.
           credential: (host) => Effect.fail(new GitHubCredentials.GitHubNotSignedInError({ host })),
           ...input.githubApi,
@@ -196,6 +204,21 @@ it.effect("includes the request cwd when an unregistered provider is used", () =
     assert.strictEqual(error.operation, "getChangeRequest");
     assert.strictEqual(error.cwd, "/repo");
     assert.strictEqual(error.reference, "#42");
+  }),
+);
+
+it.effect("lists no change requests for a repository on an unrecognized host", () =>
+  Effect.gen(function* () {
+    const registry = yield* makeRegistry({
+      remotes: [{ name: "origin", url: "https://git.example.internal/team/repo.git" }],
+    });
+    const provider = yield* registry.resolve({ cwd: "/repo" });
+
+    assert.strictEqual(provider.kind, "unknown");
+    assert.deepStrictEqual(
+      yield* provider.listChangeRequests({ cwd: "/repo", headSelector: "master", state: "all" }),
+      [],
+    );
   }),
 );
 
@@ -408,7 +431,6 @@ it.effect(
 
 it.effect.each([
   { name: "a credential", credential: "found", expected: "github" },
-  // Claimed so the error says the host is turned off, not that it is unsupported.
   { name: "a host turned off in Settings", credential: "disabled", expected: "github" },
   { name: "no credential", credential: "missing", expected: "unknown" },
 ] as const)("resolves custom-host remotes with $name", (scenario) =>
@@ -438,7 +460,6 @@ it.effect.each([
     assert.strictEqual(handle.provider.kind, SourceControlProviderKind.make(scenario.expected));
     assert.strictEqual(handle.context?.provider.baseUrl, "https://code.example.test");
     assert.deepStrictEqual(hosts, ["code.example.test"]);
-    // Recognition goes through the credential layer; gh is only one of its sources.
     assert.notInclude(commands, "gh");
   }),
 );
@@ -530,7 +551,6 @@ it.effect("asks once for every checkout of a server no integration claims", () =
       },
     });
 
-    // Three checkouts read while the first probe is still running share it.
     const started = yield* Effect.forEach(["a", "b", "c"], () => Deferred.make<void>());
     const callers = yield* Effect.forEach(
       ["a", "b", "c"],
@@ -549,7 +569,6 @@ it.effect("asks once for every checkout of a server no integration claims", () =
       ["unknown", "unknown", "unknown"],
     );
     const once = asked.slice();
-    // glab is asked about the remote's host as the remote spells it.
     assert.sameMembers(once, [
       "credential git.example.internal",
       "glab auth status --hostname Git.Example.Internal",
@@ -557,7 +576,6 @@ it.effect("asks once for every checkout of a server no integration claims", () =
       "tea",
     ]);
 
-    // A login made in a terminal sends no signal, so the server is asked again later.
     yield* TestClock.adjust("5 minutes");
     yield* resolveUnknown(registry, "a");
     assert.deepStrictEqual(asked, [...once, ...once]);
@@ -594,7 +612,6 @@ it.effect("asks again once Settings change", () =>
       settings: {
         subscribeChanges: PubSub.subscribe(changes).pipe(
           Effect.map((subscription) =>
-            // A change is handled once the registry asks for the next one.
             Stream.fromSubscription(subscription).pipe(
               Stream.flatMap((settings) =>
                 Stream.concat(
@@ -618,7 +635,6 @@ it.effect("asks again once Settings change", () =>
     signedIn = true;
     assert.strictEqual((yield* resolveUnknown(registry, "b")).provider.kind, "unknown");
 
-    // A token saved for the host in Settings.
     yield* PubSub.publish(changes, DEFAULT_SERVER_SETTINGS);
     yield* Deferred.await(handled);
     assert.strictEqual((yield* resolveUnknown(registry, "c")).provider.kind, "github");

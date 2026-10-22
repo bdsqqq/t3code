@@ -19,6 +19,8 @@ import * as Option from "effect/Option";
 import { symlinksSupported } from "@t3tools/shared/testing/symlinks";
 import * as Layer from "effect/Layer";
 
+import * as ServerConfig from "../config.ts";
+import * as ServerSettings from "../serverSettings.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import { ProviderWorkspaceMissingError } from "../provider/Errors.ts";
@@ -36,7 +38,6 @@ import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAda
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as RuntimePolicy from "./RuntimePolicy.ts";
 
-// A root that does not exist never overlaps, so other owners decide isolation.
 const unrelatedProject = Option.some({
   workspaceRoot: "/nonexistent/t3-rollback-project",
 } as never);
@@ -44,6 +45,8 @@ const layerCheckpointRollbackService = CheckpointRollbackService.layer.pipe(
   Layer.provide(
     Layer.mergeAll(
       NodeServices.layer,
+      Layer.mock(ServerConfig.ServerConfig)({ worktreesDir: "/synthetic-worktrees" } as never),
+      ServerSettings.layerTest(),
       Layer.mock(GitWorkflow.GitWorkflowService)({}),
       Layer.mock(ProjectStore.ProjectStoreV2)({ get: () => Effect.succeed(unrelatedProject) }),
     ),
@@ -396,13 +399,20 @@ it.effect.each([
   { order: "cleanup-first", restoreFiles: true },
   { order: "cleanup-first", restoreFiles: false },
   { order: "rollback-first", restoreFiles: true },
-])("locks rollback with %s", ({ order, restoreFiles }) =>
+  // A path the server would not have made is left missing, not recreated.
+  { order: "cleanup-first", restoreFiles: false, unmanaged: true },
+])("locks rollback with %s", ({ order, restoreFiles, unmanaged = false }) =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const workspaceRoot = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-rollback-" });
-    const worktreePath = path.join(workspaceRoot, "worktree");
-    yield* fileSystem.makeDirectory(worktreePath);
+    const workspaceRoot = yield* fileSystem.realPath(
+      yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-rollback-" }),
+    );
+    const worktreesDir = path.join(workspaceRoot, "worktrees");
+    const worktreePath = unmanaged
+      ? path.join(workspaceRoot, "elsewhere", "feature")
+      : path.join(worktreesDir, "repo", "feature");
+    yield* fileSystem.makeDirectory(worktreePath, { recursive: true });
     const threadId = ThreadId.make("rollback-worktree");
     const projectId = ProjectId.make("rollback-worktree-project");
     const providerThreadId = ProviderThreadId.make("rollback-worktree-provider-thread");
@@ -439,6 +449,8 @@ it.effect.each([
         Layer.mergeAll(
           ThreadCommandExecutor.layer,
           NodeServices.layer,
+          Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as never),
+          ServerSettings.layerTest(),
           Layer.mock(ProjectStore.ProjectStoreV2)({
             get: (id) => {
               assert.equal(id, projectId);
@@ -537,6 +549,12 @@ it.effect.each([
       if (order === "rollback-first") assert.isFalse(cleanupEntered);
       yield* Deferred.succeed(release, undefined);
       if (cleanup !== undefined) yield* Fiber.join(cleanup);
+      if (unmanaged) {
+        const error = yield* Fiber.join(rollback).pipe(Effect.flip);
+        assert.equal(error._tag, "CheckpointRollbackExecutionError");
+        assert.deepEqual(calls, ["cleanup"]);
+        return;
+      }
       yield* Fiber.join(rollback);
       if (laterCleanup !== undefined) yield* Fiber.join(laterCleanup);
       const rollbackCalls = restoreFiles
@@ -595,7 +613,6 @@ it.effect.each([
       },
       providerThreads: [providerThread],
       providerSessions: [],
-      // Turn 3 remains in the audit history after an earlier rollback.
       providerTurns: [
         ...(multipleTurns
           ? [
@@ -643,8 +660,6 @@ it.effect.each([
           Layer.mock(EventSink.EventSinkV2)({
             write: ({ events }) =>
               Effect.map(lockedThreads, (locked) => {
-                // A thread command that planned against the old provider thread
-                // must not commit after this and undo the rollback.
                 assert.include(locked, threadId);
                 assert.ok(
                   events.some(

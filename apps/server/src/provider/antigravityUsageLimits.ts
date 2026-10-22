@@ -96,7 +96,6 @@ function quotaWindow(
   };
 }
 
-/** The summary names the actual shared buckets; Claude and GPT consume one allowance. */
 function summaryWindows(summary: typeof Summary.Type) {
   const windows = new Map<string, ServerProviderUsageWindow>();
   const groups = summary.groups?.some((group) => group.buckets?.length)
@@ -158,7 +157,6 @@ function modelWindows(models: typeof Models.Type) {
   return [...windows.values()];
 }
 
-/** Reads this instance's Google profile, with a memory-only access token and no credential writes. */
 export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(function* (input: {
   readonly profileDirectory: string;
   readonly authMethod: AntigravitySettings["authMethod"];
@@ -248,26 +246,38 @@ export const makeAntigravityUsageProbe = Effect.fn("makeAntigravityUsageProbe")(
       accessToken = cached.accessToken;
       account = cached.account;
     }
+    // Endpoints can report different quota groups (the daily endpoint has
+    // returned the Claude/GPT group without Gemini), so merge every endpoint's
+    // windows. The most-used reading of a bucket wins, as in modelWindows.
     const fetchWindows = Effect.fn("AntigravityUsageProbe.fetchWindows")(function* <E>(
       operation: string,
       parse: (response: unknown) => Effect.Effect<ServerProviderUsageWindow[], E>,
     ) {
-      for (const endpoint of ENDPOINTS) {
-        const windows = yield* request(
-          HttpClientRequest.post(`${endpoint}/v1internal:${operation}`).pipe(
-            HttpClientRequest.setHeaders({
-              Authorization: `Bearer ${accessToken}`,
-              "User-Agent": `antigravity/hub/1.0.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`,
-            }),
-            HttpClientRequest.bodyJsonUnsafe(token.project_id ? { project: token.project_id } : {}),
+      const responses = yield* Effect.forEach(
+        ENDPOINTS,
+        (endpoint) =>
+          request(
+            HttpClientRequest.post(`${endpoint}/v1internal:${operation}`).pipe(
+              HttpClientRequest.setHeaders({
+                Authorization: `Bearer ${accessToken}`,
+                "User-Agent": `antigravity/hub/1.0.0 (aidev_client; os_type=${platform}; arch=${architecture}; cl=963137146)`,
+              }),
+              HttpClientRequest.bodyJsonUnsafe(
+                token.project_id ? { project: token.project_id } : {},
+              ),
+            ),
+          ).pipe(
+            Effect.flatMap(parse),
+            Effect.orElseSucceed(() => []),
           ),
-        ).pipe(
-          Effect.flatMap(parse),
-          Effect.orElseSucceed(() => []),
-        );
-        if (windows.length > 0) return windows;
+        { concurrency: "unbounded" },
+      );
+      const windows = new Map<string, ServerProviderUsageWindow>();
+      for (const window of responses.flat()) {
+        const previous = windows.get(window.id);
+        if (!previous || window.usedPercent > previous.usedPercent) windows.set(window.id, window);
       }
-      return [];
+      return [...windows.values()];
     });
     const summary = yield* fetchWindows("retrieveUserQuotaSummary", (response) =>
       decodeSummary(response).pipe(Effect.map(summaryWindows)),

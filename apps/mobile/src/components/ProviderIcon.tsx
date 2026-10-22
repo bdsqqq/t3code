@@ -5,7 +5,7 @@ import { providerInstanceInitials } from "@t3tools/client-runtime/state/provider
 import { useId, useState } from "react";
 import { resolveOfficialAcpRegistryIconUrl } from "@t3tools/contracts";
 import { useAppearancePreferences } from "../features/settings/appearance/AppearancePreferencesProvider";
-import { AppText as Text } from "./AppText";
+import { AppText as Text } from "./ui/AppText";
 import { getProviderClient } from "../lib/providerClients";
 
 type ProviderIconProps = {
@@ -135,7 +135,6 @@ export function ProviderIcon(props: ProviderIconProps) {
     );
   }
 
-  // codex (and unknown drivers)
   return (
     <Svg width={size} height={size} viewBox="100 100 411 411" fill="none">
       <Path
@@ -148,13 +147,6 @@ export function ProviderIcon(props: ProviderIconProps) {
   );
 }
 
-/**
- * `ProviderIcon` plus the web sidebar's account badge: an accent-color
- * initials bubble in the bottom-right corner, drawn when `showBadge` is set
- * (accent color present, or several instances share this driver). The glyph
- * dims to 60% opacity while the badge stays fully saturated, matching
- * `apps/web/src/components/chat/ProviderInstanceIcon.tsx`.
- */
 export function ProviderInstanceIcon(props: {
   readonly iconUrl?: string | null;
   readonly provider: string | null | undefined;
@@ -170,34 +162,38 @@ export function ProviderInstanceIcon(props: {
         <ProviderIcon iconUrl={props.iconUrl} provider={props.provider} size={props.size} />
       </View>
       {props.showBadge ? (
+        // A wide right-aligned box lets the badge fit its initials. Alone, an
+        // absolute badge is capped at the icon's width, which clips "WO".
         <View
-          className={props.accentColor ? undefined : "bg-card"}
-          style={{
-            position: "absolute",
-            right: -3,
-            bottom: -3,
-            height: 12,
-            minWidth: 12,
-            paddingHorizontal: 2,
-            borderRadius: 999,
-            borderWidth: 1,
-            borderColor: props.surfaceColor,
-            backgroundColor: props.accentColor,
-            alignItems: "center",
-            justifyContent: "center",
-          }}
+          pointerEvents="none"
+          style={{ position: "absolute", right: -3, bottom: -3, width: 32, alignItems: "flex-end" }}
         >
-          <Text
-            className={props.accentColor ? undefined : "text-foreground-muted"}
+          <View
+            className={props.accentColor ? undefined : "bg-card"}
             style={{
-              fontSize: 7,
-              fontWeight: "600",
-              lineHeight: 9,
-              color: props.accentColor ? "#ffffff" : undefined,
+              height: 12,
+              minWidth: 12,
+              paddingHorizontal: 2,
+              borderRadius: 999,
+              borderWidth: 1,
+              borderColor: props.surfaceColor,
+              backgroundColor: props.accentColor,
+              alignItems: "center",
+              justifyContent: "center",
             }}
           >
-            {providerInstanceInitials(props.displayName)}
-          </Text>
+            <Text
+              className={props.accentColor ? undefined : "text-foreground-muted"}
+              style={{
+                fontSize: 7,
+                fontWeight: "600",
+                lineHeight: 9,
+                color: props.accentColor ? "#ffffff" : undefined,
+              }}
+            >
+              {providerInstanceInitials(props.displayName)}
+            </Text>
+          </View>
         </View>
       ) : null}
     </View>

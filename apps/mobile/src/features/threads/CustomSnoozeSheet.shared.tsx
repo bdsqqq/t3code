@@ -19,8 +19,8 @@ import {
   TextInput,
   View,
 } from "react-native";
-import { AppText } from "../../components/AppText";
-import { SegmentedControl } from "../../components/SegmentedControl";
+import { AppText } from "../../components/ui/AppText";
+import { SegmentedControl } from "../../components/ui/SegmentedControl";
 import { environmentThreadShells } from "../../state/threads";
 import { conditionalSnoozeThreads } from "./conditionalSnoozeThreads";
 
