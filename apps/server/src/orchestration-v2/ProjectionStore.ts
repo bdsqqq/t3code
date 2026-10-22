@@ -173,6 +173,7 @@ export type ProjectionLimitRecoveryCandidate = Pick<
   | "updatedAt"
   | "limitRecovery"
   | "snoozedUntil"
+  | "snoozeCondition"
 >;
 
 export type ProjectionThreadPullRequests = Pick<
@@ -196,6 +197,7 @@ export type ProjectionSettlementCandidate = Pick<
   | "pinnedAt"
   | "autoSettleDisabledAt"
   | "snoozedUntil"
+  | "snoozeCondition"
   | "snoozedAt"
   | "latestRunId"
   | "latestRunRequestedAt"
@@ -448,6 +450,10 @@ export interface ProjectionStoreV2Shape {
   readonly getSettlementCandidates: (
     threadId?: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ProjectionSettlementCandidate>, ProjectionStoreV2Error>;
+  /** Includes pinned, busy and auto-settlement opt-out threads. */
+  readonly getConditionalSnoozeCandidates: (
+    threadId?: ThreadId,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2AppThread>, ProjectionStoreV2Error>;
   readonly getThreadsWithPullRequests: (
     threadId?: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadPullRequests>, ProjectionStoreV2Error>;
@@ -1643,6 +1649,9 @@ export function threadShellFromProjection(
     settledAt: projection.thread.settledAt,
     unsettledAt: projection.thread.unsettledAt ?? null,
     snoozedUntil: projection.thread.snoozedUntil ?? null,
+    snoozeCondition: projection.thread.snoozeCondition ?? null,
+    snoozeCommandId: projection.thread.snoozeCommandId ?? null,
+    lastSnoozeWakeAt: projection.thread.lastSnoozeWakeAt ?? null,
     snoozedAt: projection.thread.snoozedAt ?? null,
     pinnedAt: projection.thread.pinnedAt ?? null,
 
@@ -1886,6 +1895,9 @@ function shellFromState(input: {
     settledAt: input.state.thread.settledAt,
     unsettledAt: input.state.thread.unsettledAt ?? null,
     snoozedUntil: input.state.thread.snoozedUntil ?? null,
+    snoozeCondition: input.state.thread.snoozeCondition ?? null,
+    snoozeCommandId: input.state.thread.snoozeCommandId ?? null,
+    lastSnoozeWakeAt: input.state.thread.lastSnoozeWakeAt ?? null,
     snoozedAt: input.state.thread.snoozedAt ?? null,
     pinnedAt: input.state.thread.pinnedAt ?? null,
 
@@ -3817,6 +3829,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             )
             AND json_extract(t.payload_json, '$.archivedAt') IS NULL
             AND json_extract(t.payload_json, '$.settledOverride') IS NOT 'settled'
+            AND json_extract(t.payload_json, '$.snoozeCondition') IS NULL
             AND json_extract(item.payload_json, '$.failure.class') = 'usage_limit'
             AND json_extract(item.payload_json, '$.failure.resetAt') IS NOT NULL
             AND julianday(json_extract(item.payload_json, '$.failure.resetAt')) > julianday(COALESCE(r.completed_at, json_extract(t.payload_json, '$.updatedAt')))
@@ -3871,6 +3884,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             pendingRuntimeRequest: null,
             limitRecovery: thread.limitRecovery ?? null,
             snoozedUntil: thread.snoozedUntil ?? null,
+            snoozeCondition: thread.snoozeCondition ?? null,
           });
         }
         return candidates;
@@ -5969,6 +5983,34 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       return { providerThreadsByThreadId, pendingTurnItemsByThreadId };
     });
 
+    const getConditionalSnoozeCandidates: ProjectionStoreV2Shape["getConditionalSnoozeCandidates"] =
+      (threadId) =>
+        sql<{ payload_json: string }>`
+        SELECT payload_json FROM orchestration_v2_projection_threads
+        WHERE deleted_at IS NULL
+          AND json_extract(payload_json, '$.archivedAt') IS NULL
+          AND json_extract(payload_json, '$.snoozeCondition') IS NOT NULL
+          ${
+            threadId === undefined
+              ? sql``
+              : sql`AND (
+            thread_id = ${threadId}
+            OR json_extract(payload_json, '$.snoozeCondition.threadId') = ${threadId}
+          )`
+          }
+      `.pipe(
+          Effect.flatMap((rows) =>
+            Effect.forEach(rows, (row) => decodeThreadPayload(row.payload_json)),
+          ),
+          Effect.mapError(
+            (cause) =>
+              new ProjectionStoreReadError({
+                threadId: ThreadId.make("thread:conditional-snooze"),
+                cause,
+              }),
+          ),
+        );
+
     const getSettlementCandidates: ProjectionStoreV2Shape["getSettlementCandidates"] = (threadId) =>
       sql
         .withTransaction(
@@ -6489,6 +6531,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getThreadShell,
       getThread,
       getSettlementCandidates,
+      getConditionalSnoozeCandidates,
       getThreadsWithPullRequests,
       getThreadWorktreePaths,
       getThreadProjection,
@@ -6611,6 +6654,23 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
         }
         return projection.thread;
       }),
+      getConditionalSnoozeCandidates: (threadId) =>
+        Ref.get(replayState).pipe(
+          Effect.map((state) =>
+            [...state.projections.values()]
+              .map(({ thread }) => thread)
+              .filter(
+                (thread) =>
+                  thread.deletedAt === null &&
+                  thread.archivedAt === null &&
+                  thread.snoozeCondition != null &&
+                  (threadId === undefined ||
+                    thread.id === threadId ||
+                    (thread.snoozeCondition.type === "thread-settled" &&
+                      thread.snoozeCondition.threadId === threadId)),
+              ),
+          ),
+        ),
       getSettlementCandidates: Effect.fn("ProjectionStore.getSettlementCandidates")(
         function* (threadId) {
           const projections = (yield* Ref.get(replayState)).projections;
@@ -6688,6 +6748,7 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
                 ({ thread }) =>
                   thread.deletedAt === null &&
                   thread.archivedAt === null &&
+                  thread.snoozeCondition == null &&
                   thread.settledOverride !== "settled",
               )
               .map(threadShellFromProjection)

@@ -2,7 +2,10 @@ import { SheetHeader } from "../../components/ui/SheetHeader";
 import { appAtomRegistry } from "../../state/atom-registry";
 import { useAtomValue } from "@effect/atom-react";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
-import { effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  effectiveSnoozed,
+  snoozeConditionLabel,
+} from "@t3tools/client-runtime/state/thread-settled";
 import { sortInboxThreadsByReturn } from "@t3tools/client-runtime/state/thread-inbox";
 import { type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { Animated, FlatList, Modal, Pressable, View } from "react-native";
@@ -224,6 +227,10 @@ export function ThreadArrangementSheet(props: { onClose: () => void }) {
       });
     return { pinned: planner("pinned"), active: planner("active") };
   }, [sections, threads, configs, workingShelfEnabled]);
+  const threadTitlesByKey = useMemo(
+    () => new Map(threads.map((thread) => [keyOf(thread), thread.title])),
+    [threads],
+  );
   const rows = useMemo(() => {
     const result: Row[] = [];
     let offset = 0;
@@ -464,9 +471,23 @@ export function ThreadArrangementSheet(props: { onClose: () => void }) {
                       >
                         {thread ? (
                           <>
-                            <Text numberOfLines={2} className="flex-1 text-base">
-                              {thread.title}
-                            </Text>
+                            <View className="min-w-0 flex-1">
+                              <Text numberOfLines={2} className="text-base">
+                                {thread.title}
+                              </Text>
+                              {item.section === "snoozed" && thread.snoozeCondition && (
+                                <Text numberOfLines={1} className="text-xs text-foreground-muted">
+                                  {snoozeConditionLabel(
+                                    thread.snoozeCondition,
+                                    thread.snoozeCondition.type === "thread-settled"
+                                      ? threadTitlesByKey.get(
+                                          `${thread.environmentId}:${thread.snoozeCondition.threadId}`,
+                                        )
+                                      : null,
+                                  )}
+                                </Text>
+                              )}
+                            </View>
                             <DragHandle
                               title={thread.title}
                               disabled={

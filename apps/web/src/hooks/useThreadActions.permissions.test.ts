@@ -35,6 +35,7 @@ const state = vi.hoisted(() => ({
   toasts: [] as string[],
   afterRequest: undefined as ((action: string) => void) | undefined,
   sessionLookupFails: false,
+  conditionalSnooze: true,
 }));
 
 vi.mock("react", () => ({
@@ -99,6 +100,7 @@ vi.mock("../state/entities", () => ({
   readEnvironmentSupportsPinReorder: () => true,
   readEnvironmentSupportsSettlement: () => true,
   readEnvironmentSupportsSnooze: () => true,
+  readEnvironmentSupportsConditionalSnooze: () => state.conditionalSnooze,
   readThreadShell: (ref: ScopedThreadRef) =>
     state.threads.find(
       (thread) => thread.environmentId === ref.environmentId && thread.id === ref.threadId,
@@ -190,7 +192,14 @@ const operations = [
   {
     name: "snooze",
     run: (actions: ThreadActions, ref: ScopedThreadRef) =>
-      actions.snoozeThread(ref, "2099-01-01T00:00:00Z"),
+      actions.snoozeThread(ref, { snoozedUntil: "2099-01-01T00:00:00Z" }),
+  },
+  {
+    name: "snooze",
+    run: (actions: ThreadActions, ref: ScopedThreadRef) =>
+      actions.snoozeThread(ref, {
+        condition: { type: "thread-settled", threadId: ThreadId.make("dependency") },
+      }),
   },
   {
     name: "unsnooze",
@@ -229,9 +238,28 @@ beforeEach(() => {
   state.toasts = [];
   state.afterRequest = undefined;
   state.sessionLookupFails = false;
+  state.conditionalSnooze = true;
 });
 
 describe("thread action permissions", () => {
+  it("keeps time snoozes working on a server without dependency snoozes", async () => {
+    state.scopes.get(secondary)!.add(AuthOrchestrationOperateScope);
+    state.conditionalSnooze = false;
+    const actions = useThreadActions();
+    expect(
+      (
+        await actions.snoozeThread(target, {
+          condition: { type: "thread-settled", threadId: ThreadId.make("dependency") },
+        })
+      )._tag,
+    ).toBe("Failure");
+    expect(state.requests).toEqual([]);
+    expect(
+      (await actions.snoozeThread(target, { snoozedUntil: "2099-01-01T00:00:00Z" }))._tag,
+    ).toBe("Success");
+    expect(state.requests).toHaveLength(1);
+  });
+
   it.each(operations)("$name requires the target environment's grant", async ({ run }) => {
     const result = await run(useThreadActions(), target);
     expect(result._tag).toBe("Failure");

@@ -63,6 +63,72 @@ const layerOrchestratorService = OrchestratorMcpService.layer.pipe(
 );
 
 describe("OrchestratorMcpService", () => {
+  it.effect.each([
+    { type: "thread-settled", threadId: ThreadId.make("dependency") },
+    { type: "pull-request-merged", host: "github.com", repository: "other/repo", number: 42 },
+  ] as const)("reports timerless $type snoozes through read and list", (condition) =>
+    Effect.gen(function* () {
+      const id = ThreadId.make("conditional-mcp-thread");
+      const parked = {
+        ...liveThreadShell(id, { activeRunId: null }),
+        status: "completed" as const,
+        snoozedUntil: null,
+        snoozedAt: DateTime.makeUnsafe("2026-01-01T00:00:00Z"),
+        snoozeCondition: condition,
+        latestRunCompletedAt: DateTime.makeUnsafe("2026-01-02T00:00:00Z"),
+      };
+      const awake = { ...parked, id: ThreadId.make("awake"), snoozeCondition: null };
+      const projection = idleThreadProjection(parked);
+      const invocation: McpInvocationScope = {
+        environmentId: EnvironmentId.make("conditional-mcp-environment"),
+        requestNamespace: "conditional-mcp",
+        thread: undefined,
+        client: { sessionId: "conditional-mcp", label: "test", access: "read-only" },
+        capabilities: new Set(["orchestration"]),
+        issuedAt: 0,
+      };
+      yield* Effect.gen(function* () {
+        const service = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const read = yield* service.readThread(invocation, { threadId: id });
+        assert.isTrue(read.thread.snoozed);
+        assert.isNull(read.thread.snoozedUntil);
+        assert.deepEqual(read.thread.snoozeCondition, condition);
+        const listed = yield* service.listThreads(invocation, {
+          projectId: parked.projectId,
+          snoozed: true,
+        });
+        assert.equal(listed.total, 1);
+        assert.deepEqual(
+          listed.threads.map((thread) => thread.threadId),
+          [id],
+        );
+        assert.isTrue(listed.threads[0]!.snoozed);
+        assert.isNull(listed.threads[0]!.snoozedUntil);
+        assert.deepEqual(listed.threads[0]!.snoozeCondition, condition);
+      }).pipe(
+        Effect.provide(
+          layerOrchestratorService.pipe(
+            Layer.provide(NodeServices.layer),
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(
+              Layer.mock(ThreadManagementService.ThreadManagementService)({
+                getThreadShell: () => Effect.succeed(parked),
+                getProjectThreadRecords: () => Effect.succeed(projection),
+                listProjectThreads: () => Effect.succeed([parked, awake]),
+                getTimelinePage: () => Effect.succeed({ items: [], totalItems: 0, hasMore: false }),
+              }),
+            ),
+            Layer.provide(Layer.mock(ProviderRegistry.ProviderRegistry)({})),
+            Layer.provide(Layer.mock(ProviderAdapterRegistry.ProviderAdapterRegistryV2)({})),
+            Layer.provide(Layer.mock(ProjectService.ProjectService)({})),
+            Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
+            Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
+          ),
+        ),
+      );
+    }),
+  );
+
   it.effect("retries terminal acknowledgement with a fresh command id", () =>
     Effect.gen(function* () {
       const parentThreadId = ThreadId.make("thread:mcp-ack-parent");

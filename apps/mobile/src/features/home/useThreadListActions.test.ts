@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const state = vi.hoisted(() => ({
   pendingOrder: null as object | null,
   dropBusy: false,
+  conditionalSnoozeSupported: true,
   failedAction: null as string | null,
   archivedRefreshes: [] as string[],
   scopes: new Map<string, Set<string>>(),
@@ -83,6 +84,7 @@ vi.mock("../../state/atom-registry", () => ({
                       capabilities: {
                         threadSettlement: true,
                         threadSnooze: true,
+                        threadConditionalSnooze: state.conditionalSnoozeSupported,
                         threadPinning: true,
                         threadPinReorder: true,
                         threadTitleRegeneration: true,
@@ -180,6 +182,7 @@ beforeEach(() => {
   state.archivedRefreshes = [];
   state.pendingOrder = null;
   state.dropBusy = false;
+  state.conditionalSnoozeSupported = true;
   state.scopes = new Map([
     [primaryEnvironmentId, new Set([AuthOrchestrationOperateScope])],
     [otherEnvironmentId, new Set<string>()],
@@ -198,23 +201,49 @@ afterEach(() => {
 });
 
 describe("thread list operation permissions", () => {
+  it("dispatches a conditional snooze without a time", async () => {
+    const condition = { type: "thread-settled" as const, threadId: ThreadId.make("dependency") };
+    expect(await useThreadListActions().snoozeThread(makeThread(), { condition })).toBe(true);
+    expect(state.requests).toEqual([
+      {
+        action: "snooze",
+        environmentId: primaryEnvironmentId,
+        input: { threadId: ThreadId.make("thread"), condition },
+      },
+    ]);
+  });
+
+  it("rejects conditional choices on older servers while preserving time snoozes", async () => {
+    state.conditionalSnoozeSupported = false;
+    const actions = useThreadListActions();
+    expect(
+      await actions.snoozeThread(makeThread(), {
+        condition: { type: "thread-settled", threadId: ThreadId.make("dependency") },
+      }),
+    ).toBe(false);
+    expect(state.requests).toEqual([]);
+    expect(
+      await actions.snoozeThread(makeThread(), { snoozedUntil: "2099-01-01T00:00:00.000Z" }),
+    ).toBe(true);
+    expect(state.requests).toHaveLength(1);
+  });
+
   it.each(mutationCases)(
     "%s rejects a retained callback after its environment loses permission",
     async (handler) => {
       const actions = useThreadListActions();
       state.scopes.get(primaryEnvironmentId)!.clear();
 
-      await actions[handler](makeThread(), "2099-01-01T00:00:00.000Z");
+      await actions[handler](makeThread(), { snoozedUntil: "2099-01-01T00:00:00.000Z" });
 
       expect(state.requests).toEqual([]);
     },
   );
 
   it.each(mutationCases)("%s requires the target environment's permission", async (handler) => {
-    await useThreadListActions()[handler](
-      makeThread({ environmentId: otherEnvironmentId }),
-      "2099-01-01T00:00:00.000Z",
-    );
+    await useThreadListActions()[handler](makeThread({ environmentId: otherEnvironmentId }), {
+      snoozedUntil: "2099-01-01T00:00:00.000Z",
+    });
 
     expect(state.requests).toEqual([]);
   });
@@ -292,9 +321,11 @@ describe("thread action undo", () => {
     async (handler, action, notice, inverse) => {
       const actions = useThreadListActions();
       const thread = makeThread();
-      const first = actions[handler](thread, "2099-01-01T09:00:00.000Z");
+      const first = actions[handler](thread, { snoozedUntil: "2099-01-01T09:00:00.000Z" });
 
-      expect(await actions[handler](thread, "2099-01-01T09:00:00.000Z")).toBe(false);
+      expect(await actions[handler](thread, { snoozedUntil: "2099-01-01T09:00:00.000Z" })).toBe(
+        false,
+      );
       expect(await first).toBe(true);
       expect(state.requests.map(({ action }) => action)).toEqual([action]);
       expect(readThreadUndoNotice()?.action).toBe(notice);
@@ -350,10 +381,28 @@ describe("thread action undo", () => {
     expect(readThreadUndoNotice()).toBeNull();
   });
 
+  it.each(["settleThread", "unpinThread"] as const)(
+    "restores a dependency without inventing a timer when undoing %s",
+    async (action) => {
+      const condition = { type: "thread-settled" as const, threadId: ThreadId.make("dependency") };
+      const thread = makeThread({
+        pinnedAt: "2026-09-02T00:00:00.000Z",
+        snoozeCondition: condition,
+      });
+      expect(await useThreadListActions()[action](thread)).toBe(true);
+      await readThreadUndoNotice()!.undo();
+      expect(state.requests.at(-1)).toEqual({
+        action: "snooze",
+        environmentId: thread.environmentId,
+        input: { threadId: thread.id, condition },
+      });
+    },
+  );
+
   // regression: #21401 restore archive and thread action undo
   it("wakes a snoozed thread through the undo action", async () => {
     const thread = makeThread();
-    await useThreadListActions().snoozeThread(thread, "2099-01-01T09:00:00.000Z");
+    await useThreadListActions().snoozeThread(thread, { snoozedUntil: "2099-01-01T09:00:00.000Z" });
     expect(readThreadUndoNotice()?.action).toBe("Snoozed");
     await readThreadUndoNotice()!.undo();
     expect(state.requests.at(-1)).toMatchObject({

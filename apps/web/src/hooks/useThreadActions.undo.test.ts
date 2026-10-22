@@ -1,4 +1,4 @@
-import { EnvironmentId, ThreadId } from "@t3tools/contracts";
+import { EnvironmentId, ThreadId, type ThreadSnoozeCondition } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -44,6 +44,7 @@ const threadShell = vi.hoisted(() => ({
   pinOrderKey: "a0",
   pinnedAt: null as string | null,
   snoozedUntil: null as string | null,
+  snoozeCondition: null as ThreadSnoozeCondition | null,
   projectId: "project",
   environmentId: "undo-env",
   session: null,
@@ -100,6 +101,7 @@ beforeEach(() => {
   router.state.matches[0]!.params = {};
   threadShell.pinnedAt = null;
   threadShell.snoozedUntil = null;
+  threadShell.snoozeCondition = null;
 });
 afterEach(() => {
   vi.runAllTimers();
@@ -119,7 +121,7 @@ describe("concurrent thread action Undo", () => {
       const actions = useThreadActions();
       const run = () =>
         handler === "snoozeThread"
-          ? actions.snoozeThread(target, "2099-01-01T09:00:00.000Z")
+          ? actions.snoozeThread(target, { snoozedUntil: "2099-01-01T09:00:00.000Z" })
           : actions[handler](target);
       await Promise.all([run(), run()]);
       expect(commands[action]).toHaveBeenCalledTimes(2);
@@ -235,6 +237,17 @@ describe("settle and snooze Undo", () => {
     });
   });
 
+  it("restores the dependency, not a made-up timer, when undoing settlement", async () => {
+    const condition = { type: "thread-settled", threadId: ThreadId.make("dependency") } as const;
+    threadShell.snoozeCondition = condition;
+    await useThreadActions().settleThread(target);
+    await currentUndo()();
+    expect(commands.snooze).toHaveBeenCalledExactlyOnceWith({
+      environmentId: target.environmentId,
+      input: { threadId: target.threadId, condition },
+    });
+  });
+
   it("stops settle restoration if restoring the pin fails", async () => {
     threadShell.pinnedAt = "2026-01-01T00:00:00.000Z";
     threadShell.snoozedUntil = "2030-01-01T09:00:00.000Z";
@@ -260,7 +273,9 @@ describe("settle and snooze Undo", () => {
   it("wakes the thread from the snooze notice", async () => {
     const add = vi.spyOn(toastManager, "add").mockReturnValue("toast");
     const actions = useThreadActions();
-    await actions.snoozeThread(target, "2100-01-01T00:00:00.000Z");
+    await actions.snoozeThread(target, {
+      snoozedUntil: "2100-01-01T00:00:00.000Z",
+    });
     expect(useThreadUndoNotice.getState().notice).toMatchObject({ action: "Snoozed", count: 1 });
     expect(add).not.toHaveBeenCalled();
     await currentUndo()();

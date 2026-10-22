@@ -27,6 +27,8 @@ import {
   canSnooze,
   effectiveSnoozed,
   threadWokeAt,
+  snoozeConditionLabel,
+  type SnoozeChoice,
 } from "@t3tools/client-runtime/state/thread-settled";
 import { createInboxReturnTracker } from "@t3tools/client-runtime/state/thread-inbox";
 import { sortSettledThreads } from "@t3tools/client-runtime/state/thread-sort";
@@ -175,7 +177,7 @@ import {
 } from "./Sidebar.drag";
 import { SidebarDragLifecycle, SidebarPointerSensor } from "./Sidebar.pointer";
 import { createSidebarListMotion } from "./Sidebar.motion";
-import { resolveSnoozePresets, snoozeWakeLabel, type SnoozePreset } from "./Sidebar.snooze";
+import { resolveSnoozePresets, snoozeWakeLabel } from "./Sidebar.snooze";
 import { ProjectFavicon } from "./ProjectFavicon";
 import { deriveProviderEntriesByEnvironment } from "../providerInstances";
 import { useStableCallback } from "../hooks/useStableCallback";
@@ -543,7 +545,12 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
       ).push(
         optimisticDrop.clearsSnooze
           ? projected
-          : { ...projected, snoozedAt: thread.snoozedAt, snoozedUntil: thread.snoozedUntil },
+          : {
+              ...projected,
+              snoozedAt: thread.snoozedAt,
+              snoozedUntil: thread.snoozedUntil,
+              snoozeCondition: thread.snoozeCondition ?? null,
+            },
       );
     } else {
       const section = resolveSidebarThreadSection({
@@ -590,8 +597,12 @@ function partitionSidebarThreads(input: SidebarThreadPartitionInput) {
     workingThreads: sortWorkingThreadsBySend(working),
     snoozedThreads: snoozed.toSorted(
       (left, right) =>
-        firstValidTimestampMs(left.snoozedUntil ?? null) -
-        firstValidTimestampMs(right.snoozedUntil ?? null),
+        (left.snoozedUntil == null
+          ? Number.MAX_SAFE_INTEGER
+          : firstValidTimestampMs(left.snoozedUntil)) -
+        (right.snoozedUntil == null
+          ? Number.MAX_SAFE_INTEGER
+          : firstValidTimestampMs(right.snoozedUntil)),
     ),
     settledThreads: sortSettledThreads(settled),
     snoozeNow: preciseNow,
@@ -635,14 +646,19 @@ function isOptimisticDropReleased(input: {
     if (
       canonicalSection === optimisticDrop.section &&
       thread.pinnedAt == null &&
-      (!optimisticDrop.clearsSnooze || thread.snoozedUntil == null)
+      (!optimisticDrop.clearsSnooze ||
+        (thread.snoozedUntil == null && thread.snoozeCondition == null))
     ) {
       return true;
     }
     return false;
   }
   if (canonicalSection !== optimisticDrop.section) return false;
-  if (optimisticDrop.clearsSnooze && thread.snoozedUntil != null) return false;
+  if (
+    optimisticDrop.clearsSnooze &&
+    (thread.snoozedUntil != null || thread.snoozeCondition != null)
+  )
+    return false;
   const destinationKeys = optimisticDrop.section === "pinned" ? pinnedKeys : activeKeys;
   const canonicalDestination = destinationKeys.flatMap((key) => {
     const canonical = canonicalByKey.get(key);
@@ -1918,7 +1934,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   };
   const performSnooze = async (
     threadRef: ScopedThreadRef,
-    preset: Pick<SnoozePreset, "snoozedUntil">,
+    preset: SnoozeChoice,
     opts: { coSnoozingKeys?: ReadonlySet<string> } = {},
   ) => {
     const threadKey = scopedThreadKey(threadRef);
@@ -1927,7 +1943,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
     }
     snoozingThreadKeysRef.current.add(threadKey);
     const navigateAfterSnooze = planForwardNavigation(threadKey, opts.coSnoozingKeys);
-    const result = await snoozeThread(threadRef, preset.snoozedUntil);
+    const result = await snoozeThread(threadRef, preset);
     snoozingThreadKeysRef.current.delete(threadKey);
     if (result._tag === "Failure") {
       return isAtomCommandInterrupted(result)
@@ -1949,7 +1965,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
   };
   const attemptSnooze = (
     threadRef: ScopedThreadRef,
-    preset: Pick<SnoozePreset, "snoozedUntil">,
+    preset: SnoozeChoice,
     opts: { coSnoozingKeys?: ReadonlySet<string> } = {},
   ) => {
     void (async () => {
@@ -2085,7 +2101,9 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
       if (clicked.value?.startsWith("snooze:")) {
         const preset =
           clicked.value === "snooze:custom"
-            ? await requestCustomSnooze()
+            ? await requestCustomSnooze(
+                selectedThreads.map((thread) => scopeThreadRef(thread.environmentId, thread.id)),
+              )
             : snoozePresets.find((candidate) => `snooze:${candidate.id}` === clicked.value);
         if (preset) {
           const coSnoozingKeys = new Set(threadKeys);
@@ -2351,7 +2369,7 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
         if (clicked.value?.startsWith("snooze:")) {
           const preset =
             clicked.value === "snooze:custom"
-              ? await requestCustomSnooze()
+              ? await requestCustomSnooze([threadRef])
               : snoozePresets.find((candidate) => `snooze:${candidate.id}` === clicked.value);
           if (preset) attemptSnooze(threadRef, preset);
           return;
@@ -2937,11 +2955,27 @@ export default function Sidebar({ routeReveal }: { routeReveal: SidebarRouteReve
                               actionSweep?.keys.has(threadKey) ? actionSweep.action : null
                             }
                             snoozeWakeLabelText={
-                              section === "snoozed" && thread.snoozedUntil != null
-                                ? snoozeWakeLabel(thread.snoozedUntil, {
-                                    now: new Date().toISOString(),
-                                  })
-                                : null
+                              section !== "snoozed"
+                                ? null
+                                : thread.snoozeCondition != null
+                                  ? snoozeConditionLabel(
+                                      thread.snoozeCondition,
+                                      thread.snoozeCondition.type === "thread-settled"
+                                        ? threadByKey.get(
+                                            scopedThreadKey(
+                                              scopeThreadRef(
+                                                thread.environmentId,
+                                                thread.snoozeCondition.threadId,
+                                              ),
+                                            ),
+                                          )?.title
+                                        : null,
+                                    )
+                                  : thread.snoozedUntil != null
+                                    ? snoozeWakeLabel(thread.snoozedUntil, {
+                                        now: new Date().toISOString(),
+                                      })
+                                    : null
                             }
                             wokeAt={threadWokeAt(thread, { now: snoozeNow })}
                             isActive={routeRowThreadKey === threadKey}

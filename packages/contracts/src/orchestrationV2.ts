@@ -370,6 +370,12 @@ export const OrchestrationV2LimitRecoveryUpdate = Schema.Struct({
 );
 export type OrchestrationV2LimitRecoveryUpdate = typeof OrchestrationV2LimitRecoveryUpdate.Type;
 
+export const ThreadSnoozeCondition = Schema.Union([
+  Schema.Struct({ type: Schema.Literal("thread-settled"), threadId: ThreadId }),
+  Schema.Struct({ type: Schema.Literal("pull-request-merged"), ...ThreadPullRequestKey.fields }),
+]);
+export type ThreadSnoozeCondition = typeof ThreadSnoozeCondition.Type;
+
 export const OrchestrationV2AppThread = Schema.Struct({
   ...OrchestrationV2CreationFields,
   id: ThreadId,
@@ -409,6 +415,8 @@ export const OrchestrationV2AppThread = Schema.Struct({
   ),
   unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
+  snoozeCondition: Schema.optional(Schema.NullOr(ThreadSnoozeCondition)),
+  snoozeCommandId: Schema.optional(Schema.NullOr(CommandId)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   lastSnoozeWakeAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
@@ -1865,8 +1873,11 @@ export const OrchestrationV2ThreadShell = Schema.Struct({
   settledAt: Schema.NullOr(Schema.DateTimeUtc),
   unsettledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
+  snoozeCondition: Schema.optional(Schema.NullOr(ThreadSnoozeCondition)),
+  snoozeCommandId: Schema.optional(Schema.NullOr(CommandId)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   limitRecovery: Schema.optional(Schema.NullOr(OrchestrationV2LimitRecovery)),
+  lastSnoozeWakeAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtc)),
   pinOrderKey: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
@@ -2378,6 +2389,7 @@ export const OrchestrationV2ThreadShellJson = OrchestrationV2ThreadShell.mapFiel
   snoozedUntil: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   snoozedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   pinnedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
+  lastSnoozeWakeAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   autoSettleDisabledAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   lastVisitedAt: Schema.optional(Schema.NullOr(Schema.DateTimeUtcFromString)),
   titleRegeneration: Schema.optional(
@@ -2639,8 +2651,14 @@ export const OrchestrationV2Command = Schema.Union([
     type: Schema.Literal("thread.snooze"),
     commandId: CommandId,
     threadId: ThreadId,
-    snoozedUntil: IsoDateTime,
-  }),
+    snoozedUntil: Schema.optional(IsoDateTime),
+    condition: Schema.optional(ThreadSnoozeCondition),
+  }).check(
+    Schema.makeFilter(
+      (input) => (input.snoozedUntil !== undefined) !== (input.condition !== undefined),
+      { message: "Snooze requires exactly one of snoozedUntil or condition." },
+    ),
+  ),
   Schema.Struct({
     type: Schema.Literal("thread.unsnooze"),
     commandId: CommandId,
@@ -3020,6 +3038,12 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("thread.snooze.wake"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    expectedSnoozeCommandId: CommandId,
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request-watch.sync"),
     commandId: CommandId,

@@ -2,7 +2,11 @@ import type { ThreadMoveDestination } from "../threads/threadOrder";
 import type { EnvironmentThreadShell } from "@t3tools/client-runtime/state/shell";
 import * as ThreadUndo from "@t3tools/client-runtime/state/thread-undo";
 import { showThreadUndoNotice } from "./thread-undo-notice";
-import { canSnooze, effectiveSnoozed } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  canSnooze,
+  effectiveSnoozed,
+  type SnoozeChoice,
+} from "@t3tools/client-runtime/state/thread-settled";
 import { AuthOrchestrationOperateScope } from "@t3tools/contracts";
 import * as Cause from "effect/Cause";
 import * as Haptics from "expo-haptics";
@@ -228,7 +232,7 @@ export function useThreadListActions(): {
   readonly archiveThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly confirmDeleteThread: (thread: EnvironmentThreadShell) => void;
   readonly settleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
-  readonly snoozeThread: (thread: EnvironmentThreadShell, snoozedUntil: string) => Promise<boolean>;
+  readonly snoozeThread: (thread: EnvironmentThreadShell, choice: SnoozeChoice) => Promise<boolean>;
   readonly unsnoozeThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly unsettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly pinThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
@@ -286,7 +290,12 @@ export function useThreadListActions(): {
                   if (!checkThreadOperationPermission(thread, failureTitle)) return false;
                   const result = await snoozeMutation({
                     environmentId: thread.environmentId,
-                    input: { threadId: thread.id, snoozedUntil: step.snoozedUntil },
+                    input: {
+                      threadId: thread.id,
+                      ...(step.condition !== undefined
+                        ? { condition: step.condition }
+                        : { snoozedUntil: step.snoozedUntil }),
+                    },
                   });
                   if (result._tag === "Failure") {
                     const error = Cause.squash(result.cause);
@@ -325,7 +334,7 @@ export function useThreadListActions(): {
     }
     return succeeded;
   };
-  const snoozeThread = async (thread: EnvironmentThreadShell, snoozedUntil: string) => {
+  const snoozeThread = async (thread: EnvironmentThreadShell, choice: SnoozeChoice) => {
     if (!checkThreadOperationPermission(thread, "Could not snooze thread")) return false;
     const key = scopedThreadKey(thread.environmentId, thread.id);
     if (snoozeInFlightThreadKeys.current.has(key)) {
@@ -337,6 +346,17 @@ export function useThreadListActions(): {
         Dialog.alert(
           "Could not snooze thread",
           "This environment's server does not support snoozing yet. Update the server to use Snooze.",
+        );
+        return false;
+      }
+      if (
+        choice.condition !== undefined &&
+        appAtomRegistry.get(environmentServerConfigsAtom).get(thread.environmentId)?.environment
+          .capabilities.threadConditionalSnooze !== true
+      ) {
+        Dialog.alert(
+          "Could not snooze thread",
+          "Update this environment's server to snooze until a thread settles or a pull request merges.",
         );
         return false;
       }
@@ -361,7 +381,7 @@ export function useThreadListActions(): {
             environmentId: thread.environmentId,
             input: {
               threadId: thread.id,
-              snoozedUntil,
+              ...choice,
             },
           }),
         (result) => result._tag === "Success",

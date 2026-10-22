@@ -15,6 +15,7 @@ import {
   OrchestratorMcpFailure,
   OrchestrationV2DispatchCommandResult,
   ThreadId,
+  ThreadSnoozeCondition,
   RunId,
   NonNegativeInt,
   ProjectId,
@@ -30,7 +31,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 
 const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
   description:
-    "Pin, snooze, settle, archive, or mark a thread unread. Omit threadId for this thread. snooze requires snoozedUntil. Existing thread lifecycle rules apply. Settling this thread takes effect when your turn completes, returning settlesWhenTurnEnds=true; a turn that fails or is interrupted, or a queued message, leaves it active.",
+    "Pin, snooze, settle, archive, or mark a thread unread. Omit threadId for this thread. snooze requires exactly one of snoozedUntil or condition (another thread settles, or an arbitrary pull request merges). Conditional snooze wakes the sidebar, not the agent. Existing thread lifecycle rules apply. Settling this thread takes effect when your turn completes, returning settlesWhenTurnEnds=true; a turn that fails or is interrupted, or a queued message, leaves it active.",
   parameters: Schema.Struct({
     threadId: Schema.optional(ThreadId),
     action: Schema.Literals([
@@ -45,6 +46,7 @@ const ThreadOrganizeTool = Tool.make("t3_thread_organize", {
       "mark_unread",
     ]),
     snoozedUntil: Schema.optional(IsoDateTime),
+    condition: Schema.optional(ThreadSnoozeCondition),
   }),
   success: Schema.Union([
     OrchestrationV2DispatchCommandResult,

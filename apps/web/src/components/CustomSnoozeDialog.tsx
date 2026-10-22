@@ -4,8 +4,20 @@ import {
   localSnoozeDate,
   localSnoozeTime,
   resolveCustomSnooze,
+  resolveConditionalSnooze,
   type CustomSnoozeInput,
+  type SnoozeChoice,
 } from "@t3tools/client-runtime/state/thread-settled";
+import type { ScopedThreadRef } from "@t3tools/contracts";
+import { readThreadShells, readEnvironmentSupportsConditionalSnooze } from "../state/entities";
+import {
+  Combobox,
+  ComboboxInput,
+  ComboboxPopup,
+  ComboboxList,
+  ComboboxItem,
+  ComboboxEmpty,
+} from "./ui/combobox";
 import { Button } from "./ui/button";
 import { CalendarIcon } from "lucide-react";
 import { Calendar } from "./ui/calendar";
@@ -13,7 +25,6 @@ import { weekStartsOn } from "../timestampFormat";
 import { Popover, PopoverTrigger, PopoverPopup } from "./ui/popover";
 import { Input } from "./ui/input";
 import { Label } from "./ui/label";
-import { Toggle, ToggleGroup } from "./ui/toggle-group";
 import { Select, SelectTrigger, SelectValue, SelectPopup, SelectItem } from "./ui/select";
 import {
   NumberField,
@@ -32,13 +43,40 @@ import {
   DialogFooter,
 } from "./ui/dialog";
 
-type SnoozeChoice = { readonly snoozedUntil: string };
-type Request = { readonly resolve: (choice: SnoozeChoice | null) => void };
+type ThreadOption = { readonly id: string; readonly title: string };
+type Request = {
+  readonly id: number;
+  readonly resolve: (choice: SnoozeChoice | null) => void;
+  readonly conditional: boolean;
+  readonly threads: ReadonlyArray<ThreadOption>;
+};
 const useRequest = create<{ request: Request | null }>(() => ({ request: null }));
+let nextRequestId = 0;
 
-export function requestCustomSnooze(): Promise<SnoozeChoice | null> {
+export function requestCustomSnooze(
+  targets: ReadonlyArray<ScopedThreadRef> = [],
+): Promise<SnoozeChoice | null> {
   useRequest.getState().request?.resolve(null);
-  return new Promise((resolve) => useRequest.setState({ request: { resolve } }));
+  const environmentId = targets[0]?.environmentId;
+  const conditional =
+    environmentId !== undefined &&
+    targets.every((target) => target.environmentId === environmentId) &&
+    readEnvironmentSupportsConditionalSnooze(environmentId);
+  const excluded = new Set(targets.map((target) => target.threadId));
+  const threads = conditional
+    ? readThreadShells()
+        .filter(
+          (thread) =>
+            thread.environmentId === environmentId &&
+            thread.archivedAt === null &&
+            thread.deletedAt === null &&
+            !excluded.has(thread.id),
+        )
+        .map((thread) => ({ id: thread.id, title: thread.title || thread.branch || thread.id }))
+    : [];
+  return new Promise((resolve) =>
+    useRequest.setState({ request: { id: ++nextRequestId, resolve, conditional, threads } }),
+  );
 }
 
 function finish(choice: SnoozeChoice | null) {
@@ -50,21 +88,21 @@ function finish(choice: SnoozeChoice | null) {
 export function CustomSnoozeDialogHost() {
   const request = useRequest((state) => state.request);
   useEffect(() => () => finish(null), []);
-  return request ? <CustomSnoozeDialog /> : null;
+  return request ? <CustomSnoozeDialog key={request.id} request={request} /> : null;
 }
 
-function CustomSnoozeDialog() {
+function CustomSnoozeDialog({ request }: { readonly request: Request }) {
   const id = useId();
   const [initial] = useState(() => new Date(Date.now() + 3_600_000));
-  const [mode, setMode] = useState<CustomSnoozeInput["mode"]>("date");
+  const [mode, setMode] = useState<CustomSnoozeInput["mode"] | "thread" | "pull-request">("date");
+  const [thread, setThread] = useState<ThreadOption | null>(null);
+  const [url, setUrl] = useState("");
   const [date, setDate] = useState(initial);
   const [calendarOpen, setCalendarOpen] = useState(false);
   const [time, setTime] = useState(localSnoozeTime(initial));
   const [amount, setAmount] = useState("2");
   const [unit, setUnit] = useState<"minutes" | "hours" | "days">("hours");
   const [error, setError] = useState<string | null>(null);
-  const input: CustomSnoozeInput =
-    mode === "date" ? { mode, date: localSnoozeDate(date), time } : { mode, amount, unit };
   return (
     <Dialog
       open
@@ -77,6 +115,25 @@ function CustomSnoozeDialog() {
           className="flex min-h-0 flex-col"
           onSubmit={(event) => {
             event.preventDefault();
+            if (mode === "thread" || mode === "pull-request") {
+              const condition = resolveConditionalSnooze(
+                mode === "thread" ? { mode, threadId: thread?.id ?? "" } : { mode, url },
+              );
+              if (!condition) {
+                setError(
+                  mode === "thread"
+                    ? "Choose another thread."
+                    : "Enter a supported pull request URL.",
+                );
+                return;
+              }
+              finish({ condition });
+              return;
+            }
+            const input: CustomSnoozeInput =
+              mode === "date"
+                ? { mode, date: localSnoozeDate(date), time }
+                : { mode, amount, unit };
             const snoozedUntil = resolveCustomSnooze(input, new Date());
             if (!snoozedUntil) {
               setError(
@@ -95,19 +152,42 @@ function CustomSnoozeDialog() {
           </DialogHeader>
           <DialogPanel>
             <div className="flex flex-col gap-4">
-              <ToggleGroup
-                aria-label="Schedule type"
-                className="w-full *:flex-1"
-                value={[mode]}
-                onValueChange={(next) => {
-                  const value = next[0];
-                  if (value === "date" || value === "duration") setMode(value);
-                  setError(null);
-                }}
-              >
-                <Toggle value="date">Date and time</Toggle>
-                <Toggle value="duration">Duration</Toggle>
-              </ToggleGroup>
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor={`${id}-mode`}>Wake when</Label>
+                <Select
+                  value={mode}
+                  items={{
+                    date: "Date and time",
+                    duration: "Duration",
+                    thread: "Another thread settles",
+                    "pull-request": "A pull request merges",
+                  }}
+                  onValueChange={(value) => {
+                    if (
+                      value === "date" ||
+                      value === "duration" ||
+                      value === "thread" ||
+                      value === "pull-request"
+                    )
+                      setMode(value);
+                    setError(null);
+                  }}
+                >
+                  <SelectTrigger id={`${id}-mode`}>
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectPopup>
+                    <SelectItem value="date">Date and time</SelectItem>
+                    <SelectItem value="duration">Duration</SelectItem>
+                    {request.conditional && (
+                      <SelectItem value="thread">Another thread settles</SelectItem>
+                    )}
+                    {request.conditional && (
+                      <SelectItem value="pull-request">A pull request merges</SelectItem>
+                    )}
+                  </SelectPopup>
+                </Select>
+              </div>
               <div className="flex flex-col gap-4">
                 {mode === "date" ? (
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
@@ -163,7 +243,7 @@ function CustomSnoozeDialog() {
                       />
                     </Label>
                   </div>
-                ) : (
+                ) : mode === "duration" ? (
                   <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                     <NumberField
                       id={`${id}-amount`}
@@ -203,6 +283,54 @@ function CustomSnoozeDialog() {
                         </SelectPopup>
                       </Select>
                     </Label>
+                  </div>
+                ) : mode === "thread" ? (
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor={`${id}-thread`}>Wait for thread</Label>
+                    <Combobox
+                      items={request.threads}
+                      value={thread}
+                      itemToStringLabel={(item) => item.title}
+                      isItemEqualToValue={(item, value) => item.id === value.id}
+                      onValueChange={(value) => {
+                        setThread(value);
+                        setError(null);
+                      }}
+                    >
+                      <ComboboxInput id={`${id}-thread`} placeholder="Search threads…" />
+                      <ComboboxPopup>
+                        <ComboboxEmpty>No matching threads.</ComboboxEmpty>
+                        <ComboboxList>
+                          {(item: ThreadOption) => (
+                            <ComboboxItem key={item.id} value={item}>
+                              {item.title}
+                            </ComboboxItem>
+                          )}
+                        </ComboboxList>
+                      </ComboboxPopup>
+                    </Combobox>
+                    <p className="text-xs text-muted-foreground">
+                      Returns when this thread is settled, not just when its agent stops.
+                    </p>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-1.5">
+                    <Label htmlFor={`${id}-pr`}>Pull request URL</Label>
+                    <Input
+                      id={`${id}-pr`}
+                      type="url"
+                      required
+                      value={url}
+                      placeholder="https://github.com/owner/repo/pull/123"
+                      onChange={(event) => {
+                        setUrl(event.target.value);
+                        setError(null);
+                      }}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      The server checks for a merge while you’re away. This does not start the
+                      agent.
+                    </p>
                   </div>
                 )}
               </div>

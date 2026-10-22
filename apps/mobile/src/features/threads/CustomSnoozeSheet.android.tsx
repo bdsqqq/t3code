@@ -33,7 +33,7 @@ import { AppState, useWindowDimensions } from "react-native";
 import { OverlayPortal } from "../../components/ui/OverlayPortal";
 import { useAppearancePreferences } from "../settings/appearance/AppearancePreferencesProvider";
 import { useScaledTextRole } from "../settings/appearance/useScaledTextRole";
-import type { CustomSnoozeSheet as SharedCustomSnoozeSheet } from "./CustomSnoozeSheet.shared";
+import { CustomSnoozeSheet as SharedCustomSnoozeSheet } from "./CustomSnoozeSheet.shared";
 import {
   applySnoozePickerDate,
   applySnoozePickerTime,
@@ -59,6 +59,14 @@ function systemUses24HourClock() {
 }
 
 export function CustomSnoozeSheet(props: Props) {
+  return props.conditionalSnoozeSupported && props.initialMode ? (
+    <SharedCustomSnoozeSheet {...props} />
+  ) : (
+    <TimeSnoozeSheet {...props} />
+  );
+}
+
+function TimeSnoozeSheet(props: Props) {
   const { themeAppearance, themeVariables: colors } = useAppearancePreferences();
   const [is24Hour, setIs24Hour] = useState(systemUses24HourClock);
   useEffect(() => {
@@ -88,7 +96,7 @@ export function CustomSnoozeSheet(props: Props) {
       );
       return;
     }
-    props.onSnooze(snoozedUntil);
+    props.onSnooze({ snoozedUntil });
     props.onClose();
   };
   const pickerColors = {

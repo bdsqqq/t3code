@@ -22,7 +22,11 @@ import {
   ProviderInteractionMode,
   RuntimeMode,
 } from "@t3tools/contracts";
-import { effectiveSnoozed, threadWokeAt } from "@t3tools/client-runtime/state/thread-settled";
+import {
+  effectiveSnoozed,
+  threadWokeAt,
+  snoozeConditionLabel,
+} from "@t3tools/client-runtime/state/thread-settled";
 import { useAcknowledgeThreadWoke, useThreadActions } from "../../hooks/useThreadActions";
 import { settleAndAdvance } from "../../settleAndAdvance";
 import type { ChatShortcutCommands } from "./useChatShortcuts";
@@ -45,7 +49,12 @@ import { composerDraftHasUserContent, useComposerDraftStore } from "../../compos
 import { useEnvironmentScope } from "~/state/session";
 import { threadEnvironment } from "../../state/threads";
 import { vcsEnvironment } from "../../state/vcs";
-import { useChildThreadInputs, readThreadShell, waitForThreadShell } from "../../state/entities";
+import {
+  useChildThreadInputs,
+  readThreadShell,
+  waitForThreadShell,
+  useQuietThreadShell,
+} from "../../state/entities";
 import { environmentShell } from "../../state/shell";
 import { ThreadStatusLine } from "./ThreadStatusLine";
 import { formatRelativeTimeLabel, formatRelativeTimeUntilLabel } from "../../timestampFormat";
@@ -534,11 +543,23 @@ export function useThreadLifecycle(input: ThreadLifecycleInput) {
     : null;
   // The relative times read the clock; nowMinute re-renders them on the minute.
   const snoozedUntil = activeThreadShell?.snoozedUntil ?? null;
+  const snoozeCondition = activeThreadShell?.snoozeCondition;
+  const snoozeDependency = useQuietThreadShell(
+    activeThreadShell && snoozeCondition?.type === "thread-settled"
+      ? scopeThreadRef(activeThreadShell.environmentId, snoozeCondition.threadId)
+      : null,
+  );
   const settledAt = activeThreadShell?.settledAt ?? null;
   const threadStatusLine = activeThreadSnoozed ? (
     <ThreadStatusLine
       icon={<AlarmClockIcon />}
-      label={snoozedUntil ? `Snoozed, ${formatRelativeTimeUntilLabel(snoozedUntil)}` : "Snoozed"}
+      label={
+        snoozeCondition
+          ? `Snoozed · ${snoozeConditionLabel(snoozeCondition, snoozeDependency?.title)}`
+          : snoozedUntil
+            ? `Snoozed, ${formatRelativeTimeUntilLabel(snoozedUntil)}`
+            : "Snoozed"
+      }
       clockMinute={nowMinute}
       actionLabel={isUnsnoozing ? "Waking..." : "Wake now"}
       actionDisabled={!canOperateThread || isUnsnoozing}

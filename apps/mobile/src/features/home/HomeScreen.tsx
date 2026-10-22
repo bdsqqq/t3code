@@ -6,6 +6,7 @@ import { computeThreadMoveAvailability } from "../threads/threadOrder";
 import type { LegendListRef } from "@legendapp/list/react-native";
 import { AnimatedLegendList } from "@legendapp/list/reanimated";
 import { THREAD_SIDEBAR_ROW_LAYOUT } from "../threads/threadListAnimations";
+import type { SnoozeChoice } from "@t3tools/client-runtime/state/thread-settled";
 import {
   type EnvironmentProject,
   type EnvironmentThreadShell,
@@ -118,7 +119,7 @@ interface HomeScreenProps {
   readonly onSettleThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly onSnoozeThread: (
     thread: EnvironmentThreadShell,
-    snoozedUntil: string,
+    choice: SnoozeChoice,
   ) => Promise<boolean>;
   readonly onUnsnoozeThread: (thread: EnvironmentThreadShell) => Promise<boolean>;
   readonly onUnsettleThread: (thread: EnvironmentThreadShell) => void;
@@ -469,6 +470,7 @@ export function HomeScreen(props: HomeScreenProps) {
     machineByEnvironmentId,
     settlementEnvironmentIds,
     snoozeEnvironmentIds,
+    conditionalSnoozeEnvironmentIds,
     pinningEnvironmentIds,
     autoSettleOptOutEnvironmentIds,
     pinReorderEnvironmentIds,
@@ -551,6 +553,9 @@ export function HomeScreen(props: HomeScreenProps) {
         )) &&
       (v2SearchQuery.length === 0 || pendingTask.title.toLocaleLowerCase().includes(v2SearchQuery)),
   );
+  const threadTitlesByKey = new Map(
+    props.threads.map((thread) => [`${thread.environmentId}:${thread.id}`, thread.title]),
+  );
   const threadListV2Items = buildThreadListV2ListItems({
     items: threadListV2Layout.items,
     pendingTasks: v2PendingTasks,
@@ -564,6 +569,7 @@ export function HomeScreen(props: HomeScreenProps) {
     settledShelfExpanded,
     settledShelfHeaderIndex: threadListV2Layout.settledShelfHeaderIndex,
     snoozeLabelNow: `${nowMinute}:00.000Z`,
+    threadTitlesByKey,
     snoozeEnvironmentIds,
     queuedThreadKeys,
     moveAvailability: threadMoveAvailability,
@@ -688,6 +694,7 @@ export function HomeScreen(props: HomeScreenProps) {
         settlementSupported={settlementEnvironmentIds.has(thread.environmentId)}
         onSettleThread={handleSettleThread}
         snoozeSupported={snoozeEnvironmentIds.has(thread.environmentId)}
+        conditionalSnoozeSupported={conditionalSnoozeEnvironmentIds.has(thread.environmentId)}
         pinningSupported={pinningEnvironmentIds.has(thread.environmentId)}
         autoSettleOptOutSupported={autoSettleOptOutEnvironmentIds.has(thread.environmentId)}
         reorderSupported={

@@ -17,6 +17,7 @@ import { v2Now, v2ShellSnapshot, v2ThreadShell } from "./orchestrationV2TestFixt
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import { isThreadWorking } from "./threadInbox.ts";
 import { childThreadInputsTitle, createEnvironmentThreadShellAtoms } from "./threadShell.ts";
+import { effectiveSnoozed, threadWokeAt } from "./threadSettled.ts";
 
 const environmentId = EnvironmentId.make("environment-v2");
 const remoteEnvironmentId = EnvironmentId.make("remote-environment-v2");
@@ -53,6 +54,37 @@ function makeHarness(environmentIds: ReadonlyArray<EnvironmentId> = [environment
 }
 
 describe("v2 thread shell lists", () => {
+  it("presents dependency snoozes and their server wake through the shell stream", () => {
+    const { registry, threads, snapshotAtom } = makeHarness();
+    const condition = { type: "thread-settled", threadId: ThreadId.make("dependency") } as const;
+    const parked = {
+      ...v2ThreadShell,
+      snoozedUntil: null,
+      snoozedAt: v2Now,
+      snoozeCondition: condition,
+    };
+    const snapshot = { ...v2ShellSnapshot, threads: [parked] };
+    registry.set(snapshotAtom(environmentId), snapshot);
+    const visible = threads.threadShellAtom({ environmentId, threadId: parked.id });
+    const dispose = registry.mount(visible);
+    const now = DateTime.formatIso(v2Now);
+    expect(effectiveSnoozed(registry.get(visible)!, { now })).toBe(true);
+    registry.set(
+      snapshotAtom(environmentId),
+      applyShellStreamEvent(snapshot, {
+        kind: "thread.updated",
+        location: "active",
+        sequence: 1,
+        thread: { ...parked, snoozeCondition: null, snoozedAt: null, lastSnoozeWakeAt: v2Now },
+      }),
+    );
+    const awake = registry.get(visible)!;
+    expect(effectiveSnoozed(awake, { now })).toBe(false);
+    expect(threadWokeAt(awake, { now })).toBe(now);
+    dispose();
+    registry.dispose();
+  });
+
   it("preserves ordered reference arrays when a middle thread changes", () => {
     const { registry, threads, snapshotAtom } = makeHarness();
     const snapshot = {

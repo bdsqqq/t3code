@@ -233,6 +233,16 @@ Choose **Snooze → Custom…** from a thread's menu to pick a date and time in 
 local time zone, or a duration in minutes, hours, or days. Durations start when
 you confirm; one day means 24 hours. On web and desktop, you can also snooze
 several selected threads together. Choose **Wake thread** to bring a thread back early.
-A snoozed thread keeps working and stays hidden until its wake time, even while
-its agent wakes itself for background work. It comes back early only when it needs
-an approval or answer from you, when a run fails, or when you send it a message.
+A snoozed thread keeps working and stays hidden until its timer or condition is
+fulfilled, even while its agent wakes itself for background work. It comes back
+early only when it needs an approval or answer from you, when a run fails, or when
+you send it a message.
+
+You can also wait for another thread in the same environment to settle, or for a
+pull request URL to merge. On web and desktop, choose **Custom…**; on mobile,
+choose the thread or pull request option in the Snooze menu.
+Finishing an agent turn does not count as settling a thread. A pull request closed
+without merging keeps the snooze in place.
+The environment needs source-control access to the pull request.
+The server checks these conditions while your client is closed; waking returns the
+thread to your inbox without starting the agent.

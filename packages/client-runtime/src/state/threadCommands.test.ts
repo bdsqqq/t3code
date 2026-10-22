@@ -125,6 +125,57 @@ const makeHarness = Effect.fn("TestThreadCommands.makeHarness")(function* () {
 });
 
 describe("remote thread lifecycle commands", () => {
+  it.effect("previews a conditional snooze, forwards its target, and rolls back a rejection", () =>
+    Effect.gen(function* () {
+      const h = yield* makeHarness();
+      const condition = { type: "thread-settled", threadId: ThreadId.make("dependency") } as const;
+      const result = h.commands.snooze.run(h.registry, {
+        environmentId: ENVIRONMENT_ID,
+        input: { threadId: THREAD_ID, condition },
+      });
+      expect(h.registry.get(h.visibleAtom)?.threads[0]).toMatchObject({
+        snoozedUntil: null,
+        snoozeCondition: condition,
+      });
+      const request = yield* Queue.take(h.requests);
+      expect(request.command).toMatchObject({ type: "thread.snooze", condition });
+      yield* Deferred.fail(request.reply, new Error("Dependency rejected"));
+      expect((yield* Effect.promise(() => result))._tag).toBe("Failure");
+      expect(h.registry.get(h.visibleAtom)).toBe(SNAPSHOT);
+    }),
+  );
+
+  it.effect.each(["snooze", "unsnooze", "pin", "settle"] as const)(
+    "%s clears a conditional snooze optimistically",
+    (action) =>
+      Effect.gen(function* () {
+        const h = yield* makeHarness();
+        const initial = {
+          ...SNAPSHOT,
+          threads: [
+            {
+              ...SNAPSHOT.threads[0]!,
+              snoozeCondition: {
+                type: "thread-settled" as const,
+                threadId: ThreadId.make("dependency"),
+              },
+              snoozeCommandId: CommandId.make("installed"),
+            },
+          ],
+        };
+        h.registry.set(h.snapshotAtom(ENVIRONMENT_ID), initial);
+        const result = h.commands[action].run(h.registry, {
+          environmentId: ENVIRONMENT_ID,
+          input: { threadId: THREAD_ID, snoozedUntil: "2099-01-01T00:00:00.000Z", reason: "user" },
+        });
+        expect(h.registry.get(h.visibleAtom)?.threads[0]?.snoozeCondition).toBeNull();
+        const request = yield* Queue.take(h.requests);
+        yield* Deferred.fail(request.reply, new Error("Rejected"));
+        yield* Effect.promise(() => result);
+        expect(h.registry.get(h.visibleAtom)).toBe(initial);
+      }),
+  );
+
   const actions = [
     ["settle", {}, { settledOverride: "settled", pinnedAt: null, snoozedUntil: null }],
     ["unsettle", { reason: "user" }, { settledOverride: "active", settledAt: null }],
