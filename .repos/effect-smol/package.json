@@ -62,7 +62,7 @@
     "dprint": "^0.57.4",
     "fast-check": "^4.10.2",
     "glob": "^13.0.6",
-    "happy-dom": "^20.14.5",
+    "happy-dom": "^21.0.4",
     "jscodeshift": "^17.4.0",
     "lalph": "^0.3.139",
     "madge": "^8.0.0",
@@ -76,9 +76,9 @@
     "terser": "^5.51.2",
     "tstyche": "^7.2.5",
     "typescript": "^7.0.2",
-    "vite": "^8.3.1",
+    "vite": "^8.3.3",
     "vitest": "^5.0.2",
     "vitest-websocket-mock": "^0.8.0",
-    "zod": "^4.6.5"
+    "zod": "^4.6.6"
   }
 }
